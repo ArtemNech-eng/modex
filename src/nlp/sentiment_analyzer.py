@@ -85,15 +85,22 @@ class SentimentAnalyzer:
 
     def _load_sync(self):
         """Синхронная загрузка модели (в thread pool)"""
-        from transformers import pipeline
-        self._pipeline = pipeline(
-            task="text-classification",
-            model=self.model_name,
-            tokenizer=self.model_name,
-            top_k=1,             # только лучший класс
-            truncation=True,
-            max_length=512,
-        )
+        try:
+            from transformers import pipeline
+            self._pipeline = pipeline(
+                task="text-classification",
+                model=self.model_name,
+                tokenizer=self.model_name,
+                top_k=1,
+                truncation=True,
+                max_length=512,
+            )
+        except ImportError:
+            logger.warning("⚠️ transformers не установлен — используем словарный метод")
+            self._pipeline = None
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось загрузить NLP-модель: {e} — используем словарный метод")
+            self._pipeline = None
 
     def _predict_sync(self, texts: list[str]) -> list[dict]:
         """Синхронный предикт (в thread pool)"""

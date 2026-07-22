@@ -61,8 +61,6 @@ class TelegramCollector:
         """Подключиться к Telegram и начать слушать каналы"""
         logger.info("Подключение к Telegram...")
 
-        # Если есть строковая сессия (для Docker/Coolify) — используем её
-        # Иначе — файловая сессия (для локального запуска)
         if TELEGRAM_STRING_SESSION:
             from telethon.sessions import StringSession
             # Очищаем от лишних символов (пробелы, переносы, не-ASCII)
@@ -70,14 +68,23 @@ class TelegramCollector:
                 c for c in TELEGRAM_STRING_SESSION.strip()
                 if ord(c) < 128
             )
+            logger.info(f"🔑 Строковая сессия загружена ({len(clean_session)} символов)")
             session = StringSession(clean_session)
-            logger.info("🔑 Используем строковую сессию (Docker-режим)")
+            self.client = TelegramClient(session, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+            # Подключаемся без интерактивного ввода
+            await self.client.connect()
+            if not await self.client.is_user_authorized():
+                raise RuntimeError(
+                    "❌ Сессия недействительна! Сгенерируй новую через Colab "
+                    "и обнови TELEGRAM_STRING_SESSION в Coolify."
+                )
+            me = await self.client.get_me()
+            logger.info(f"✅ Авторизован как {me.first_name} (@{me.username})")
         else:
-            session = TELEGRAM_SESSION
+            # Локальный режим — файловая сессия
+            self.client = TelegramClient(TELEGRAM_SESSION, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+            await self.client.start(phone=TELEGRAM_PHONE)
             logger.info("🔑 Используем файловую сессию (локальный режим)")
-
-        self.client = TelegramClient(session, TELEGRAM_API_ID, TELEGRAM_API_HASH)
-        await self.client.start(phone=TELEGRAM_PHONE if not TELEGRAM_STRING_SESSION else None)
         logger.info("✅ Подключено к Telegram")
         self._running = True
 
