@@ -65,7 +65,12 @@ class TelegramCollector:
         # Иначе — файловая сессия (для локального запуска)
         if TELEGRAM_STRING_SESSION:
             from telethon.sessions import StringSession
-            session = StringSession(TELEGRAM_STRING_SESSION)
+            # Очищаем от лишних символов (пробелы, переносы, не-ASCII)
+            clean_session = ''.join(
+                c for c in TELEGRAM_STRING_SESSION.strip()
+                if ord(c) < 128
+            )
+            session = StringSession(clean_session)
             logger.info("🔑 Используем строковую сессию (Docker-режим)")
         else:
             session = TELEGRAM_SESSION
