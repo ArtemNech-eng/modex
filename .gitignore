@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Секреты
+.env
+*.session
+*.session-journal
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Данные
+*.db
+*.db-shm
+*.db-wal
+data/
+
+# Модели (тяжёлые, не коммитим)
+models/
+*.bin
+*.safetensors

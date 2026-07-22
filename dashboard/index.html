@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MOODEX — Market Mood Index</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface2: #1e2631;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --green: #3fb950;
+    --red: #f85149;
+    --yellow: #d29922;
+    --blue: #58a6ff;
+    --purple: #a371f7;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    min-height: 100vh;
+  }
+
+  /* ── Хедер ── */
+  header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 14px 24px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+  .logo { font-size: 22px; font-weight: 700; letter-spacing: -0.5px; }
+  .logo span { color: var(--blue); }
+  .badge {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 3px 10px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--green);
+    animation: pulse 2s infinite;
+    margin-left: auto;
+  }
+  .status-text { font-size: 12px; color: var(--text-dim); }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+
+  /* ── Основной layout ── */
+  main { max-width: 1400px; margin: 0 auto; padding: 24px; }
+
+  /* ── Верхние карточки ── */
+  .top-cards {
+    display: grid;
+    grid-template-columns: 280px 1fr 300px;
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+  }
+
+  /* ── Большой индекс рынка ── */
+  .market-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+  }
+  .market-label { font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px; }
+  .market-index {
+    font-size: 72px;
+    font-weight: 800;
+    line-height: 1;
+    transition: color 0.5s;
+  }
+  .market-mood { font-size: 16px; font-weight: 600; }
+  .market-meta { font-size: 12px; color: var(--text-dim); }
+
+  /* ── Gauge (дуга) ── */
+  .gauge-wrapper { position: relative; width: 200px; height: 110px; }
+  canvas#gaugeCanvas { width: 200px !important; height: 110px !important; }
+  .gauge-value {
+    position: absolute;
+    bottom: 0; left: 50%;
+    transform: translateX(-50%);
+    font-size: 28px; font-weight: 700;
+  }
+
+  /* ── Статы карточка ── */
+  .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .stat { background: var(--surface2); border-radius: 8px; padding: 12px; }
+  .stat-value { font-size: 22px; font-weight: 700; }
+  .stat-label { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+
+  /* ── Секции ── */
+  .section-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 12px;
+  }
+
+  /* ── Анализ текста ── */
+  .analyze-card { margin-bottom: 24px; }
+  .analyze-row { display: flex; gap: 10px; }
+  textarea {
+    flex: 1;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-size: 14px;
+    padding: 12px;
+    resize: vertical;
+    min-height: 70px;
+    font-family: inherit;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  textarea:focus { border-color: var(--blue); }
+  .btn {
+    background: var(--blue);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    padding: 0 20px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.2s;
+    white-space: nowrap;
+  }
+  .btn:hover { opacity: 0.85; }
+  .analyze-result {
+    margin-top: 12px;
+    padding: 12px 16px;
+    background: var(--surface2);
+    border-radius: 8px;
+    display: none;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .analyze-result.show { display: flex; }
+  .result-badge {
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .badge-positive { background: rgba(63,185,80,0.2); color: var(--green); }
+  .badge-negative { background: rgba(248,81,73,0.2); color: var(--red); }
+  .badge-neutral { background: rgba(139,148,158,0.2); color: var(--text-dim); }
+  .result-score { font-size: 13px; color: var(--text-dim); }
+  .result-tickers { display: flex; gap: 6px; flex-wrap: wrap; }
+  .ticker-chip {
+    background: rgba(88,166,255,0.15);
+    color: var(--blue);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  /* ── Таблица тикеров ── */
+  .tickers-section { margin-bottom: 24px; }
+  .tickers-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 12px;
+  }
+  .ticker-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    transition: border-color 0.2s, transform 0.1s;
+    cursor: default;
+    position: relative;
+    overflow: hidden;
+  }
+  .ticker-card:hover { border-color: var(--blue); transform: translateY(-1px); }
+  .ticker-card.anomaly { border-color: var(--yellow) !important; }
+  .ticker-card.anomaly::after {
+    content: "⚠️ АНОМАЛИЯ";
+    position: absolute;
+    top: 8px; right: 8px;
+    font-size: 9px;
+    color: var(--yellow);
+    font-weight: 700;
+    letter-spacing: 0.5px;
+  }
+  .tc-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 10px; }
+  .tc-ticker { font-size: 16px; font-weight: 700; }
+  .tc-company { font-size: 11px; color: var(--text-dim); margin-top: 1px; }
+  .tc-index { font-size: 24px; font-weight: 800; }
+  .tc-bar-wrap { height: 4px; background: var(--surface2); border-radius: 2px; margin: 10px 0; overflow: hidden; }
+  .tc-bar { height: 100%; border-radius: 2px; transition: width 0.5s ease; }
+  .tc-footer { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-dim); }
+  .tc-label { font-size: 11px; font-weight: 600; margin-top: 2px; }
+
+  /* ── Цвета по значению ── */
+  .color-bull { color: var(--green) !important; }
+  .color-bear { color: var(--red) !important; }
+  .color-neutral { color: var(--text-dim) !important; }
+  .bar-bull { background: var(--green); }
+  .bar-bear { background: var(--red); }
+  .bar-neutral { background: var(--text-dim); }
+
+  /* ── Лента сообщений ── */
+  .feed-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+  .feed-list { max-height: 400px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+  .feed-item {
+    background: var(--surface2);
+    border-radius: 8px;
+    padding: 10px 12px;
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    border-left: 3px solid transparent;
+  }
+  .feed-item.pos { border-left-color: var(--green); }
+  .feed-item.neg { border-left-color: var(--red); }
+  .feed-item.neu { border-left-color: var(--border); }
+  .feed-emoji { font-size: 16px; flex-shrink: 0; margin-top: 1px; }
+  .feed-content { flex: 1; min-width: 0; }
+  .feed-text { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .feed-meta { font-size: 11px; color: var(--text-dim); margin-top: 3px; }
+  .feed-ticker-chip {
+    display: inline-block;
+    background: rgba(88,166,255,0.15);
+    color: var(--blue);
+    border-radius: 3px;
+    padding: 0 5px;
+    font-size: 10px;
+    font-weight: 700;
+    margin-right: 4px;
+  }
+
+  /* ── Footer ── */
+  footer {
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 12px;
+    padding: 24px;
+    border-top: 1px solid var(--border);
+    margin-top: 24px;
+  }
+
+  /* ── Responsive ── */
+  @media (max-width: 900px) {
+    .top-cards { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">MOO<span>DEX</span></div>
+  <div class="badge">Market Mood Index · Мосбиржа</div>
+  <div style="margin-left:auto;display:flex;align-items:center;gap:8px;">
+    <div class="status-dot" id="statusDot"></div>
+    <span class="status-text" id="statusText">Подключение...</span>
+  </div>
+</header>
+
+<main>
+
+  <!-- ── Верхние карточки ── -->
+  <div class="top-cards">
+
+    <!-- Большой индекс -->
+    <div class="card market-card">
+      <div class="market-label">Индекс рынка</div>
+      <div class="market-index" id="marketIndex">—</div>
+      <div class="market-mood" id="marketMood">Загрузка...</div>
+      <div class="market-meta" id="marketMeta"></div>
+    </div>
+
+    <!-- Gauge + история -->
+    <div class="card" style="display:flex;flex-direction:column;gap:16px;">
+      <div class="section-title">История индекса (последние 20 обновлений)</div>
+      <canvas id="historyChart" height="80"></canvas>
+    </div>
+
+    <!-- Статистика -->
+    <div class="card">
+      <div class="section-title">Статистика</div>
+      <div class="stats-grid">
+        <div class="stat">
+          <div class="stat-value color-bull" id="statMessages">0</div>
+          <div class="stat-label">Сообщений / час</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value color-blue" id="statTickers">0</div>
+          <div class="stat-label">Активных тикеров</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value color-bull" id="statTopBull">—</div>
+          <div class="stat-label">Топ бычий 🚀</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value color-bear" id="statTopBear">—</div>
+          <div class="stat-label">Топ медвежий 🩸</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── Анализ текста ── -->
+  <div class="card analyze-card">
+    <div class="section-title">Анализ текста</div>
+    <div class="analyze-row">
+      <textarea id="analyzeInput" placeholder="Введите сообщение трейдера для анализа... Например: Сбер летит вверх, покупаю на всё!"></textarea>
+      <button class="btn" onclick="analyzeText()">Анализировать</button>
+    </div>
+    <div class="analyze-result" id="analyzeResult"></div>
+  </div>
+
+  <!-- ── Тикеры ── -->
+  <div class="tickers-section">
+    <div class="section-title">Тикеры · Индексы настроения</div>
+    <div class="tickers-grid" id="tickersGrid">
+      <div style="color:var(--text-dim);font-size:13px;">Загружаем данные...</div>
+    </div>
+  </div>
+
+  <!-- ── Демо лента ── -->
+  <div class="feed-card">
+    <div class="section-title" style="margin-bottom:14px;">Демо-лента сообщений</div>
+    <div class="feed-list" id="feedList"></div>
+  </div>
+
+</main>
+
+<footer>
+  MOODEX v0.1 · Market sentiment analysis для Московской биржи · Не является инвестиционной рекомендацией
+</footer>
+
+<script>
+// ── Конфигурация ─────────────────────────────────────────────────────────────
+const API_BASE = window.location.origin;
+const WS_URL = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`;
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let historyData = [];
+let historyChart = null;
+let ws = null;
+
+// ── Демо-лента сообщений ─────────────────────────────────────────────────────
+const DEMO_FEED = [
+  { ticker: "SBER", text: "Сбер сегодня очень сильный, покупаю на всё!", label: "positive" },
+  { ticker: "GAZP", text: "Газпром летит вниз, шорчу без сожалений 📉", label: "negative" },
+  { ticker: "YNDX", text: "Яндекс ракета 🚀 обновил хай, держу!", label: "positive" },
+  { ticker: "VTBR", text: "ВТБ всё, пора избавляться, слабый банк", label: "negative" },
+  { ticker: "TCSG", text: "Тинькофф снова обновил максимум!", label: "positive" },
+  { ticker: "LKOH", text: "Лукойл держится хорошо, нефть поддерживает", label: "positive" },
+  { ticker: "MAGN", text: "ММК под давлением, продаю позицию", label: "negative" },
+  { ticker: "PLZL", text: "Полюс держится, золото растёт → Полюс растёт", label: "positive" },
+  { ticker: "OZON", text: "OZON хороший потенциал для роста", label: "positive" },
+  { ticker: "AFLT", text: "Аэрофлот слабый, осторожно с входом", label: "negative" },
+  { ticker: "NLMK", text: "НЛМК нейтрально, жду квартального отчёта", label: "neutral" },
+  { ticker: "NVTK", text: "Новатэк отличный актив на долгосрок", label: "positive" },
+];
+
+// ── Инициализация графика истории ─────────────────────────────────────────────
+function initChart() {
+  const ctx = document.getElementById('historyChart').getContext('2d');
+  historyChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [{
+        label: 'Индекс рынка',
+        data: [],
+        borderColor: '#58a6ff',
+        backgroundColor: 'rgba(88,166,255,0.1)',
+        borderWidth: 2,
+        pointRadius: 3,
+        pointBackgroundColor: '#58a6ff',
+        fill: true,
+        tension: 0.3,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        y: {
+          min: 0, max: 100,
+          grid: { color: 'rgba(48,54,61,0.8)' },
+          ticks: { color: '#8b949e', font: { size: 11 } }
+        },
+        x: {
+          grid: { display: false },
+          ticks: { color: '#8b949e', font: { size: 10 }, maxTicksLimit: 8 }
+        }
+      }
+    }
+  });
+}
+
+// ── Получение цвета по индексу ────────────────────────────────────────────────
+function getIndexColor(index) {
+  if (index >= 65) return '#3fb950';      // бычий — зелёный
+  if (index >= 50) return '#58a6ff';      // слегка позитивный — синий
+  if (index >= 35) return '#8b949e';      // нейтральный — серый
+  if (index >= 20) return '#d29922';      // слегка медвежий — жёлтый
+  return '#f85149';                        // медвежий — красный
+}
+
+function getMoodText(index) {
+  if (index >= 70) return 'Сильный бычий 🚀';
+  if (index >= 55) return 'Умеренно бычий 📈';
+  if (index >= 45) return 'Нейтральный ➡️';
+  if (index >= 30) return 'Умеренно медвежий 📉';
+  return 'Сильный медвежий 🩸';
+}
+
+// ── Обновление главного индекса ───────────────────────────────────────────────
+function updateMarket(market) {
+  const idx = market.sentiment_index;
+  const el = document.getElementById('marketIndex');
+  el.textContent = idx.toFixed(1);
+  el.style.color = getIndexColor(idx);
+  
+  document.getElementById('marketMood').textContent = getMoodText(idx);
+  document.getElementById('marketMeta').textContent = 
+    `${market.total_messages} сообщений · ${market.active_tickers} тикеров`;
+  
+  document.getElementById('statMessages').textContent = market.total_messages;
+  document.getElementById('statTickers').textContent = market.active_tickers;
+  document.getElementById('statTopBull').textContent = market.top_bullish?.[0] || '—';
+  document.getElementById('statTopBear').textContent = market.top_bearish?.[0] || '—';
+
+  // История
+  const now = new Date().toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  historyData.push({ time: now, value: idx });
+  if (historyData.length > 20) historyData.shift();
+
+  historyChart.data.labels = historyData.map(d => d.time);
+  historyChart.data.datasets[0].data = historyData.map(d => d.value);
+  historyChart.update('none');
+}
+
+// ── Рендер карточки тикера ────────────────────────────────────────────────────
+function renderTickerCard(t) {
+  const idx = t.sentiment_index;
+  const color = getIndexColor(idx);
+  const barClass = idx >= 55 ? 'bar-bull' : idx >= 45 ? 'bar-neutral' : 'bar-bear';
+  const colorClass = idx >= 55 ? 'color-bull' : idx >= 45 ? 'color-neutral' : 'color-bear';
+  const anomalyClass = t.is_anomaly ? ' anomaly' : '';
+  
+  return `
+    <div class="ticker-card${anomalyClass}">
+      <div class="tc-header">
+        <div>
+          <div class="tc-ticker">${t.ticker}</div>
+          <div class="tc-company">${t.company_name}</div>
+        </div>
+        <div class="tc-index ${colorClass}">${idx.toFixed(0)}</div>
+      </div>
+      <div class="tc-bar-wrap">
+        <div class="tc-bar ${barClass}" style="width:${idx}%"></div>
+      </div>
+      <div class="tc-footer">
+        <span class="tc-label ${colorClass}">${t.label || getMoodText(idx)}</span>
+        <span>${t.message_count} сообщ.</span>
+      </div>
+    </div>
+  `;
+}
+
+// ── Обновление тикеров ────────────────────────────────────────────────────────
+function updateTickers(tickers) {
+  if (!tickers || tickers.length === 0) return;
+  
+  const sorted = [...tickers].sort((a, b) => b.sentiment_index - a.sentiment_index);
+  const grid = document.getElementById('tickersGrid');
+  grid.innerHTML = sorted.map(renderTickerCard).join('');
+}
+
+// ── Лента сообщений ───────────────────────────────────────────────────────────
+function initFeed() {
+  const feed = document.getElementById('feedList');
+  const items = [...DEMO_FEED, ...DEMO_FEED].slice(0, 15);
+  feed.innerHTML = items.map(item => {
+    const cls = item.label === 'positive' ? 'pos' : item.label === 'negative' ? 'neg' : 'neu';
+    const emoji = item.label === 'positive' ? '📈' : item.label === 'negative' ? '📉' : '➡️';
+    const time = new Date(Date.now() - Math.random() * 3600000)
+      .toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit' });
+    return `
+      <div class="feed-item ${cls}">
+        <div class="feed-emoji">${emoji}</div>
+        <div class="feed-content">
+          <div class="feed-text">${item.text}</div>
+          <div class="feed-meta">
+            <span class="feed-ticker-chip">${item.ticker}</span>
+            ${time} · markettwits
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+// ── Анализ текста ─────────────────────────────────────────────────────────────
+async function analyzeText() {
+  const text = document.getElementById('analyzeInput').value.trim();
+  if (!text) return;
+  
+  const resultEl = document.getElementById('analyzeResult');
+  resultEl.className = 'analyze-result show';
+  resultEl.innerHTML = '<span style="color:var(--text-dim);font-size:13px;">Анализирую...</span>';
+  
+  try {
+    const resp = await fetch(`${API_BASE}/api/analyze`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, use_model: false }) // false = словарный метод
+    });
+    const data = await resp.json();
+    
+    const badgeClass = data.label === 'positive' ? 'badge-positive' : 
+                       data.label === 'negative' ? 'badge-negative' : 'badge-neutral';
+    const labelText = data.label === 'positive' ? '📈 Позитивный' : 
+                      data.label === 'negative' ? '📉 Негативный' : '➡️ Нейтральный';
+    const signalBar = `${(data.signal * 100).toFixed(0)}%`;
+    
+    const tickersHtml = data.tickers.length > 0
+      ? data.tickers.map(t => `<span class="ticker-chip">${t}</span>`).join('')
+      : '<span style="color:var(--text-dim);font-size:12px;">тикеры не найдены</span>';
+    
+    resultEl.innerHTML = `
+      <span class="result-badge ${badgeClass}">${labelText}</span>
+      <span class="result-score">Уверенность: ${(data.score * 100).toFixed(0)}%</span>
+      <span class="result-score">Сигнал: ${data.signal > 0 ? '+' : ''}${(data.signal * 100).toFixed(0)}%</span>
+      <div class="result-tickers">${tickersHtml}</div>
+    `;
+  } catch(e) {
+    resultEl.innerHTML = '<span style="color:var(--red);font-size:13px;">Ошибка анализа. Убедитесь что сервер запущен.</span>';
+  }
+}
+
+// Enter для отправки
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('analyzeInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); analyzeText(); }
+  });
+});
+
+// ── WebSocket / Polling ───────────────────────────────────────────────────────
+function connectWS() {
+  ws = new WebSocket(WS_URL);
+  
+  ws.onopen = () => {
+    document.getElementById('statusDot').style.background = '#3fb950';
+    document.getElementById('statusText').textContent = 'Live';
+  };
+  
+  ws.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    if (data.type === 'market_update') {
+      updateMarket(data.market);
+      updateTickers(data.tickers);
+    }
+  };
+  
+  ws.onclose = () => {
+    document.getElementById('statusDot').style.background = '#f85149';
+    document.getElementById('statusText').textContent = 'Переподключение...';
+    setTimeout(connectWS, 3000);
+  };
+  
+  ws.onerror = () => {
+    // Fallback на REST polling если WS недоступен
+    ws.close();
+    pollFallback();
+  };
+}
+
+async function pollFallback() {
+  document.getElementById('statusDot').style.background = '#d29922';
+  document.getElementById('statusText').textContent = 'Polling (REST)';
+  
+  const fetchAll = async () => {
+    try {
+      const [marketResp, tickersResp] = await Promise.all([
+        fetch(`${API_BASE}/api/market`),
+        fetch(`${API_BASE}/api/tickers`)
+      ]);
+      const market = await marketResp.json();
+      const tickersData = await tickersResp.json();
+      updateMarket(market);
+      updateTickers(tickersData.tickers);
+      document.getElementById('statusDot').style.background = '#3fb950';
+      document.getElementById('statusText').textContent = 'Live (REST)';
+    } catch (e) {
+      document.getElementById('statusDot').style.background = '#f85149';
+      document.getElementById('statusText').textContent = 'Нет соединения';
+    }
+  };
+  
+  fetchAll();
+  setInterval(fetchAll, 5000);
+}
+
+// ── Старт ─────────────────────────────────────────────────────────────────────
+initChart();
+initFeed();
+connectWS();
+</script>
+</body>
+</html>
