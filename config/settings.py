@@ -43,6 +43,10 @@ USE_LLM_FALLBACK = os.getenv("USE_LLM_FALLBACK", "false").lower() == "true"
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./moodex.db")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
+# Файл для хранения каналов, добавленных вручную через дашборд
+# (директория data/ в .gitignore — переживает перезапуски)
+CHANNELS_FILE = os.getenv("CHANNELS_FILE", "data/channels.json")
+
 # ─── API ───────────────────────────────────────────────────────────────────────
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
 API_PORT = int(os.getenv("API_PORT", "8000"))

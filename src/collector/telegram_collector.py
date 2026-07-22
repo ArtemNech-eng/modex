@@ -56,6 +56,7 @@ class TelegramCollector:
         self.client: Optional[TelegramClient] = None
         self._message_queue: asyncio.Queue = asyncio.Queue(maxsize=10_000)
         self._running = False
+        self._handler = None   # текущий обработчик NewMessage
 
     async def start(self):
         """Подключиться к Telegram и начать слушать каналы"""
@@ -89,13 +90,43 @@ class TelegramCollector:
         self._running = True
 
         # Регистрируем обработчик новых сообщений
-        @self.client.on(events.NewMessage(chats=self.channels))
+        self._register_handler()
+        logger.info(f"👂 Слушаем {len(self.channels)} каналов: {self.channels}")
+
+    def _register_handler(self):
+        """
+        (Пере)регистрирует обработчик новых сообщений на текущий self.channels.
+
+        Telethon резолвит список чатов в момент регистрации, поэтому при
+        изменении списка каналов обработчик нужно пересоздать — иначе новые
+        каналы не будут слушаться.
+        """
         async def handler(event: events.NewMessage.Event):
             msg = await self._parse_message(event.message)
             if msg and msg.text.strip():
                 await self._message_queue.put(msg)
 
-        logger.info(f"👂 Слушаем {len(self.channels)} каналов: {self.channels}")
+        if self._handler is not None:
+            self.client.remove_event_handler(self._handler)
+
+        self.client.add_event_handler(handler, events.NewMessage(chats=self.channels))
+        self._handler = handler
+
+    async def add_channel(self, username: str):
+        """Добавить канал в realtime-мониторинг и перерегистрировать обработчик."""
+        if username not in self.channels:
+            self.channels.append(username)
+            if self.client:
+                self._register_handler()
+            logger.info(f"👂 Канал добавлен в мониторинг: @{username}")
+
+    async def remove_channel(self, username: str):
+        """Убрать канал из realtime-мониторинга и перерегистрировать обработчик."""
+        if username in self.channels:
+            self.channels.remove(username)
+            if self.client:
+                self._register_handler()
+            logger.info(f"🔇 Канал убран из мониторинга: @{username}")
 
     async def stop(self):
         """Отключиться от Telegram"""

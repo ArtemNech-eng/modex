@@ -26,7 +26,11 @@ from src.collector.telegram_collector import TelegramCollector
 from src.nlp.sentiment_analyzer import SentimentAnalyzer, keyword_sentiment
 from src.nlp.ticker_extractor import extract_tickers, is_market_related
 from src.aggregator.aggregator import SentimentAggregator
-from src.api.main import app, aggregator as api_aggregator, connected_websockets, analyzer as api_analyzer, set_collector
+from src.api.main import (
+    app, aggregator as api_aggregator, connected_websockets,
+    analyzer as api_analyzer, set_collector,
+    _load_channels, get_saved_channel_usernames,
+)
 from config.settings import TELEGRAM_CHANNELS
 
 logging.basicConfig(
@@ -152,12 +156,19 @@ async def stats_reporter():
 
 async def telegram_pipeline():
     """Основной цикл: Telegram → NLP → Aggregator"""
-    collector = TelegramCollector(channels=TELEGRAM_CHANNELS)
+    # Восстанавливаем сохранённые вручную каналы и добавляем их к дефолтным
+    _load_channels()
+    saved = get_saved_channel_usernames()
+    all_channels = list(dict.fromkeys(TELEGRAM_CHANNELS + saved))
+    collector = TelegramCollector(channels=all_channels)
 
     logger.info("⏳ Подключаемся к Telegram...")
     await collector.start()
     set_collector(collector)  # даём API доступ к коллектору
-    logger.info(f"✅ Подключено! Слушаем {len(TELEGRAM_CHANNELS)} каналов.")
+    logger.info(
+        f"✅ Подключено! Слушаем {len(all_channels)} каналов "
+        f"(дефолтных: {len(TELEGRAM_CHANNELS)}, восстановлено: {len(saved)})."
+    )
 
     # Загружаем NLP-модель
     logger.info("⏳ Загружаем NLP-модель (первый запуск скачает ~45MB)...")
