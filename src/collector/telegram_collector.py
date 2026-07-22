@@ -14,7 +14,7 @@ from telethon.tl.types import Channel, Chat, Message
 
 from config.settings import (
     TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE,
-    TELEGRAM_SESSION, TELEGRAM_CHANNELS
+    TELEGRAM_SESSION, TELEGRAM_STRING_SESSION, TELEGRAM_CHANNELS
 )
 
 logger = logging.getLogger(__name__)
@@ -60,12 +60,19 @@ class TelegramCollector:
     async def start(self):
         """Подключиться к Telegram и начать слушать каналы"""
         logger.info("Подключение к Telegram...")
-        self.client = TelegramClient(
-            TELEGRAM_SESSION,
-            TELEGRAM_API_ID,
-            TELEGRAM_API_HASH
-        )
-        await self.client.start(phone=TELEGRAM_PHONE)
+
+        # Если есть строковая сессия (для Docker/Coolify) — используем её
+        # Иначе — файловая сессия (для локального запуска)
+        if TELEGRAM_STRING_SESSION:
+            from telethon.sessions import StringSession
+            session = StringSession(TELEGRAM_STRING_SESSION)
+            logger.info("🔑 Используем строковую сессию (Docker-режим)")
+        else:
+            session = TELEGRAM_SESSION
+            logger.info("🔑 Используем файловую сессию (локальный режим)")
+
+        self.client = TelegramClient(session, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+        await self.client.start(phone=TELEGRAM_PHONE if not TELEGRAM_STRING_SESSION else None)
         logger.info("✅ Подключено к Telegram")
         self._running = True
 

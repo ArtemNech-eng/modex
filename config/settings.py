@@ -12,6 +12,9 @@ TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 TELEGRAM_PHONE = os.getenv("TELEGRAM_PHONE", "")
 TELEGRAM_SESSION = os.getenv("TELEGRAM_SESSION", "moodex_session")
+# Строковая сессия для деплоя в контейнерах (генерируется через auth_telegram.py)
+# Если задана — используется вместо файла сессии
+TELEGRAM_STRING_SESSION = os.getenv("TELEGRAM_STRING_SESSION", "")
 
 # ─── Список каналов для парсинга ──────────────────────────────────────────────
 # Публичные Telegram-каналы/чаты трейдеров MOEX
