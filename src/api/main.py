@@ -58,9 +58,24 @@ class AnalyzeResponse(BaseModel):
 
 class AlertConfig(BaseModel):
     ticker: str
-    threshold_above: Optional[float] = None   # алерт когда индекс выше X
-    threshold_below: Optional[float] = None   # алерт когда индекс ниже X
+    threshold_above: Optional[float] = None
+    threshold_below: Optional[float] = None
     anomaly_only: bool = False
+
+
+class ChannelRequest(BaseModel):
+    username: str   # например "markettwits" или "https://t.me/markettwits"
+
+
+# ─── Хранилище каналов (в памяти, можно заменить на БД) ──────────────────────
+_channels: list[dict] = []
+_collector_ref = None   # ссылка на TelegramCollector, устанавливается из main.py
+
+
+def set_collector(collector):
+    """Вызывается из main.py чтобы дать API доступ к коллектору"""
+    global _collector_ref
+    _collector_ref = collector
 
 
 # ─── Startup / Shutdown ───────────────────────────────────────────────────────
@@ -210,6 +225,116 @@ async def get_anomalies():
 async def get_stats():
     """Статистика работы агрегатора"""
     return aggregator.get_stats()
+
+
+# ─── Управление каналами ──────────────────────────────────────────────────────
+
+@app.get("/api/channels", summary="Список каналов")
+async def get_channels():
+    """Получить список всех подключённых каналов"""
+    from config.settings import TELEGRAM_CHANNELS
+    # Объединяем дефолтные и добавленные вручную
+    all_channels = []
+    for ch in TELEGRAM_CHANNELS:
+        all_channels.append({
+            "username": ch,
+            "status": "active",
+            "source": "config",
+        })
+    for ch in _channels:
+        all_channels.append(ch)
+    return {"channels": all_channels, "count": len(all_channels)}
+
+
+@app.post("/api/channels", summary="Добавить канал")
+async def add_channel(req: ChannelRequest):
+    """
+    Добавить новый Telegram-канал для мониторинга.
+    Аккаунт автоматически вступает в канал.
+    """
+    if not _collector_ref:
+        raise HTTPException(status_code=503, detail="Telegram коллектор не запущен")
+
+    # Очищаем username
+    username = req.username.strip()
+    username = username.replace("https://t.me/", "").replace("@", "").strip("/")
+
+    # Проверяем дубликаты
+    from config.settings import TELEGRAM_CHANNELS
+    existing = [c["username"] for c in _channels] + TELEGRAM_CHANNELS
+    if username in existing:
+        raise HTTPException(status_code=400, detail=f"Канал @{username} уже подключён")
+
+    # Пробуем вступить в канал
+    try:
+        entity = await _collector_ref.client.get_entity(username)
+        title = getattr(entity, "title", username)
+        members = getattr(entity, "participants_count", None)
+
+        # Вступаем в канал
+        try:
+            from telethon.tl.functions.channels import JoinChannelRequest
+            await _collector_ref.client(JoinChannelRequest(entity))
+            joined = True
+        except Exception:
+            joined = False  # Может быть уже состоим или публичный канал
+
+        # Добавляем в список мониторинга
+        channel_info = {
+            "username": username,
+            "title": title,
+            "members": members,
+            "status": "active",
+            "source": "manual",
+            "joined": joined,
+        }
+        _channels.append(channel_info)
+
+        # Добавляем обработчик новых сообщений для этого канала
+        _collector_ref.channels.append(username)
+
+        logger.info(f"✅ Канал добавлен: @{username} ({title}), вступили: {joined}")
+        return {"success": True, "channel": channel_info}
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Не удалось добавить @{username}: {str(e)}")
+
+
+@app.delete("/api/channels/{username}", summary="Удалить канал")
+async def remove_channel(username: str):
+    """Удалить канал из мониторинга"""
+    global _channels
+    before = len(_channels)
+    _channels = [c for c in _channels if c["username"] != username]
+
+    if _collector_ref and username in _collector_ref.channels:
+        _collector_ref.channels.remove(username)
+
+    if len(_channels) < before:
+        return {"success": True, "message": f"Канал @{username} удалён"}
+    else:
+        raise HTTPException(status_code=404, detail=f"Канал @{username} не найден")
+
+
+@app.get("/api/channels/search/{query}", summary="Поиск канала в Telegram")
+async def search_channel(query: str):
+    """Найти канал по username и получить информацию о нём"""
+    if not _collector_ref:
+        raise HTTPException(status_code=503, detail="Telegram коллектор не запущен")
+
+    username = query.replace("https://t.me/", "").replace("@", "").strip("/")
+
+    try:
+        entity = await _collector_ref.client.get_entity(username)
+        return {
+            "username": username,
+            "title": getattr(entity, "title", username),
+            "members": getattr(entity, "participants_count", None),
+            "about": getattr(entity, "about", ""),
+            "found": True,
+        }
+    except Exception as e:
+        return {"found": False, "error": str(e)}
 
 
 # ─── WebSocket (реалтайм) ─────────────────────────────────────────────────────

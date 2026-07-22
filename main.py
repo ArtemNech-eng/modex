@@ -26,7 +26,7 @@ from src.collector.telegram_collector import TelegramCollector
 from src.nlp.sentiment_analyzer import SentimentAnalyzer, keyword_sentiment
 from src.nlp.ticker_extractor import extract_tickers, is_market_related
 from src.aggregator.aggregator import SentimentAggregator
-from src.api.main import app, aggregator as api_aggregator, connected_websockets, analyzer as api_analyzer
+from src.api.main import app, aggregator as api_aggregator, connected_websockets, analyzer as api_analyzer, set_collector
 from config.settings import TELEGRAM_CHANNELS
 
 logging.basicConfig(
@@ -156,6 +156,7 @@ async def telegram_pipeline():
 
     logger.info("⏳ Подключаемся к Telegram...")
     await collector.start()
+    set_collector(collector)  # даём API доступ к коллектору
     logger.info(f"✅ Подключено! Слушаем {len(TELEGRAM_CHANNELS)} каналов.")
 
     # Загружаем NLP-модель

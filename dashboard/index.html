@@ -263,6 +263,66 @@
     margin-right: 4px;
   }
 
+  /* ── Каналы ── */
+  .channels-card { margin-bottom: 24px; }
+  .channel-add-row { display: flex; gap: 10px; margin-bottom: 16px; }
+  .channel-input {
+    flex: 1;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-size: 14px;
+    padding: 10px 14px;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  .channel-input:focus { border-color: var(--blue); }
+  .channel-input::placeholder { color: var(--text-dim); }
+  .channels-list { display: flex; flex-direction: column; gap: 8px; }
+  .channel-item {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .channel-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .channel-dot.active { background: var(--green); }
+  .channel-dot.pending { background: var(--yellow); animation: pulse 1.5s infinite; }
+  .channel-info { flex: 1; }
+  .channel-name { font-size: 14px; font-weight: 600; }
+  .channel-meta { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+  .channel-remove {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-dim);
+    padding: 4px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .channel-remove:hover { border-color: var(--red); color: var(--red); }
+  .channel-preview {
+    background: var(--surface2);
+    border: 1px solid var(--blue);
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-bottom: 10px;
+    display: none;
+  }
+  .channel-preview.show { display: block; }
+  .preview-title { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+  .preview-meta { font-size: 12px; color: var(--text-dim); }
+  .btn-success { background: var(--green); }
+
   /* ── Footer ── */
   footer {
     text-align: center;
@@ -349,6 +409,37 @@
     <div class="section-title">Тикеры · Индексы настроения</div>
     <div class="tickers-grid" id="tickersGrid">
       <div style="color:var(--text-dim);font-size:13px;">Загружаем данные...</div>
+    </div>
+  </div>
+
+  <!-- ── Управление каналами ── -->
+  <div class="card channels-card">
+    <div class="section-title" style="margin-bottom:14px;">📡 Telegram-каналы для мониторинга</div>
+
+    <!-- Поиск и добавление -->
+    <div class="channel-add-row">
+      <input
+        class="channel-input"
+        id="channelInput"
+        placeholder="Введи @username или https://t.me/username..."
+        onkeydown="if(event.key==='Enter') searchChannel()"
+      />
+      <button class="btn" onclick="searchChannel()" id="searchBtn">Найти</button>
+    </div>
+
+    <!-- Превью найденного канала -->
+    <div class="channel-preview" id="channelPreview">
+      <div class="preview-title" id="previewTitle"></div>
+      <div class="preview-meta" id="previewMeta"></div>
+      <div style="margin-top:10px;display:flex;gap:8px;">
+        <button class="btn btn-success" onclick="addChannel()" id="addBtn">✅ Добавить и вступить</button>
+        <button class="btn" style="background:var(--surface2);border:1px solid var(--border);" onclick="cancelPreview()">Отмена</button>
+      </div>
+    </div>
+
+    <!-- Список каналов -->
+    <div class="channels-list" id="channelsList">
+      <div style="color:var(--text-dim);font-size:13px;">Загрузка...</div>
     </div>
   </div>
 
@@ -633,10 +724,130 @@ async function pollFallback() {
   setInterval(fetchAll, 5000);
 }
 
+// ── Управление каналами ───────────────────────────────────────────────────────
+let foundChannel = null;
+
+async function loadChannels() {
+  try {
+    const resp = await fetch(`${API_BASE}/api/channels`);
+    const data = await resp.json();
+    renderChannels(data.channels);
+  } catch(e) {
+    document.getElementById('channelsList').innerHTML =
+      '<div style="color:var(--text-dim);font-size:13px;">Не удалось загрузить каналы</div>';
+  }
+}
+
+function renderChannels(channels) {
+  const list = document.getElementById('channelsList');
+  if (!channels || channels.length === 0) {
+    list.innerHTML = '<div style="color:var(--text-dim);font-size:13px;">Нет подключённых каналов</div>';
+    return;
+  }
+  list.innerHTML = channels.map(ch => `
+    <div class="channel-item">
+      <div class="channel-dot ${ch.status === 'active' ? 'active' : 'pending'}"></div>
+      <div class="channel-info">
+        <div class="channel-name">@${ch.username} ${ch.title ? '· ' + ch.title : ''}</div>
+        <div class="channel-meta">
+          ${ch.members ? ch.members.toLocaleString('ru') + ' подписчиков · ' : ''}
+          ${ch.source === 'config' ? 'Базовый канал' : 'Добавлен вручную'}
+          ${ch.joined ? ' · ✅ Вступили' : ''}
+        </div>
+      </div>
+      ${ch.source === 'manual' ? `
+        <button class="channel-remove" onclick="removeChannel('${ch.username}')">✕</button>
+      ` : ''}
+    </div>
+  `).join('');
+}
+
+async function searchChannel() {
+  const input = document.getElementById('channelInput').value.trim();
+  if (!input) return;
+
+  const btn = document.getElementById('searchBtn');
+  btn.textContent = '...';
+  btn.disabled = true;
+
+  const username = input.replace('https://t.me/', '').replace('@', '').trim('/');
+
+  try {
+    const resp = await fetch(`${API_BASE}/api/channels/search/${username}`);
+    const data = await resp.json();
+
+    if (data.found) {
+      foundChannel = data;
+      document.getElementById('previewTitle').textContent =
+        `${data.title || '@' + username}`;
+      document.getElementById('previewMeta').textContent =
+        `@${username}` +
+        (data.members ? ` · ${data.members.toLocaleString('ru')} подписчиков` : '') +
+        (data.about ? ` · ${data.about.slice(0, 80)}` : '');
+      document.getElementById('channelPreview').classList.add('show');
+    } else {
+      alert(`Канал @${username} не найден: ${data.error || 'неизвестная ошибка'}`);
+    }
+  } catch(e) {
+    alert('Ошибка поиска. Проверьте подключение.');
+  } finally {
+    btn.textContent = 'Найти';
+    btn.disabled = false;
+  }
+}
+
+async function addChannel() {
+  if (!foundChannel) return;
+
+  const btn = document.getElementById('addBtn');
+  btn.textContent = 'Добавляю...';
+  btn.disabled = true;
+
+  try {
+    const resp = await fetch(`${API_BASE}/api/channels`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: foundChannel.username })
+    });
+    const data = await resp.json();
+
+    if (data.success) {
+      document.getElementById('channelInput').value = '';
+      cancelPreview();
+      await loadChannels();
+      alert(`✅ Канал @${foundChannel.username} добавлен!${data.channel.joined ? ' Аккаунт вступил в канал.' : ''}`);
+    } else {
+      alert(`Ошибка: ${data.detail}`);
+    }
+  } catch(e) {
+    alert('Ошибка добавления канала.');
+  } finally {
+    btn.textContent = '✅ Добавить и вступить';
+    btn.disabled = false;
+  }
+}
+
+async function removeChannel(username) {
+  if (!confirm(`Удалить @${username} из мониторинга?`)) return;
+
+  try {
+    await fetch(`${API_BASE}/api/channels/${username}`, { method: 'DELETE' });
+    await loadChannels();
+  } catch(e) {
+    alert('Ошибка удаления.');
+  }
+}
+
+function cancelPreview() {
+  foundChannel = null;
+  document.getElementById('channelPreview').classList.remove('show');
+}
+
 // ── Старт ─────────────────────────────────────────────────────────────────────
 initChart();
 initFeed();
 connectWS();
+loadChannels();
 </script>
 </body>
 </html>
