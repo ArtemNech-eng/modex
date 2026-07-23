@@ -110,8 +110,8 @@ async def run_pulse_backfill(days: int = 730, tickers=None,
     Выкачать историю Пульса по тикерам и сохранить дневное настроение.
     Не требует Telegram-коллектора — Пульс тянется по HTTP.
     """
-    from src.collector.pulse_collector import PulseCollector
-    from config.settings import MOEX_TICKERS, PULSE_TICKERS
+    from src.collector.pulse_collector import PulseCollector, PULSE_TICKERS
+    from config.settings import MOEX_TICKERS
 
     tickers = tickers or PULSE_TICKERS or list(MOEX_TICKERS.keys())
     collector = PulseCollector(tickers=tickers)
