@@ -180,3 +180,14 @@ def is_market_related(text: str) -> bool:
     
     # Иначе проверяем ключевые слова
     return any(kw in text_lower for kw in market_keywords)
+
+
+def is_noise(text: str) -> bool:
+    """
+    Обратная функция к is_market_related.
+    Возвращает True если текст НЕ относится к рынку (шум, реклама, флуд).
+    Используется в бэкфилле для отсева нерелевантных сообщений.
+    """
+    if not text or len(text.strip()) < 5:
+        return True
+    return not is_market_related(text)
