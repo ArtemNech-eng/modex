@@ -18,36 +18,73 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-CLAUDE_API = "https://api.anthropic.com/v1/messages"
-CLAUDE_MODEL = "claude-sonnet-4-5"
+# Поддерживаются два формата API:
+#   "anthropic" — нативный Anthropic (api.anthropic.com)
+#   "openai"    — OpenAI-совместимые прокси (gen-api.ru, openrouter.ai и др.)
+# Задаётся через AI_PROVIDER в .env (по умолчанию "openai" для прокси-сервисов)
+_PROVIDER = os.getenv("AI_PROVIDER", "openai").lower()
+_BASE_URL  = os.getenv(
+    "AI_BASE_URL",
+    "https://api.gen-api.ru/v1" if _PROVIDER == "openai" else "https://api.anthropic.com",
+)
+_MODEL = os.getenv("AI_MODEL", "claude-sonnet-4-5")
 
 
 class ClaudeAgent:
 
     def __init__(self, api_key: str = None):
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY", "")
-        self.headers = {
-            "x-api-key": self.api_key,
-            "anthropic-version": "2023-06-01",
+        self.provider = _PROVIDER
+        self.base_url = _BASE_URL.rstrip("/")
+        self.model = _MODEL
+
+    def _build_headers(self) -> dict:
+        if self.provider == "anthropic":
+            return {
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            }
+        # OpenAI-совместимый формат (gen-api.ru, openrouter и др.)
+        return {
+            "Authorization": f"Bearer {self.api_key}",
             "content-type": "application/json",
         }
 
     async def _ask(self, system: str, user: str, max_tokens: int = 1024) -> str:
-        """Отправить запрос к Claude"""
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                CLAUDE_API,
-                headers=self.headers,
-                json={
-                    "model": CLAUDE_MODEL,
-                    "max_tokens": max_tokens,
-                    "system": system,
-                    "messages": [{"role": "user", "content": user}],
-                },
-            )
+        """Отправить запрос к AI (Anthropic или OpenAI-совместимый прокси)"""
+        headers = self._build_headers()
+
+        if self.provider == "anthropic":
+            url = f"{self.base_url}/v1/messages"
+            payload = {
+                "model": self.model,
+                "max_tokens": max_tokens,
+                "system": system,
+                "messages": [{"role": "user", "content": user}],
+            }
+        else:
+            # OpenAI chat/completions формат
+            url = f"{self.base_url}/chat/completions"
+            payload = {
+                "model": self.model,
+                "max_tokens": max_tokens,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            }
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(url, headers=headers, json=payload)
             if resp.status_code != 200:
-                raise RuntimeError(f"Claude API error {resp.status_code}: {resp.text[:200]}")
-            return resp.json()["content"][0]["text"]
+                raise RuntimeError(f"AI API error {resp.status_code}: {resp.text[:300]}")
+            data = resp.json()
+
+        if self.provider == "anthropic":
+            return data["content"][0]["text"]
+        else:
+            return data["choices"][0]["message"]["content"]
 
     async def analyze_sentiment_batch(self, messages: list[str]) -> list[dict]:
         """
