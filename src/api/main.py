@@ -719,28 +719,59 @@ async def get_chart_analysis(ticker: str):
 
 
 
-@app.get("/api/backtest-claude/{ticker}", summary="Исторический бэктест стратегии Claude")
-async def backtest_claude(
+
+# Хранилище статуса бэктеста (один за раз)
+_bt_claude_status: dict = {"running": False, "progress": None, "result": None, "error": None}
+
+
+@app.post("/api/backtest-claude/{ticker}", summary="Запустить настоящий бэктест Claude")
+async def start_claude_backtest(
     ticker: str,
-    min_confidence: float = 0.3,
     hold_days: int = 5,
+    min_confidence: int = 40,
+    max_calls: int = 60,
     commission: float = 0.05,
 ):
     """
-    Walk-forward бэктест: симулируем решения системы на 2 годах истории.
-    Каждые 5 дней генерируется сигнал на данных доступных в тот день.
-    Метрики: точность, доходность, Sharpe, MaxDD, сравнение с buy&hold.
+    Запускает реальный бэктест: Claude анализирует каждую историческую дату.
+    Фоновый процесс — результат получить через GET /api/backtest-claude/status
     """
-    from src.agent.historical_backtest import run_historical_backtest
+    from src.agent.historical_backtest import run_real_claude_backtest
+
     ticker = ticker.upper()
     if ticker not in MOEX_TICKERS:
         raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
-    return await run_historical_backtest(
-        ticker=ticker,
-        min_confidence=min_confidence,
-        hold_days=hold_days,
-        commission_pct=commission,
-    )
+    if _bt_claude_status["running"]:
+        return {"status": "already_running", **_bt_claude_status}
+
+    _bt_claude_status.update({"running": True, "progress": None, "result": None, "error": None})
+
+    def on_progress(p):
+        _bt_claude_status["progress"] = p
+
+    async def run():
+        try:
+            result = await run_real_claude_backtest(
+                ticker=ticker,
+                hold_days=hold_days,
+                min_confidence=min_confidence,
+                max_calls=max_calls,
+                commission_pct=commission,
+                progress_callback=on_progress,
+            )
+            _bt_claude_status["result"] = result
+        except Exception as e:
+            _bt_claude_status["error"] = str(e)
+        finally:
+            _bt_claude_status["running"] = False
+
+    asyncio.create_task(run())
+    return {"status": "started", "ticker": ticker, "max_calls": max_calls}
+
+
+@app.get("/api/backtest-claude/status", summary="Статус и результат бэктеста Claude")
+async def get_claude_backtest_status():
+    return _bt_claude_status
 
 
 async def get_accuracy(ticker: Optional[str] = None):

@@ -1,20 +1,21 @@
 """
-MOODEX — Historical Backtest для стратегии Claude
+MOODEX — Настоящий исторический бэктест Claude
 
-Walk-forward тест: для каждого торгового дня в истории
-берём данные которые были доступны НА ТОТ МОМЕНТ
-(не заглядываем в будущее!) и симулируем решение.
+Для каждой исторической даты:
+  1. Берём данные ДОСТУПНЫЕ В ТОТ ДЕНЬ (свечи до этой даты, настроение)
+  2. Реально вызываем Claude с историческим контекстом
+  3. Записываем его решение (up/down/flat + уверенность)
+  4. Сравниваем с тем что реально произошло с ценой
 
-Метрики:
-  - Точность направления (up/down)
-  - Суммарная доходность vs buy-and-hold
-  - Sharpe ratio
-  - Max drawdown
-  - Win rate по сделкам
-  - Доходность при разных порогах уверенности
+Это честный тест — Claude не знает будущего, видит только прошлое.
+
+⚠️  На 2 года данных, каждые 5 дней ≈ 100 вызовов Claude.
+    Занимает 5-15 минут. Каждый вызов использует токены.
 """
+import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+import math
+from datetime import datetime, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -23,7 +24,7 @@ logger = logging.getLogger(__name__)
 def _sma(closes: list[float], period: int) -> Optional[float]:
     if len(closes) < period:
         return None
-    return sum(closes[-period:]) / period
+    return round(sum(closes[-period:]) / period, 2)
 
 
 def _rsi(closes: list[float], period: int = 14) -> Optional[float]:
@@ -39,74 +40,117 @@ def _rsi(closes: list[float], period: int = 14) -> Optional[float]:
     for i in range(period, len(gains)):
         ag = (ag * (period - 1) + gains[i]) / period
         al = (al * (period - 1) + losses[i]) / period
-    return 100 - 100 / (1 + ag / al) if al != 0 else 100
+    return round(100 - 100 / (1 + ag / al), 1) if al != 0 else 100.0
 
 
-def _simulate_signal(
-    closes: list[float],
-    sentiment: Optional[float],    # 0-100
-    sentiment_signal: Optional[float],  # -1..+1
-) -> tuple[str, float]:
-    """
-    Симулируем решение Claude на исторических данных.
-    Используем те же факторы что и реальная система:
-      - Технический сигнал (SMA cross, RSI)
-      - Настроение (из sentiment_daily)
-    Возвращает (direction, confidence).
-    """
-    if len(closes) < 50:
-        return "flat", 0.0
-
-    price = closes[-1]
-    s20   = _sma(closes, 20)
-    s50   = _sma(closes, 50)
-    r     = _rsi(closes, 14)
-
-    tech_score = 0.0
-    if s20 and s50:
-        tech_score += 0.5 if s20 > s50 else -0.5
-    if price and s20:
-        tech_score += 0.3 if price > s20 else -0.3
-    if r:
-        if r < 30:   tech_score += 0.3
-        elif r > 70: tech_score -= 0.3
-
-    sent_score = 0.0
-    if sentiment_signal is not None:
-        sent_score = sentiment_signal  # -1..+1
-
-    # Взвешиваем: техника 60%, настроение 40%
-    combined = 0.6 * tech_score + 0.4 * sent_score
-    combined = max(-1.0, min(1.0, combined))
-
-    if combined > 0.15:
-        return "up", abs(combined)
-    elif combined < -0.15:
-        return "down", abs(combined)
-    return "flat", abs(combined)
+def _pct(closes: list[float], n: int) -> Optional[float]:
+    if len(closes) <= n or closes[-n - 1] == 0:
+        return None
+    return round((closes[-1] / closes[-n - 1] - 1) * 100, 2)
 
 
-async def run_historical_backtest(
+async def _ask_claude_historical(
+    claude_agent,
     ticker: str,
-    min_confidence: float = 0.3,
-    hold_days: int = 5,
-    commission_pct: float = 0.05,
+    company: str,
+    date: str,
+    closes_to_date: list[float],
+    sentiment: Optional[dict],
 ) -> dict:
     """
-    Полный walk-forward бэктест стратегии на истории.
+    Вызываем Claude с данными которые были доступны на конкретную дату.
+    Используем облегчённый промпт чтобы экономить токены.
+    """
+    price  = closes_to_date[-1]
+    s20    = _sma(closes_to_date, 20)
+    s50    = _sma(closes_to_date, 50)
+    r      = _rsi(closes_to_date, 14)
+    ch1    = _pct(closes_to_date, 1)
+    ch5    = _pct(closes_to_date, 5)
+    ch20   = _pct(closes_to_date, 20)
 
-    Алгоритм:
-      1. Берём 2 года дневных свечей MOEX
-      2. Берём историю настроений из БД (sentiment_daily)
-      3. Для каждого дня симулируем сигнал на данных ДОСТУПНЫХ В ТОТ ДЕНЬ
-      4. Открываем позицию на следующий день по цене открытия
-      5. Закрываем через hold_days дней
-      6. Считаем P&L
+    # Режим рынка
+    if s20 and s50:
+        if price > s20 > s50:
+            regime = "восходящий тренд"
+        elif price < s20 < s50:
+            regime = "нисходящий тренд"
+        else:
+            regime = "боковик"
+    else:
+        regime = "нет данных"
+
+    sent_block = ""
+    if sentiment:
+        idx = sentiment.get("sentiment_index", 50)
+        sig = sentiment.get("avg_signal", 0)
+        cnt = sentiment.get("msg_count", 0)
+        mood = "бычье" if idx > 60 else "медвежье" if idx < 40 else "нейтральное"
+        sent_block = f"Настроение толпы: {idx:.0f}/100 ({mood}), {cnt} сообщений, сигнал {sig:+.3f}"
+    else:
+        sent_block = "Настроение: нет данных"
+
+    system = """Ты трейдер на Московской бирже. Дата фиксирована — не знаешь что будет после.
+Оцени акцию и дай прогноз на 5 торговых дней.
+Отвечай ТОЛЬКО JSON, без пояснений."""
+
+    user = f"""Дата: {date}
+Акция: {ticker} ({company})
+Цена: {price:.2f} ₽
+SMA20: {s20} | SMA50: {s50}
+RSI(14): {r}
+Изменение: день {ch1:+.1f}% | неделя {ch5:+.1f}% | месяц {ch20:+.1f}%
+Режим: {regime}
+{sent_block}
+Доступно свечей: {len(closes_to_date)}
+
+Прогноз на 5 дней:
+{{"signal":"bullish|bearish|neutral","confidence":0-100,"reason":"1 предложение"}}"""
+
+    try:
+        result = await claude_agent._ask(system, user, max_tokens=150)
+        import json
+        start = result.find("{")
+        end   = result.rfind("}") + 1
+        if start >= 0 and end > start:
+            data = json.loads(result[start:end])
+            return {
+                "signal":     data.get("signal", "neutral"),
+                "confidence": data.get("confidence", 0),
+                "reason":     data.get("reason", ""),
+            }
+    except Exception as e:
+        logger.debug(f"Claude historical call failed {date}: {e}")
+
+    return {"signal": "neutral", "confidence": 0, "reason": "ошибка"}
+
+
+async def run_real_claude_backtest(
+    ticker: str,
+    step_days: int = 5,
+    hold_days: int = 5,
+    min_confidence: int = 40,
+    max_calls: int = 60,
+    commission_pct: float = 0.05,
+    progress_callback=None,
+) -> dict:
+    """
+    Настоящий бэктест — Claude реально анализирует каждую историческую дату.
+
+    step_days:      каждые N дней генерируем сигнал
+    hold_days:      удерживаем позицию N дней
+    min_confidence: минимальная уверенность Claude для входа (0-100)
+    max_calls:      максимум вызовов Claude (ограничение по стоимости)
     """
     from src.analysis import technical as ta
+    from src.agent.claude_agent import ClaudeAgent
     from src import db
+    from config.settings import MOEX_TICKERS
 
-    # Загружаем данные
+    claude = ClaudeAgent()
+    company = MOEX_TICKERS.get(ticker, ticker)
+
+    # Загружаем все свечи
     try:
         candles = await ta.fetch_candles(ticker, days=730)
     except Exception as e:
@@ -117,134 +161,162 @@ async def run_historical_backtest(
     dates  = candles.get("dates", [])
 
     if len(closes) < 100:
-        return {"error": "Мало исторических данных (< 100 дней)"}
+        return {"error": "Недостаточно данных (< 100 дней)"}
 
     # История настроений
-    hist = await db.sentiment_history(ticker=ticker, limit=1000)
-    sent_by_date = {h["date"]: h for h in hist}
+    hist      = await db.sentiment_history(ticker=ticker, limit=1000)
+    sent_map  = {h["date"]: h for h in hist}
 
-    # Walk-forward: каждые 5 дней генерируем сигнал
-    trades = []
-    equity = [1.0]   # нормированный капитал
-    capital = 1.0
-    in_position = None  # {"direction", "entry_price", "entry_date", "confidence"}
+    # Выбираем точки для анализа
+    # Идём с конца чтобы взять свежие данные, не старые
+    analysis_points = []
+    i = 60   # минимум 60 свечей для индикаторов
+    while i < len(closes) - hold_days - 1 and len(analysis_points) < max_calls:
+        analysis_points.append(i)
+        i += step_days
 
-    for i in range(60, len(closes) - hold_days - 1):
-        date = dates[i][:10] if i < len(dates) else ""
+    if not analysis_points:
+        return {"error": "Нет точек для анализа"}
 
-        # Закрываем позицию если пора
-        if in_position and i >= in_position["exit_idx"]:
-            exit_price = opens[i] if i < len(opens) else closes[i]
-            entry_price = in_position["entry_price"]
-            direction   = in_position["direction"]
+    # Запускаем анализ
+    calls_done = 0
+    trades     = []
+    capital    = 1.0
+    equity     = [1.0]
+    decisions  = []
 
-            ret = (exit_price / entry_price - 1) * 100
-            if direction == "down":
-                ret = -ret
-            ret -= commission_pct * 2  # комиссия туда-обратно
+    for idx, point_i in enumerate(analysis_points):
+        date         = dates[point_i][:10] if point_i < len(dates) else ""
+        closes_to    = closes[:point_i + 1]
+        sentiment    = sent_map.get(date)
 
-            correct = ret > 0
-            trades.append({
-                "date":        in_position["entry_date"],
-                "ticker":      ticker,
-                "direction":   direction,
-                "confidence":  in_position["confidence"],
-                "entry":       entry_price,
-                "exit":        exit_price,
-                "return_pct":  round(ret, 2),
-                "correct":     correct,
-                "hold_days":   hold_days,
+        if progress_callback:
+            progress_callback({
+                "done": idx + 1,
+                "total": len(analysis_points),
+                "date": date,
+                "calls": calls_done,
             })
-            capital *= (1 + ret / 100)
-            equity.append(capital)
-            in_position = None
 
-        # Сигнал раз в 5 дней (не каждый день — реалистично)
-        if i % 5 != 0 or in_position:
-            continue
-
-        sent = sent_by_date.get(date, {})
-        direction, confidence = _simulate_signal(
-            closes[:i + 1],
-            sent.get("sentiment_index"),
-            sent.get("avg_signal"),
+        # Вызываем Claude
+        decision = await _ask_claude_historical(
+            claude, ticker, company, date, closes_to, sentiment
         )
+        calls_done += 1
+        decision["date"] = date
 
+        signal_map = {"bullish": "up", "bearish": "down", "neutral": "flat"}
+        direction  = signal_map.get(decision["signal"], "flat")
+        confidence = decision["confidence"]
+
+        decisions.append({
+            "date":       date,
+            "direction":  direction,
+            "confidence": confidence,
+            "reason":     decision.get("reason", ""),
+        })
+
+        # Пропускаем если уверенность ниже порога или нейтрально
         if direction == "flat" or confidence < min_confidence:
             continue
 
-        entry_price = opens[i + 1] if (i + 1) < len(opens) else closes[i]
-        in_position = {
-            "direction":   direction,
-            "entry_price": entry_price,
-            "entry_date":  date,
-            "confidence":  round(confidence, 3),
-            "exit_idx":    i + 1 + hold_days,
-        }
+        # Цена входа — следующий день открытие
+        entry_i = point_i + 1
+        exit_i  = point_i + 1 + hold_days
+        if exit_i >= len(closes):
+            continue
+
+        entry_price = opens[entry_i] if entry_i < len(opens) else closes[entry_i]
+        exit_price  = opens[exit_i]  if exit_i  < len(opens) else closes[exit_i]
+
+        if entry_price == 0:
+            continue
+
+        ret = (exit_price / entry_price - 1) * 100
+        if direction == "down":
+            ret = -ret
+        ret -= commission_pct * 2
+
+        correct = ret > 0
+        capital *= (1 + ret / 100)
+        equity.append(round(capital, 4))
+
+        trades.append({
+            "date":       date,
+            "direction":  direction,
+            "confidence": confidence,
+            "reason":     decision.get("reason", ""),
+            "entry":      round(entry_price, 2),
+            "exit":       round(exit_price, 2),
+            "return_pct": round(ret, 2),
+            "correct":    correct,
+        })
+
+        # Небольшая пауза чтобы не перегружать API
+        await asyncio.sleep(0.3)
 
     if not trades:
-        return {"error": "Недостаточно сделок для статистики"}
+        return {
+            "error":     "Claude не дал ни одного торгового сигнала (всё нейтрально или ниже порога)",
+            "decisions": decisions,
+            "calls_made": calls_done,
+        }
 
-    # ── Метрики ──────────────────────────────────────────────────────────────
-    total      = len(trades)
-    winners    = [t for t in trades if t["correct"]]
-    losers     = [t for t in trades if not t["correct"]]
-    win_rate   = round(len(winners) / total * 100, 1)
-    avg_win    = round(sum(t["return_pct"] for t in winners) / len(winners), 2) if winners else 0
-    avg_loss   = round(sum(t["return_pct"] for t in losers)  / len(losers),  2) if losers  else 0
-    total_ret  = round((capital - 1) * 100, 2)
-    profit_factor = round(-sum(t["return_pct"] for t in winners) /
-                          sum(t["return_pct"] for t in losers), 2) \
-                    if losers and sum(t["return_pct"] for t in losers) != 0 else None
+    # Метрики
+    total     = len(trades)
+    winners   = [t for t in trades if t["correct"]]
+    losers    = [t for t in trades if not t["correct"]]
+    win_rate  = round(len(winners) / total * 100, 1)
+    avg_win   = round(sum(t["return_pct"] for t in winners) / len(winners), 2) if winners else 0
+    avg_loss  = round(sum(t["return_pct"] for t in losers)  / len(losers),  2) if losers  else 0
+    total_ret = round((capital - 1) * 100, 2)
 
-    # Buy & Hold
-    bh_ret = round((closes[-1] / closes[60] - 1) * 100, 2)
+    bh_start = closes[60] if len(closes) > 60 else closes[0]
+    bh_ret   = round((closes[-1] / bh_start - 1) * 100, 2)
 
-    # Max Drawdown
     peak = 1.0
     max_dd = 0.0
     for e in equity:
-        if e > peak:
-            peak = e
-        dd = (peak - e) / peak * 100
-        if dd > max_dd:
-            max_dd = dd
+        peak   = max(peak, e)
+        max_dd = max(max_dd, (peak - e) / peak * 100)
 
-    # Sharpe (упрощённый)
-    rets = [t["return_pct"] / 100 for t in trades]
-    if len(rets) > 1:
-        import math
-        mean_r = sum(rets) / len(rets)
-        std_r  = math.sqrt(sum((r - mean_r) ** 2 for r in rets) / len(rets))
-        sharpe = round(mean_r / std_r * math.sqrt(252 / hold_days), 2) if std_r > 0 else 0
-    else:
-        sharpe = 0
+    rets   = [t["return_pct"] / 100 for t in trades]
+    mean_r = sum(rets) / len(rets)
+    std_r  = math.sqrt(sum((r - mean_r) ** 2 for r in rets) / len(rets)) if len(rets) > 1 else 0
+    sharpe = round(mean_r / std_r * math.sqrt(252 / hold_days), 2) if std_r > 0 else 0
 
-    # Разбивка по уровням уверенности
-    high_conf = [t for t in trades if t["confidence"] >= 0.5]
-    hc_wr = round(sum(1 for t in high_conf if t["correct"]) /
-                  len(high_conf) * 100, 1) if high_conf else None
+    pf = round(-sum(t["return_pct"] for t in winners) /
+               sum(t["return_pct"] for t in losers), 2) \
+         if losers and sum(t["return_pct"] for t in losers) != 0 else None
+
+    # Статистика по уверенности
+    high = [t for t in trades if t["confidence"] >= 60]
+    hc_wr = round(sum(1 for t in high if t["correct"]) / len(high) * 100, 1) if high else None
 
     return {
-        "ticker":         ticker,
-        "period_days":    len(closes),
-        "total_trades":   total,
-        "win_rate":       win_rate,
-        "total_return":   total_ret,
-        "buy_hold_return": bh_ret,
-        "alpha":          round(total_ret - bh_ret, 2),
-        "avg_win":        avg_win,
-        "avg_loss":       avg_loss,
-        "profit_factor":  profit_factor,
-        "max_drawdown":   round(max_dd, 2),
-        "sharpe":         sharpe,
-        "high_conf_trades": len(high_conf),
+        "ticker":             ticker,
+        "mode":               "real_claude",
+        "calls_made":         calls_done,
+        "analysis_points":    len(analysis_points),
+        "total_trades":       total,
+        "win_rate":           win_rate,
+        "total_return":       total_ret,
+        "buy_hold_return":    bh_ret,
+        "alpha":              round(total_ret - bh_ret, 2),
+        "avg_win":            avg_win,
+        "avg_loss":           avg_loss,
+        "profit_factor":      pf,
+        "max_drawdown":       round(max_dd, 2),
+        "sharpe":             sharpe,
+        "high_conf_trades":   len(high),
         "high_conf_win_rate": hc_wr,
-        "recent_trades":  trades[-10:],
-        "equity_curve":   [round(e, 4) for e in equity[-100:]],
+        "equity_curve":       equity,
+        "recent_trades":      trades[-15:],
+        "all_decisions":      decisions[-20:],
         "params": {
-            "min_confidence": min_confidence,
+            "step_days":      step_days,
             "hold_days":      hold_days,
+            "min_confidence": min_confidence,
             "commission_pct": commission_pct,
         },
     }

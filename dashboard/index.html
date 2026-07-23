@@ -375,7 +375,7 @@ header {
       </div>
       <div class="ch-add" style="flex-wrap:wrap;">
         <input class="ch-input" id="claudeBtTicker" placeholder="Тикер, напр. SBER" value="SBER" style="width:120px;">
-        <label style="font-size:12px;color:var(--dim);">Удержание дней:
+        <label style="font-size:12px;color:var(--dim);">Удержание:
           <select id="claudeBtDays" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:3px;">
             <option value="3">3 дня</option>
             <option value="5" selected>5 дней</option>
@@ -383,14 +383,21 @@ header {
             <option value="21">Месяц</option>
           </select>
         </label>
-        <label style="font-size:12px;color:var(--dim);">Мин. уверенность:
+        <label style="font-size:12px;color:var(--dim);">Уверенность:
           <select id="claudeBtConf" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:3px;">
-            <option value="0.2">20%</option>
-            <option value="0.3" selected>30%</option>
-            <option value="0.5">50%</option>
+            <option value="30">30%</option>
+            <option value="40" selected>40%</option>
+            <option value="60">60%</option>
           </select>
         </label>
-        <button class="btn" onclick="runClaudeBacktest()" id="claudeBtBtn">▶ Запустить бэктест</button>
+        <label style="font-size:12px;color:var(--dim);">Точек анализа:
+          <select id="claudeBtCalls" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:3px;">
+            <option value="20">20 (~1 мин)</option>
+            <option value="40" selected>40 (~3 мин)</option>
+            <option value="60">60 (~5 мин)</option>
+          </select>
+        </label>
+        <button class="btn" onclick="runClaudeBacktest()" id="claudeBtBtn">▶ Запустить настоящий бэктест</button>
       </div>
       <div id="claudeBtResult" style="margin-top:12px;"></div>
     </div>
@@ -613,55 +620,124 @@ async function runClaudeBacktest() {
   const ticker = (document.getElementById('claudeBtTicker').value||'SBER').trim().toUpperCase();
   const days   = document.getElementById('claudeBtDays').value;
   const conf   = document.getElementById('claudeBtConf').value;
+  const calls  = document.getElementById('claudeBtCalls').value;
   const btn    = document.getElementById('claudeBtBtn');
   const box    = document.getElementById('claudeBtResult');
-  btn.disabled = true; btn.textContent = '⏳ Считаю...';
-  box.innerHTML = '<div style="color:var(--dim);">Анализирую 2 года истории...</div>';
-  try {
-    const d = await (await fetch(`${API}/api/backtest-claude/${ticker}?min_confidence=${conf}&hold_days=${days}`)).json();
-    if (d.error) { box.innerHTML = `<div style="color:var(--red);">${d.error}</div>`; return; }
 
-    const alpha   = d.alpha >= 0 ? `<span style="color:var(--green)">+${d.alpha}%</span>` : `<span style="color:var(--red)">${d.alpha}%</span>`;
-    const ret     = d.total_return >= 0 ? `<span style="color:var(--green)">+${d.total_return}%</span>` : `<span style="color:var(--red)">${d.total_return}%</span>`;
-    const bh      = d.buy_hold_return >= 0 ? `<span style="color:var(--green)">+${d.buy_hold_return}%</span>` : `<span style="color:var(--red)">${d.buy_hold_return}%</span>`;
-    const wr_col  = d.win_rate >= 55 ? 'var(--green)' : d.win_rate < 45 ? 'var(--red)' : 'var(--yellow)';
-    const sh_col  = d.sharpe >= 1 ? 'var(--green)' : d.sharpe >= 0 ? 'var(--yellow)' : 'var(--red)';
+  btn.disabled = true;
+  box.innerHTML = `<div style="color:var(--blue);">🤖 Запускаю Claude для анализа истории...<br>
+    <span style="color:var(--dim);font-size:11px;">Каждые 5 дней Claude реально анализирует данные того дня.<br>
+    ${calls} вызовов × ~3 сек = ~${Math.round(calls*3/60)} мин. Не закрывайте страницу.</span></div>`;
+
+  try {
+    // Запускаем бэктест
+    const start = await fetch(`${API}/api/backtest-claude/${ticker}`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+    });
+    const startData = await start.json();
+    if (startData.status === 'already_running') {
+      box.innerHTML = `<div style="color:var(--yellow);">⏳ Бэктест уже запущен, жду результат...</div>`;
+    }
+
+    // Поллинг прогресса
+    let result = null;
+    let dots = 0;
+    while (!result) {
+      await new Promise(r => setTimeout(r, 2000));
+      const st = await (await fetch(`${API}/api/backtest-claude/status`)).json();
+
+      if (st.error) {
+        box.innerHTML = `<div style="color:var(--red);">Ошибка: ${st.error}</div>`;
+        return;
+      }
+      if (st.result) {
+        result = st.result;
+        break;
+      }
+      // Показываем прогресс
+      const p = st.progress;
+      dots = (dots + 1) % 4;
+      const d = '.'.repeat(dots);
+      if (p) {
+        const pct = Math.round(p.done / p.total * 100);
+        box.innerHTML = `<div style="color:var(--blue);">
+          🤖 Claude анализирует историю${d}<br>
+          <div style="margin:8px 0;background:var(--surface2);border-radius:4px;height:6px;">
+            <div style="background:var(--blue);height:6px;border-radius:4px;width:${pct}%;transition:width 0.5s;"></div>
+          </div>
+          <span style="color:var(--dim);font-size:11px;">
+            Дата: ${p.date} | Вызов ${p.calls}/${p.total} (${pct}%)
+          </span>
+        </div>`;
+      }
+    }
+
+    if (result.error) { box.innerHTML = `<div style="color:var(--red);">${result.error}</div>`; return; }
+
+    // Рендерим результат
+    const wr_col  = result.win_rate >= 55 ? 'var(--green)' : result.win_rate < 45 ? 'var(--red)' : 'var(--yellow)';
+    const sh_col  = result.sharpe >= 1 ? 'var(--green)' : result.sharpe >= 0 ? 'var(--yellow)' : 'var(--red)';
+    const ret_col = result.total_return >= 0 ? 'var(--green)' : 'var(--red)';
+    const a_col   = result.alpha >= 0 ? 'var(--green)' : 'var(--red)';
 
     let tradesHtml = '';
-    (d.recent_trades||[]).slice(-8).reverse().forEach(t => {
+    (result.recent_trades||[]).slice().reverse().forEach(t => {
       const col = t.correct ? 'var(--green)' : 'var(--red)';
-      const dir = t.direction === 'up' ? '↑' : '↓';
+      const dir = t.direction === 'up' ? '↑ ЛОНГ' : '↓ ШОРТ';
       tradesHtml += `<tr>
-        <td>${t.date}</td>
-        <td style="color:${col}">${dir} ${t.direction==='up'?'ЛОНГ':'ШОРТ'}</td>
-        <td>${Math.round(t.confidence*100)}%</td>
-        <td style="color:${col}">${t.return_pct > 0 ? '+' : ''}${t.return_pct}%</td>
-        <td>${t.correct ? '✅' : '❌'}</td>
+        <td style="padding:3px 6px;">${t.date}</td>
+        <td style="color:${col};padding:3px 6px;">${dir}</td>
+        <td style="padding:3px 6px;">${t.confidence}%</td>
+        <td style="color:${col};padding:3px 6px;">${t.return_pct > 0 ? '+' : ''}${t.return_pct}%</td>
+        <td style="padding:3px 6px;">${t.correct ? '✅' : '❌'}</td>
+        <td style="padding:3px 6px;color:var(--dim);font-size:10px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${t.reason||''}</td>
       </tr>`;
     });
 
+    // Кривая капитала мини
+    const eq = result.equity_curve || [];
+    const eqMini = eq.length > 0 ? eq.map((v,i) => {
+      const x = Math.round(i / (eq.length-1) * 100);
+      const y = Math.round((1 - (v - Math.min(...eq)) / (Math.max(...eq) - Math.min(...eq) + 0.001)) * 60);
+      return `${x},${y}`;
+    }).join(' ') : '';
+
     box.innerHTML = `
       <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px;">
-        ${metricCard('Доходность стратегии', d.total_return + '%', d.total_return >= 0 ? 'var(--green)' : 'var(--red)')}
-        ${metricCard('Buy & Hold', d.buy_hold_return + '%', d.buy_hold_return >= 0 ? 'var(--green)' : 'var(--red)')}
-        ${metricCard('Альфа vs рынка', (d.alpha >= 0 ? '+' : '') + d.alpha + '%', d.alpha >= 0 ? 'var(--green)' : 'var(--red)')}
-        ${metricCard('Win Rate', d.win_rate + '%', wr_col)}
-        ${metricCard('Sharpe Ratio', d.sharpe, sh_col)}
-        ${metricCard('Max Drawdown', '-' + d.max_drawdown + '%', 'var(--red)')}
-        ${metricCard('Сделок всего', d.total_trades, 'var(--text)')}
-        ${metricCard('Profit Factor', d.profit_factor || '—', d.profit_factor >= 1.5 ? 'var(--green)' : 'var(--yellow)')}
+        ${metricCard('Доходность Claude', (result.total_return>=0?'+':'')+result.total_return+'%', ret_col)}
+        ${metricCard('Buy & Hold', (result.buy_hold_return>=0?'+':'')+result.buy_hold_return+'%', result.buy_hold_return>=0?'var(--green)':'var(--red)')}
+        ${metricCard('Альфа', (result.alpha>=0?'+':'')+result.alpha+'%', a_col)}
+        ${metricCard('Win Rate', result.win_rate+'%', wr_col)}
+        ${metricCard('Sharpe', result.sharpe, sh_col)}
+        ${metricCard('Max Drawdown', '-'+result.max_drawdown+'%', 'var(--red)')}
+        ${metricCard('Сделок', result.total_trades, 'var(--text)')}
+        ${metricCard('Profit Factor', result.profit_factor||'—', result.profit_factor>=1.5?'var(--green)':'var(--yellow)')}
       </div>
-      ${d.high_conf_win_rate ? `<div style="font-size:12px;color:var(--dim);margin-bottom:10px;">
-        При уверенности ≥50%: ${d.high_conf_trades} сделок, win rate <b style="color:var(--green)">${d.high_conf_win_rate}%</b>
+      ${result.high_conf_win_rate ? `<div style="background:var(--surface2);padding:8px 12px;border-radius:6px;font-size:12px;margin-bottom:10px;border-left:3px solid var(--green);">
+        🎯 При уверенности Claude ≥60%: <b>${result.high_conf_trades} сделок</b>, win rate <b style="color:var(--green)">${result.high_conf_win_rate}%</b>
       </div>` : ''}
-      <div style="font-size:12px;font-weight:600;margin-bottom:6px;">Последние сделки:</div>
-      <table style="width:100%;font-size:11px;border-collapse:collapse;">
-        <tr style="color:var(--dim);"><th style="text-align:left;">Дата</th><th>Направление</th><th>Уверенность</th><th>Доход</th><th>Итог</th></tr>
-        ${tradesHtml}
-      </table>
+      ${eqMini ? `<div style="background:var(--surface2);padding:8px;border-radius:6px;margin-bottom:10px;">
+        <div style="font-size:11px;color:var(--dim);margin-bottom:4px;">Кривая капитала (${eq.length} точек)</div>
+        <svg width="100%" height="65" viewBox="0 0 100 65" preserveAspectRatio="none">
+          <polyline points="${eqMini}" fill="none" stroke="${result.total_return>=0?'#3fb950':'#f85149'}" stroke-width="1.5"/>
+          <line x1="0" y1="30" x2="100" y2="30" stroke="#ffffff22" stroke-width="0.5" stroke-dasharray="2,2"/>
+        </svg>
+      </div>` : ''}
+      <div style="font-size:12px;font-weight:600;margin-bottom:6px;">Сделки Claude (с его обоснованием):</div>
+      <div style="overflow-x:auto;">
+        <table style="width:100%;font-size:11px;border-collapse:collapse;">
+          <tr style="color:var(--dim);"><th style="text-align:left;padding:3px 6px;">Дата</th><th>Направление</th><th>Уверенность</th><th>Доход</th><th>Итог</th><th style="text-align:left;">Причина Claude</th></tr>
+          ${tradesHtml}
+        </table>
+      </div>
       <div style="font-size:10px;color:var(--dim);margin-top:8px;">
-        Период: ${d.period_days} дней | Удержание: ${days} дней | Мин. уверенность: ${Math.round(conf*100)}% | Комиссия: 0.05% × 2
+        🤖 Claude сделал ${result.calls_made} реальных вызовов API | 
+        Удержание: ${result.params.hold_days} дней | 
+        Мин. уверенность: ${result.params.min_confidence}% | 
+        Комиссия: ${result.params.commission_pct}% × 2
       </div>`;
+
   } catch(e) {
     box.innerHTML = `<div style="color:var(--red);">Ошибка: ${e.message}</div>`;
   } finally {
