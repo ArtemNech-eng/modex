@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 _PROVIDER = os.getenv("AI_PROVIDER", "openai").lower()
 _BASE_URL  = os.getenv(
     "AI_BASE_URL",
-    "https://api.gen-api.ru/v1" if _PROVIDER == "openai" else "https://api.anthropic.com",
+    "https://proxy.gen-api.ru/v1" if _PROVIDER == "openai" else "https://api.anthropic.com",
 )
 _MODEL = os.getenv("AI_MODEL", "claude-sonnet-5")
 
