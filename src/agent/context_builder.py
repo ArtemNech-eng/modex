@@ -357,3 +357,163 @@ async def build_ticker_context(
         "stats":    stats,
         "summary":  "\n".join(summary_parts),
     }
+
+
+async def build_memory_context(ticker: str) -> str:
+    """
+    Память Claude — его прошлые прогнозы по этому тикеру.
+    Показывает точность, паттерны ошибок, уверенность.
+    """
+    try:
+        preds = await db.list_recent_predictions(limit=20, ticker=ticker)
+        stats = await db.accuracy_stats(ticker=ticker)
+    except Exception as e:
+        return f"Память недоступна: {e}"
+
+    if not preds:
+        return f"По тикеру {ticker} прогнозов ещё не было — это первый анализ."
+
+    lines = [f"🧠 МОЯ ПАМЯТЬ — прошлые прогнозы по {ticker}:"]
+
+    # Общая статистика
+    total     = stats.get("total", 0)
+    evaluated = stats.get("evaluated", 0)
+    accuracy  = stats.get("accuracy")
+
+    if evaluated > 0 and accuracy is not None:
+        acc_pct = round(accuracy * 100, 1)
+        comment = "хорошая" if acc_pct >= 60 else "плохая — пересмотри подход" if acc_pct < 40 else "средняя"
+        lines.append(f"  Всего прогнозов: {total} | Оценено: {evaluated} | "
+                     f"Точность: {acc_pct}% ({comment})")
+    else:
+        lines.append(f"  Всего прогнозов: {total} | Оценённых пока нет (ждём истечения горизонта)")
+
+    # Последние 5 прогнозов
+    lines.append("  Последние прогнозы:")
+    for p in preds[:5]:
+        direction = {"up": "↑ ВВЕРХ", "down": "↓ ВНИЗ", "flat": "→ БОКОМ"}.get(
+            p.get("direction", "flat"), "?")
+        conf      = round((p.get("confidence") or 0) * 100)
+        correct   = p.get("correct")
+        if correct is True:
+            result = "✅"
+        elif correct is False:
+            result = "❌"
+        else:
+            result = "⏳"
+        ret = p.get("realized_return")
+        ret_str = f" ({ret:+.1f}%)" if ret is not None else ""
+        date = (p.get("created_at") or "")[:10]
+        lines.append(f"    {date}: {direction} уверенность {conf}% → {result}{ret_str}")
+
+    # Предупреждение если точность низкая
+    if evaluated >= 5 and accuracy is not None and accuracy < 0.45:
+        lines.append("  ⚠️ Точность ниже 45% — рынок вёл себя непредсказуемо, будь осторожен.")
+
+    return "\n".join(lines)
+
+
+async def build_news_context(ticker: str, news_cache: list) -> str:
+    """
+    Последние новости по тикеру из RSS-коллектора.
+    news_cache — список NewsItem из RSSCollector (передаётся из агрегатора).
+    """
+    if not news_cache:
+        return ""
+
+    from src.nlp.ticker_extractor import extract_tickers
+    relevant = []
+    for item in news_cache[-200:]:   # смотрим последние 200 новостей
+        text = getattr(item, "full_text", "") or ""
+        tickers_in_news = extract_tickers(text)
+        if ticker in tickers_in_news or ticker.lower() in text.lower():
+            relevant.append(item)
+
+    if not relevant:
+        return ""
+
+    relevant = sorted(relevant, key=lambda x: x.timestamp, reverse=True)[:5]
+
+    lines = [f"📰 ПОСЛЕДНИЕ НОВОСТИ по {ticker}:"]
+    for item in relevant:
+        age_h = int((
+            __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+            - item.timestamp
+        ).total_seconds() / 3600)
+        age_str = f"{age_h}ч назад" if age_h < 24 else f"{age_h // 24}д назад"
+        lines.append(f"  [{age_str}] {item.source}: {item.title[:100]}")
+
+    return "\n".join(lines)
+
+
+async def build_multiframe_context(ticker: str) -> str:
+    """
+    Мультитаймфреймовый анализ: день + неделя + месяц.
+    Даёт Claude понимание на каком тренде находится цена глобально.
+    """
+    import httpx
+    from datetime import datetime, timedelta, timezone
+
+    ISS = ("https://iss.moex.com/iss/engines/stock/markets/shares"
+           "/securities/{ticker}/candles.json")
+    url = ISS.format(ticker=ticker.upper())
+
+    async def fetch_tf(interval: int, days: int) -> list[float]:
+        start = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(url, params={"interval": str(interval), "from": start})
+                resp.raise_for_status()
+            data = resp.json().get("candles", {})
+            cols = data.get("columns", [])
+            rows = data.get("data", [])
+            if "close" not in cols:
+                return []
+            ci = cols.index("close")
+            return [r[ci] for r in rows if r[ci] is not None]
+        except Exception:
+            return []
+
+    import asyncio
+    weekly, monthly = await asyncio.gather(
+        fetch_tf(7, 365),    # недельные свечи за год
+        fetch_tf(31, 730),   # месячные свечи за 2 года
+    )
+
+    lines = [f"📊 МУЛЬТИТАЙМФРЕЙМ {ticker}:"]
+
+    def tf_summary(closes: list[float], label: str) -> Optional[str]:
+        if len(closes) < 4:
+            return None
+        from src.analysis.technical import sma, rsi
+        last = closes[-1]
+        s20  = sma(closes, min(20, len(closes) // 2))
+        r    = rsi(closes, min(14, len(closes) - 1))
+        trend = "↑ вверх" if (s20 and last > s20) else "↓ вниз"
+        change = (closes[-1] / closes[0] - 1) * 100
+        result = f"  {label}: тренд {trend}, изменение {change:+.1f}%"
+        if r:
+            result += f", RSI={r:.0f}"
+        return result
+
+    w = tf_summary(weekly, "Недельный (1г)")
+    m = tf_summary(monthly, "Месячный (2г)")
+    if w:
+        lines.append(w)
+    if m:
+        lines.append(m)
+
+    if not w and not m:
+        return ""
+
+    # Проверяем согласованность таймфреймов
+    if w and m:
+        w_bull = "вверх" in w
+        m_bull = "вверх" in m
+        if w_bull == m_bull:
+            direction = "бычий" if w_bull else "медвежий"
+            lines.append(f"  ✅ Все таймфреймы согласованы — {direction} тренд")
+        else:
+            lines.append("  ⚠️ Таймфреймы расходятся — высокая неопределённость")
+
+    return "\n".join(lines)

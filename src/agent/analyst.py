@@ -18,14 +18,19 @@ from typing import Optional
 
 from src.analysis import technical as ta
 from src.analysis import geopolitics as geo
+from src.analysis.macro import get_macro_context
+from src.analysis.fundamentals import get_fundamentals
 from src.agent import predictor as pred
 from src.agent.claude_agent import ClaudeAgent
-from src.agent.context_builder import build_ticker_context, build_price_context
+from src.agent.context_builder import (
+    build_ticker_context, build_price_context,
+    build_memory_context, build_news_context, build_multiframe_context,
+)
 from src.agent.chart_generator import generate_chart_b64
 from src.collector.tinkoff_client import TinkoffClient
+from src import db
 
 _tinkoff = TinkoffClient()
-from src import db
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +116,20 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         # Строим ценовой дайджест за 2 года
         price_ctx = await build_price_context(ticker)
 
+        # Параллельно: макро + фундаментал + память + мультитаймфрейм
+        import asyncio
+        macro_ctx, fund_ctx, memory_ctx, multiframe_ctx = await asyncio.gather(
+            get_macro_context(),
+            get_fundamentals(ticker),
+            build_memory_context(ticker),
+            build_multiframe_context(ticker),
+            return_exceptions=True,
+        )
+        macro_ctx      = macro_ctx      if not isinstance(macro_ctx, Exception)      else {}
+        fund_ctx       = fund_ctx       if not isinstance(fund_ctx, Exception)       else {}
+        memory_ctx     = memory_ctx     if not isinstance(memory_ctx, Exception)     else ""
+        multiframe_ctx = multiframe_ctx if not isinstance(multiframe_ctx, Exception) else ""
+
         # Tinkoff: стакан + поток сделок + объём
         tinkoff_snap = await _tinkoff.get_full_snapshot(ticker)
 
@@ -152,6 +171,10 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
             historical_context=hist_ctx.get("summary") if hist_ctx["patterns"] else None,
             price_context=price_ctx,
             tinkoff_context=tinkoff_snap.get("summary") if tinkoff_snap else None,
+            macro_context=macro_ctx.get("summary") if macro_ctx else None,
+            fundamental_context=fund_ctx.get("summary") if fund_ctx else None,
+            memory_context=memory_ctx or None,
+            multiframe_context=multiframe_ctx or None,
             momentum=sentiment_block.get("momentum") if sentiment_block else None,
             momentum_label=sentiment_block.get("momentum_label") if sentiment_block else None,
             source_diversity=sentiment_block.get("source_diversity") if sentiment_block else None,

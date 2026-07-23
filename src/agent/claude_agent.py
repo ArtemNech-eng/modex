@@ -249,21 +249,20 @@ class ClaudeAgent:
         historical_context: Optional[str] = None,
         price_context: Optional[str] = None,
         tinkoff_context: Optional[str] = None,
+        macro_context: Optional[str] = None,
+        fundamental_context: Optional[str] = None,
+        memory_context: Optional[str] = None,
+        multiframe_context: Optional[str] = None,
         momentum: Optional[float] = None,
         momentum_label: Optional[str] = None,
         source_diversity: Optional[float] = None,
         volume_zscore: Optional[float] = None,
         signal_confidence: Optional[float] = None,
     ) -> dict:
-        """
-        Синтез всех сигналов по тикеру → торговый инсайт.
-        Если передан historical_context — Claude видит реальные паттерны этого рынка.
-        """
         messages_text = "\n".join(f"- {m[:150]}" for m in top_messages[:8])
-        price_info = f"Изменение цены за день: {price_change_1d:+.2f}%" if price_change_1d else "Цена: нет данных"
-        tech_info  = f"RSI: {rsi:.0f}, Тренд: {trend}" if rsi else "Технические данные: нет"
+        price_info = f"Изменение цены за день: {price_change_1d:+.2f}%" if price_change_1d else "нет данных"
+        tech_info  = f"RSI: {rsi:.0f}, Тренд: {trend}" if rsi else "нет данных"
 
-        # Блок качества сигнала
         quality_lines = []
         if momentum_label:
             quality_lines.append(f"- Моментум настроения: {momentum_label} (Δ={momentum:+.3f})")
@@ -271,13 +270,93 @@ class ClaudeAgent:
             div_label = "высокое" if source_diversity > 0.6 else "среднее" if source_diversity > 0.3 else "низкое (1-2 канала)"
             quality_lines.append(f"- Разнообразие источников: {div_label} ({source_diversity:.2f})")
         if volume_zscore is not None:
-            vol_label = f"всплеск активности (+{volume_zscore:.1f}σ)" if volume_zscore > 2 else \
-                        f"пониженная активность ({volume_zscore:.1f}σ)" if volume_zscore < -1 else \
-                        f"нормальная активность ({volume_zscore:.1f}σ)"
+            vol_label = f"всплеск (+{volume_zscore:.1f}σ)" if volume_zscore > 2 else \
+                        f"пониженная ({volume_zscore:.1f}σ)" if volume_zscore < -1 else \
+                        f"норма ({volume_zscore:.1f}σ)"
             quality_lines.append(f"- Объём сообщений: {vol_label}")
         if signal_confidence is not None:
             quality_lines.append(f"- Уверенность сигнала: {signal_confidence:.0%}")
         quality_block = "\n".join(quality_lines) if quality_lines else "нет данных"
+
+        def _block(text, default=""):
+            return f"\n{text}\n" if text else default
+
+        system = """Ты опытный трейдер и аналитик Московской биржи с 15-летним опытом.
+Тебе дают максимум данных: макро, фундаментал, техника, настроение толпы, стакан, история.
+Твоя задача — синтезировать ВСЁ это в одно чёткое торговое решение.
+
+ВАЖНО — думай пошагово (chain of thought):
+1. Сначала оцени макро-фон (ставка ЦБ, рынок, нефть)
+2. Затем фундаментал (дёшево/дорого по P/E, дивиденды)
+3. Затем технику (тренд на всех таймфреймах)
+4. Затем настроение толпы и стакан
+5. Затем историю — что было в похожих ситуациях
+6. Затем свою память — насколько точен был раньше
+7. ТОЛЬКО ПОТОМ — финальное решение
+
+Отвечай по-русски. Отвечай ТОЛЬКО валидным JSON."""
+
+        user = f"""Прими торговое решение по акции {ticker} ({company}).
+{_block(macro_context)}
+{_block(fundamental_context)}
+{_block(multiframe_context)}
+{_block(price_context)}
+{_block(tinkoff_context)}
+{_block(historical_context)}
+{_block(memory_context)}
+📊 ТЕКУЩЕЕ НАСТРОЕНИЕ ТОЛПЫ (Telegram + Пульс):
+- Индекс: {sentiment_index:.1f}/100 | Сообщений: {message_count}
+- Позитивных: {positive_pct:.0f}% | Негативных: {negative_pct:.0f}%
+
+📐 КАЧЕСТВО СИГНАЛА:
+{quality_block}
+
+💹 ТЕКУЩИЙ РЫНОК (MOEX):
+- {price_info}
+- {tech_info}
+
+💬 ЧТО ПИШУТ В ЧАТАХ:
+{messages_text if messages_text else "нет данных"}
+
+Пройди все 7 шагов анализа и дай решение в JSON:
+{{
+  "macro_assessment": "1-2 предложения: как макро влияет на решение",
+  "fundamental_assessment": "1 предложение: дёшево или дорого",
+  "technical_assessment": "1-2 предложения: что говорит техника на всех таймфреймах",
+  "crowd_assessment": "1 предложение: что делает толпа и стоит ли за ней идти",
+  "history_assessment": "1 предложение: что говорит история похожих ситуаций",
+  "signal": "bullish|bearish|neutral",
+  "confidence": 0-100,
+  "summary": "итоговый вывод 2-3 предложения",
+  "key_insight": "главное что не видно без глубокого анализа",
+  "risk": "главный риск для этого решения",
+  "crowd_behavior": "моментум|контртренд|неопределённость",
+  "history_based": true
+}}"""
+
+        try:
+            result = await self._ask(system, user, max_tokens=1000)
+            import json
+            start = result.find("{")
+            end   = result.rfind("}") + 1
+            if start >= 0 and end > start:
+                data = json.loads(result[start:end])
+                data["ticker"]      = ticker
+                data["analyzed_at"] = datetime.now(timezone.utc).isoformat()
+                return data
+        except Exception as e:
+            logger.warning(f"Claude synthesis failed for {ticker}: {e}")
+
+        return {
+            "ticker":         ticker,
+            "signal":         "neutral",
+            "confidence":     0,
+            "summary":        "Анализ недоступен",
+            "key_insight":    "Ошибка запроса к Claude",
+            "risk":           "Нет данных",
+            "crowd_behavior": "неопределённость",
+            "history_based":  False,
+        }
 
         system = """Ты опытный трейдер и аналитик Московской биржи.
 Ты обучаешься на реальной истории рынка: тебе дают исторические данные о том,
