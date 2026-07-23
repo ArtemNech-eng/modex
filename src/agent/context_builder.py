@@ -192,11 +192,6 @@ async def build_price_context(ticker: str) -> str:
         lines += ["", "  Фазы рынка (движения >15%):"] + phase_lines
 
     return "\n".join(lines)
-from typing import Optional
-from src import db
-from src.analysis import technical as ta
-
-logger = logging.getLogger(__name__)
 
 
 async def build_ticker_context(
