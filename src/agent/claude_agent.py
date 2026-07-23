@@ -27,7 +27,7 @@ _BASE_URL  = os.getenv(
     "AI_BASE_URL",
     "https://api.gen-api.ru/v1" if _PROVIDER == "openai" else "https://api.anthropic.com",
 )
-_MODEL = os.getenv("AI_MODEL", "claude-sonnet-4-5")
+_MODEL = os.getenv("AI_MODEL", "claude-sonnet-5")
 
 
 class ClaudeAgent:
