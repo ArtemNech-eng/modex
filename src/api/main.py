@@ -221,6 +221,93 @@ async def get_anomalies():
     return {"anomalies": anomalies, "count": len(anomalies)}
 
 
+@app.get("/api/correlation", summary="Корреляция настроения и цены")
+async def get_correlation(days: int = 7):
+    """
+    Найти связь между индексом настроения и движением цены.
+    days: за сколько дней считать (1-30)
+    """
+    from datetime import date, timedelta
+    from src.collector.moex_price_collector import MOEXPriceCollector
+    from src.aggregator.correlation import CorrelationAnalyzer
+    from config.settings import MOEX_TICKERS
+
+    days = max(1, min(30, days))
+    price_collector = MOEXPriceCollector()
+    analyzer_corr = CorrelationAnalyzer()
+
+    # Получаем тикеры с достаточной историей настроения
+    sentiment_history = {}
+    for ticker in MOEX_TICKERS:
+        points = list(aggregator._history.get(ticker, []))
+        if len(points) >= 5:
+            sentiment_history[ticker] = points
+
+    if not sentiment_history:
+        return {
+            "results": [],
+            "message": "Недостаточно данных. Система должна поработать минимум час.",
+            "days": days,
+        }
+
+    # Загружаем цены для тикеров с историей настроения
+    price_history = {}
+    from_date = date.today() - timedelta(days=days)
+
+    for ticker in list(sentiment_history.keys())[:15]:  # макс 15 тикеров за раз
+        try:
+            candles = await price_collector.get_candles(
+                ticker, interval=10, from_date=from_date
+            )
+            if candles:
+                price_history[ticker] = candles
+        except Exception:
+            pass
+
+    results = analyzer_corr.analyze_all(sentiment_history, price_history, MOEX_TICKERS)
+
+    return {
+        "results": [r.to_dict() for r in results],
+        "analyzed_tickers": len(results),
+        "days": days,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/api/price/{ticker}", summary="Текущие цены тикера")
+async def get_price(ticker: str):
+    """Получить текущую цену и свечи тикера с Мосбиржи"""
+    from src.collector.moex_price_collector import MOEXPriceCollector
+    from datetime import date, timedelta
+
+    ticker = ticker.upper()
+    collector = MOEXPriceCollector()
+
+    price = await collector.get_current_price(ticker)
+    candles = await collector.get_candles(
+        ticker,
+        interval=60,
+        from_date=date.today() - timedelta(days=30)
+    )
+
+    return {
+        "ticker": ticker,
+        "current_price": price,
+        "candles": [
+            {
+                "time": c.timestamp.isoformat(),
+                "open": c.open,
+                "high": c.high,
+                "low": c.low,
+                "close": c.close,
+                "volume": c.volume,
+                "change_pct": round(c.change_pct, 2),
+            }
+            for c in candles[-30:]  # последние 30 свечей
+        ],
+    }
+
+
 @app.get("/api/sources", summary="Все источники данных")
 async def get_sources():
     """Список всех активных источников данных"""

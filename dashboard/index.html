@@ -178,6 +178,7 @@ header {
 
 <div class="tabs">
   <div class="tab active" onclick="switchTab('market', this)">📊 Рынок</div>
+  <div class="tab" onclick="switchTab('correlation', this)">🔗 Корреляция</div>
   <div class="tab" onclick="switchTab('channels', this)">📡 Каналы</div>
   <div class="tab" onclick="switchTab('analyze', this)">🔬 Анализ</div>
 </div>
@@ -236,6 +237,25 @@ header {
   </div>
 </div>
 
+<!-- ══ КОРРЕЛЯЦИЯ ══ -->
+<div class="content" id="tab-correlation">
+  <div class="corr-layout">
+    <div class="corr-header">
+      <div class="card-title">🔗 Корреляция настроения толпы и цены акций</div>
+      <select id="corrDays" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;font-size:12px;">
+        <option value="1">За 1 день</option>
+        <option value="7" selected>За 7 дней</option>
+        <option value="30">За 30 дней</option>
+      </select>
+      <button class="btn" onclick="loadCorrelation()">Обновить</button>
+    </div>
+
+    <div id="corrContent">
+      <div class="corr-empty">Нажми "Обновить" чтобы рассчитать корреляцию</div>
+    </div>
+  </div>
+</div>
+
 <!-- ══ КАНАЛЫ ══ -->
 <div class="content" id="tab-channels">
   <div class="channels-layout">
@@ -285,6 +305,7 @@ function switchTab(name, el) {
   el.classList.add('active');
   document.getElementById('tab-' + name).classList.add('active');
   if (name === 'channels') loadChannels();
+  if (name === 'correlation') loadCorrelation();
 }
 
 // ── График ────────────────────────────────────────────────────────────────────
@@ -374,6 +395,81 @@ function updateTickers(tickers) {
         </div>
       </div>`;
   }).join('');
+}
+
+// ── Корреляция ───────────────────────────────────────────────────────────────
+async function loadCorrelation() {
+  const days = document.getElementById('corrDays').value;
+  const el = document.getElementById('corrContent');
+  el.innerHTML = '<div class="corr-empty">⏳ Загружаю данные с Мосбиржи и считаю корреляцию...</div>';
+
+  try {
+    const r = await fetch(`${API}/api/correlation?days=${days}`);
+    const d = await r.json();
+
+    if (!d.results || d.results.length === 0) {
+      el.innerHTML = `<div class="corr-empty">
+        ${d.message || 'Нет данных для анализа.'}<br><br>
+        <small>Система должна собрать данные из чатов минимум за час.<br>
+        Убедись что каналы подключены во вкладке 📡 Каналы.</small>
+      </div>`;
+      return;
+    }
+
+    el.innerHTML = `
+      <div style="font-size:12px;color:var(--dim);margin-bottom:12px;">
+        Проанализировано ${d.analyzed_tickers} тикеров за ${days} дн. · 
+        <span style="color:var(--green)">Зелёный</span> = настроение опережает рост цены · 
+        <span style="color:var(--red)">Красный</span> = настроение опережает падение
+      </div>
+      <table class="corr-table">
+        <thead>
+          <tr>
+            <th>Тикер</th>
+            <th>Корреляция</th>
+            <th>Сила связи</th>
+            <th>Опережение</th>
+            <th>Точность сигнала</th>
+            <th>После 🚀</th>
+            <th>После 🩸</th>
+            <th>Данных</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${d.results.map(r => {
+            const corr = r.correlation;
+            const absCorr = Math.abs(corr);
+            const barColor = corr > 0.1 ? '#3fb950' : corr < -0.1 ? '#f85149' : '#8b949e';
+            const strengthTag = absCorr >= 0.7 ? 'tag-green' : absCorr >= 0.4 ? 'tag-yellow' : absCorr >= 0.2 ? 'tag-dim' : 'tag-dim';
+            const accColor = r.signal_accuracy >= 60 ? 'var(--green)' : r.signal_accuracy >= 50 ? 'var(--yellow)' : 'var(--red)';
+            const bullColor = r.avg_price_after_bull > 0 ? 'var(--green)' : 'var(--red)';
+            const bearColor = r.avg_price_after_bear < 0 ? 'var(--green)' : 'var(--red)';
+            return `
+              <tr>
+                <td><b>${r.ticker}</b><br><span style="font-size:10px;color:var(--dim)">${r.company_name}</span></td>
+                <td>
+                  <div class="corr-bar-wrap">
+                    <div class="corr-bar" style="width:${absCorr*100}%;background:${barColor}"></div>
+                  </div>
+                  <span style="color:${barColor}">${corr > 0 ? '+' : ''}${corr.toFixed(2)}</span>
+                </td>
+                <td><span class="tag ${strengthTag}">${r.strength}</span></td>
+                <td style="color:var(--blue)">${r.lead_minutes} мин</td>
+                <td style="color:${accColor};font-weight:600">${r.signal_accuracy}%</td>
+                <td style="color:${bullColor}">${r.avg_price_after_bull > 0 ? '+' : ''}${r.avg_price_after_bull.toFixed(2)}%</td>
+                <td style="color:${bearColor}">${r.avg_price_after_bear > 0 ? '+' : ''}${r.avg_price_after_bear.toFixed(2)}%</td>
+                <td style="color:var(--dim)">${r.sample_size} ${r.is_significant ? '✅' : '⚠️'}</td>
+              </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+      <div style="font-size:11px;color:var(--dim);margin-top:12px;">
+        ✅ = статистически значимо (10+ точек) · ⚠️ = мало данных, требуется накопление
+      </div>
+    `;
+  } catch(e) {
+    el.innerHTML = '<div class="corr-empty" style="color:var(--red)">Ошибка загрузки данных</div>';
+  }
 }
 
 // ── Каналы ────────────────────────────────────────────────────────────────────
