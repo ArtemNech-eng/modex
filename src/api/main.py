@@ -719,6 +719,30 @@ async def get_chart_analysis(ticker: str):
 
 
 
+@app.get("/api/backtest-claude/{ticker}", summary="Исторический бэктест стратегии Claude")
+async def backtest_claude(
+    ticker: str,
+    min_confidence: float = 0.3,
+    hold_days: int = 5,
+    commission: float = 0.05,
+):
+    """
+    Walk-forward бэктест: симулируем решения системы на 2 годах истории.
+    Каждые 5 дней генерируется сигнал на данных доступных в тот день.
+    Метрики: точность, доходность, Sharpe, MaxDD, сравнение с buy&hold.
+    """
+    from src.agent.historical_backtest import run_historical_backtest
+    ticker = ticker.upper()
+    if ticker not in MOEX_TICKERS:
+        raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
+    return await run_historical_backtest(
+        ticker=ticker,
+        min_confidence=min_confidence,
+        hold_days=hold_days,
+        commission_pct=commission,
+    )
+
+
 async def get_accuracy(ticker: Optional[str] = None):
     """Статистика точности прогнозов агента (основа для оценки качества)."""
     return await db.accuracy_stats(ticker=ticker)
