@@ -727,14 +727,23 @@ _bt_claude_status: dict = {"running": False, "progress": None, "result": None, "
 @app.post("/api/backtest-claude/{ticker}", summary="Запустить настоящий бэктест Claude")
 async def start_claude_backtest(
     ticker: str,
-    hold_days: int = 5,
-    min_confidence: int = 40,
+    hold_days: int = 10,
+    min_confidence: int = 50,
     max_calls: int = 60,
     commission: float = 0.05,
+    atr_stop: float = 1.5,
+    atr_target: float = 3.0,
+    require_agreement: bool = True,
+    block_counter_trend: bool = True,
+    dry_run: bool = False,
 ):
     """
-    Запускает реальный бэктест: Claude анализирует каждую историческую дату.
+    Запускает реальный бэктест: Claude анализирует каждую историческую дату,
+    сделки исполняются с риск-менеджментом (ATR-стоп/цель, intrabar-выход).
     Фоновый процесс — результат получить через GET /api/backtest-claude/status
+
+    dry_run=true прогоняет ту же механику без вызовов Claude (решение из техсигнала) —
+    для быстрой офлайн-проверки логики и фильтров.
     """
     from src.agent.historical_backtest import run_real_claude_backtest
 
@@ -757,6 +766,11 @@ async def start_claude_backtest(
                 min_confidence=min_confidence,
                 max_calls=max_calls,
                 commission_pct=commission,
+                atr_stop_mult=atr_stop,
+                atr_target_mult=atr_target,
+                require_tech_agreement=require_agreement,
+                block_counter_trend=block_counter_trend,
+                dry_run=dry_run,
                 progress_callback=on_progress,
             )
             _bt_claude_status["result"] = result
@@ -766,7 +780,7 @@ async def start_claude_backtest(
             _bt_claude_status["running"] = False
 
     asyncio.create_task(run())
-    return {"status": "started", "ticker": ticker, "max_calls": max_calls}
+    return {"status": "started", "ticker": ticker, "max_calls": max_calls, "dry_run": dry_run}
 
 
 @app.get("/api/backtest-claude/status", summary="Статус и результат бэктеста Claude")
