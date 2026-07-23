@@ -193,6 +193,7 @@ header {
 <div class="tabs">
   <div class="tab active" onclick="switchTab('market', this)">📊 Рынок</div>
   <div class="tab" onclick="switchTab('signals', this)">🎯 Сигналы</div>
+  <div class="tab" onclick="switchTab('live', this)">📡 Live-сигналы</div>
   <div class="tab" onclick="switchTab('agent', this)">🤖 AI-агент</div>
   <div class="tab" onclick="switchTab('track', this)">🏆 Точность</div>
   <div class="tab" onclick="switchTab('strategy', this)">🧪 Стратегия</div>
@@ -272,6 +273,64 @@ header {
     </div>
     <div id="signalsList" style="display:flex;flex-direction:column;gap:8px;">
       <div style="color:var(--dim);font-size:12px;">Сканер собирает данные... Загляни через пару минут после запуска.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ LIVE-СИГНАЛЫ (ФОРВАРД-ТЕСТ) ══ -->
+<div class="content" id="tab-live">
+  <div class="scroll-col">
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+      <div class="card-title">📡 Live-сигналы <span id="liveMeta" style="color:var(--dim);font-weight:400;font-size:11px;"></span></div>
+      <button class="btn btn-ghost" onclick="loadLiveSignals()">↻ Обновить</button>
+    </div>
+    <div style="font-size:12px;color:var(--dim);line-height:1.6;">
+      Историю нельзя честно протестировать с полным контекстом (стакан, новости, макро не восстановить на прошлую дату).
+      Поэтому система проверяется <b>вперёд</b>: каждый сигнал фиксируется с меткой времени и ценой, а когда проходит горизонт —
+      автоматически сверяется с фактической ценой. Так копится трек-рекорд, который невозможно подделать задним числом.
+    </div>
+
+    <!-- Панель управления движком -->
+    <div class="card" style="border:1px solid #58a6ff44;">
+      <div class="ch-add" style="flex-wrap:wrap;align-items:center;">
+        <label style="font-size:12px;color:var(--dim);">Период:
+          <select id="liveInterval" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:3px;">
+            <option value="15">15 мин</option>
+            <option value="30">30 мин</option>
+            <option value="60" selected>1 час</option>
+            <option value="240">4 часа</option>
+          </select>
+        </label>
+        <input class="ch-input" id="liveTickers" placeholder="Тикеры через запятую (пусто = все)" style="width:240px;">
+        <button class="btn" onclick="liveScanNow()" id="liveScanBtn">⚡ Сгенерировать сейчас</button>
+        <button class="btn btn-ghost" onclick="liveStart()" id="liveStartBtn">▶ Включить авто</button>
+        <button class="btn btn-ghost" onclick="liveStop()" id="liveStopBtn">■ Остановить</button>
+      </div>
+      <div id="liveStatus" style="font-size:11px;color:var(--dim);margin-top:8px;">Движок остановлен.</div>
+      <div style="font-size:10px;color:var(--dim);margin-top:6px;">⚠️ Каждый цикл делает реальные вызовы Claude и MOEX (расход токенов). Требуется настроенный API-ключ и доступ к MOEX ISS.</div>
+    </div>
+
+    <!-- Сводка форвард-точности -->
+    <div id="liveTrackSummary" style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;"></div>
+
+    <!-- Открытые сигналы -->
+    <div class="card">
+      <div class="card-title" style="margin-bottom:8px;">🟢 Открытые сигналы (ждут проверки по факту) <span id="liveOpenMeta" style="color:var(--dim);font-weight:400;font-size:11px;"></span></div>
+      <div id="liveOpenList" style="font-size:12px;">
+        <div style="color:var(--dim);">Пока нет открытых сигналов. Нажми «⚡ Сгенерировать сейчас» или включи авто-режим.</div>
+      </div>
+    </div>
+
+    <!-- Недавно закрытые (оценённые) -->
+    <div class="card">
+      <div class="card-title" style="margin-bottom:8px;">Недавно оценённые</div>
+      <div id="liveClosedList" style="font-size:12px;"><div style="color:var(--dim);">Появятся, когда у сигналов пройдёт горизонт (по умолчанию 24ч).</div></div>
+    </div>
+
+    <div style="font-size:11px;color:var(--dim);line-height:1.6;">
+      <b>Как читать:</b> открытый сигнал — это зафиксированное мнение системы (направление + уверенность + цена входа) на конкретный момент.
+      Через горизонт он получит ✅/❌ по реальному движению цены. Смотрите не только на процент угадываний, но и на среднюю доходность и просадку.
+      <b>Не является инвестиционной рекомендацией.</b>
     </div>
   </div>
 </div>
@@ -564,6 +623,7 @@ function switchTab(name, el) {
   document.getElementById('tab-' + name).classList.add('active');
   if (name === 'channels') loadChannels();
   if (name === 'signals') loadSignals();
+  if (name === 'live') loadLiveSignals();
   if (name === 'track') loadTrackRecord();
   if (name === 'strategy') { refreshBackfill(); if (!window._btLoaded) { window._btLoaded=true; runBacktest(); } }
 }
@@ -1077,7 +1137,125 @@ async function loadSignals() {
   } catch(e) { document.getElementById('signalsList').innerHTML = `<div style="color:var(--red);font-size:12px;">Ошибка: ${e.message}</div>`; }
 }
 
-// ── AI-агент ───────────────────────────────────────────────────────────────────
+// ── Live-сигналы (форвард-тест) ──────────────────────────────────────────────
+let livePoll = null;
+function _fmtTime(iso) {
+  if (!iso) return '—';
+  try { return new Date(iso).toLocaleString('ru-RU', {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}); }
+  catch { return '—'; }
+}
+function _timeLeft(iso) {
+  if (!iso) return '';
+  const ms = new Date(iso) - new Date();
+  if (ms <= 0) return 'созрел, ждёт оценки';
+  const h = Math.floor(ms/3600000), m = Math.floor((ms%3600000)/60000);
+  return h>0 ? `через ${h}ч ${m}м` : `через ${m}м`;
+}
+function renderLiveStatus(st) {
+  const box = document.getElementById('liveStatus');
+  const startBtn = document.getElementById('liveStartBtn');
+  const stopBtn = document.getElementById('liveStopBtn');
+  const on = st.enabled && st.running;
+  startBtn.disabled = on; stopBtn.disabled = !on;
+  let txt = on
+    ? `<span style="color:var(--green);font-weight:600;">● Авто-режим включён</span> · период ${st.interval_min} мин · следующий скан ${_fmtTime(st.next_scan)}`
+    : `<span style="color:var(--dim);">○ Авто-режим выключен</span>`;
+  txt += ` · последний скан: ${_fmtTime(st.last_scan)}`;
+  if (st.tickers && st.tickers.length) txt += ` · тикеры: ${st.tickers.join(', ')}`;
+  if (st.error) txt += ` · <span style="color:var(--red);">ошибка: ${st.error}</span>`;
+  box.innerHTML = txt;
+}
+function liveSigRow(s) {
+  const col = recColor(s.direction);
+  const dir = s.direction==='up'?'↑ ЛОНГ':s.direction==='down'?'↓ ШОРТ':'⚪ ФЛЭТ';
+  const conf = s.confidence!=null ? Math.round(s.confidence*100)+'%' : '—';
+  const plan = (s.entry_low!=null)
+    ? `🎯 ${s.entry_low}–${s.entry_high} · 🛑 ${s.stop_loss} · 🏁 ${s.take_profit_1}`
+    : '<span style="color:var(--dim);">план появится после скана</span>';
+  return `<div class="card" style="padding:9px 12px;cursor:pointer;" onclick="openAgent('${s.ticker}')">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+      <div><b style="font-size:14px;">${s.ticker}</b>
+        <span style="color:${col};font-weight:700;"> ${dir}</span>
+        <span style="color:var(--dim);font-size:11px;"> · уверенность ${conf}</span></div>
+      <div style="text-align:right;font-size:11px;color:var(--dim);">
+        зафиксирован ${_fmtTime(s.created_at)}<br>
+        <span style="color:var(--yellow);">${_timeLeft(s.matures_at)}</span></div>
+    </div>
+    <div style="font-size:11px;color:var(--text);margin-top:4px;">
+      цена входа <b>${s.price_at ?? '—'}</b>${s.current_price!=null?` · сейчас ${s.current_price}`:''} · ${plan}
+    </div>
+    ${s.narrative?`<div style="font-size:10px;color:var(--dim);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">🤖 ${s.narrative}</div>`:''}
+  </div>`;
+}
+function liveClosedRow(c) {
+  const ok = c.correct;
+  const col = ok ? 'var(--green)' : 'var(--red)';
+  const dir = c.direction==='up'?'↑':c.direction==='down'?'↓':'⚪';
+  return `<div style="display:grid;grid-template-columns:60px 40px 1fr 90px 40px;gap:6px;padding:3px 4px;border-bottom:1px solid var(--border);align-items:center;">
+    <b>${c.ticker}</b><span style="color:${col};">${dir}</span>
+    <span style="color:var(--dim);font-size:11px;">${_fmtTime(c.created_at)}</span>
+    <span style="color:${col};">${c.realized_return!=null?(c.realized_return>0?'+':'')+c.realized_return+'%':'—'}</span>
+    <span>${ok?'✅':'❌'}</span></div>`;
+}
+async function loadLiveSignals() {
+  try {
+    const d = await (await fetch(`${API}/api/live-signals`)).json();
+    renderLiveStatus(d.status||{});
+    document.getElementById('liveMeta').textContent = `· открытых ${d.open_count} · оценено ${d.evaluated_count}`;
+    // Сводка форвард-точности
+    const acc = d.accuracy!=null ? (d.accuracy*100).toFixed(0)+'%' : '—';
+    const accCol = d.accuracy==null?'var(--dim)':d.accuracy>=0.55?'var(--green)':d.accuracy<0.45?'var(--red)':'var(--yellow)';
+    document.getElementById('liveTrackSummary').innerHTML =
+      metricCard('Открытых сигналов', d.open_count, 'var(--blue)') +
+      metricCard('Оценено (по факту)', d.evaluated_count, 'var(--text)') +
+      metricCard('Форвард-точность', acc, accCol) +
+      metricCard('Режим', (d.status&&d.status.running)?'● авто':'○ ручной', (d.status&&d.status.running)?'var(--green)':'var(--dim)');
+    // Открытые
+    const openBox = document.getElementById('liveOpenList');
+    document.getElementById('liveOpenMeta').textContent = `(${d.open_count})`;
+    openBox.innerHTML = (d.open_signals||[]).length
+      ? `<div style="display:flex;flex-direction:column;gap:6px;">${d.open_signals.map(liveSigRow).join('')}</div>`
+      : '<div style="color:var(--dim);">Пока нет открытых сигналов. Нажми «⚡ Сгенерировать сейчас» или включи авто-режим.</div>';
+    // Закрытые
+    const closedBox = document.getElementById('liveClosedList');
+    closedBox.innerHTML = (d.recent_closed||[]).length
+      ? d.recent_closed.map(liveClosedRow).join('')
+      : '<div style="color:var(--dim);">Появятся, когда у сигналов пройдёт горизонт (по умолчанию 24ч).</div>';
+  } catch(e) {
+    document.getElementById('liveStatus').innerHTML = `<span style="color:var(--red);">Ошибка загрузки: ${e.message}</span>`;
+  }
+}
+async function liveScanNow() {
+  const btn = document.getElementById('liveScanBtn');
+  btn.disabled = true; btn.textContent = '⏳ Генерирую...';
+  try {
+    const r = await (await fetch(`${API}/api/live-signals/scan-now`, {method:'POST'})).json();
+    if (r.detail) { document.getElementById('liveStatus').innerHTML = `<span style="color:var(--red);">Ошибка: ${r.detail}</span>`; }
+    await loadLiveSignals();
+  } catch(e) { document.getElementById('liveStatus').innerHTML = `<span style="color:var(--red);">Ошибка: ${e.message}</span>`; }
+  finally { btn.disabled = false; btn.textContent = '⚡ Сгенерировать сейчас'; }
+}
+async function liveStart() {
+  const interval = document.getElementById('liveInterval').value;
+  const tickers = document.getElementById('liveTickers').value.trim();
+  const qs = new URLSearchParams({interval_min: interval});
+  if (tickers) qs.set('tickers', tickers);
+  try {
+    await fetch(`${API}/api/live-signals/start?${qs}`, {method:'POST'});
+    await loadLiveSignals();
+    if (livePoll) clearInterval(livePoll);
+    livePoll = setInterval(loadLiveSignals, 30000);
+  } catch(e) { document.getElementById('liveStatus').innerHTML = `<span style="color:var(--red);">Ошибка: ${e.message}</span>`; }
+}
+async function liveStop() {
+  try {
+    await fetch(`${API}/api/live-signals/stop`, {method:'POST'});
+    if (livePoll) { clearInterval(livePoll); livePoll = null; }
+    await loadLiveSignals();
+  } catch(e) { document.getElementById('liveStatus').innerHTML = `<span style="color:var(--red);">Ошибка: ${e.message}</span>`; }
+}
+
+
 function openAgent(ticker) {
   const tabEl = [...document.querySelectorAll('.tab')].find(t => t.textContent.includes('AI-агент'));
   switchTab('agent', tabEl);

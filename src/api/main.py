@@ -860,6 +860,149 @@ async def trigger_learning():
     return {**result, "model_weights": [round(w, 3) for w in weights]}
 
 
+# ─── Live-сигналы (форвард-тест в реальном времени) ───────────────────────────
+#
+# Почему это нужно: полный контекст (стакан, новости, макро) нельзя восстановить
+# на прошлую дату, поэтому честно оценить систему можно только ВПЕРЁД. Движок по
+# расписанию (или по кнопке) генерирует сигналы Claude, ФИКСИРУЕТ их в БД с меткой
+# времени и ценой, а когда проходит горизонт — автоматически сверяет с фактической
+# ценой. Так копится трек-рекорд, который невозможно подделать задним числом.
+
+_live_status: dict = {
+    "enabled": False,          # включён ли авто-цикл
+    "running": False,          # крутится ли фоновая задача
+    "interval_min": 60,        # период сканирования, мин
+    "tickers": None,           # None = все тикеры
+    "last_scan": None,
+    "last_eval": None,
+    "next_scan": None,
+    "scanned": 0,              # тикеров в кеше сканера
+    "saved": 0,                # сохранено сигналов в последнем цикле
+    "evaluated_total": 0,      # всего оценено прогнозов за сессию движка
+    "error": None,
+}
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def _live_scan_once() -> dict:
+    """Один цикл: сгенерировать+зафиксировать сигналы и оценить созревшие прогнозы."""
+    saved = await scanner.scan_all(aggregator, tickers=_live_status["tickers"], save=True)
+    _live_status["last_scan"] = _now_iso()
+    _live_status["scanned"] = len(scanner.CACHE.results)
+    _live_status["saved"] = saved
+    ev = await analyst.evaluate_due_predictions()
+    _live_status["last_eval"] = _now_iso()
+    _live_status["evaluated_total"] += ev.get("evaluated", 0)
+    return {"saved": saved, "evaluated": ev.get("evaluated", 0)}
+
+
+async def _live_loop():
+    _live_status["running"] = True
+    try:
+        while _live_status["enabled"]:
+            try:
+                await _live_scan_once()
+                _live_status["error"] = None
+            except Exception as e:
+                _live_status["error"] = str(e)
+                logger.warning(f"live-signals цикл: {e}")
+            interval = max(5, _live_status["interval_min"]) * 60
+            from datetime import timedelta
+            _live_status["next_scan"] = (datetime.now(timezone.utc) + timedelta(seconds=interval)).isoformat()
+            slept = 0
+            while _live_status["enabled"] and slept < interval:
+                await asyncio.sleep(2)
+                slept += 2
+    finally:
+        _live_status["running"] = False
+        _live_status["next_scan"] = None
+
+
+@app.post("/api/live-signals/start", summary="Запустить авто-генерацию live-сигналов")
+async def live_start(interval_min: int = 60, tickers: Optional[str] = None):
+    """
+    Включает фоновый цикл: каждые interval_min минут система генерирует сигналы,
+    фиксирует их в БД и оценивает созревшие. tickers — список через запятую
+    (по умолчанию все). ⚠️ Каждый цикл делает реальные вызовы Claude/MOEX.
+    """
+    if _live_status["running"]:
+        return {"status": "already_running", **_live_status}
+    _live_status.update({
+        "enabled": True,
+        "interval_min": max(5, interval_min),
+        "tickers": [t.strip().upper() for t in tickers.split(",") if t.strip()] if tickers else None,
+        "error": None,
+    })
+    asyncio.create_task(_live_loop())
+    return {"status": "started", **_live_status}
+
+
+@app.post("/api/live-signals/stop", summary="Остановить авто-генерацию live-сигналов")
+async def live_stop():
+    _live_status["enabled"] = False
+    return {"status": "stopping", **_live_status}
+
+
+@app.post("/api/live-signals/scan-now", summary="Сгенерировать сигналы один раз сейчас")
+async def live_scan_now():
+    """Разовый прогон: сгенерировать+зафиксировать сигналы и оценить созревшие."""
+    if _live_status.get("scan_now_running"):
+        return {"status": "already_running", **_live_status}
+    _live_status["scan_now_running"] = True
+    try:
+        r = await _live_scan_once()
+        return {"status": "ok", **r, **_live_status}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        _live_status["scan_now_running"] = False
+
+
+@app.get("/api/live-signals", summary="Открытые live-сигналы + статус движка")
+async def get_live_signals(limit: int = 200):
+    """
+    Открытые (ещё не оценённые) сигналы, зафиксированные в БД, обогащённые текущим
+    торговым планом и обоснованием Claude из кеша сканера. Плюс статус движка и
+    краткая сводка форвард-точности.
+    """
+    from datetime import timedelta
+    preds = await db.list_recent_predictions(limit=limit)
+    open_sig, closed_sig = [], []
+    for p in preds:
+        (open_sig if p.get("correct") is None else closed_sig).append(p)
+
+    for p in open_sig:
+        a  = scanner.CACHE.results.get(p["ticker"]) or {}
+        tp = (a.get("technical") or {}).get("trade_plan") or {}
+        p["entry_low"]     = tp.get("entry_low")
+        p["entry_high"]    = tp.get("entry_high")
+        p["stop_loss"]     = tp.get("stop_loss")
+        p["take_profit_1"] = tp.get("take_profit_1")
+        p["current_price"] = (a.get("technical") or {}).get("price")
+        p["recommendation"] = a.get("recommendation")
+        p["narrative"]     = a.get("narrative") or ((a.get("claude") or {}).get("summary"))
+        # когда прогноз созреет
+        try:
+            created = datetime.fromisoformat(p["created_at"])
+            p["matures_at"] = (created + timedelta(hours=p.get("horizon_hours") or 24)).isoformat()
+        except Exception:
+            p["matures_at"] = None
+
+    open_sig.sort(key=lambda x: (x.get("confidence") or 0), reverse=True)
+    stats = await db.accuracy_stats()
+    return {
+        "status": _live_status,
+        "open_signals": open_sig,
+        "open_count": len(open_sig),
+        "evaluated_count": stats.get("evaluated", 0) if isinstance(stats, dict) else 0,
+        "accuracy": stats.get("accuracy") if isinstance(stats, dict) else None,
+        "recent_closed": closed_sig[:20],
+    }
+
+
 # ─── WebSocket (реалтайм) ─────────────────────────────────────────────────────
 
 @app.websocket("/ws")
