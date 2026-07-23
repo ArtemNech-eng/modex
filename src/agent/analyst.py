@@ -21,6 +21,7 @@ from src.analysis import geopolitics as geo
 from src.agent import predictor as pred
 from src.agent.claude_agent import ClaudeAgent
 from src.agent.context_builder import build_ticker_context, build_price_context
+from src.agent.chart_generator import generate_chart_b64
 from src import db
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,30 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         # Строим ценовой дайджест за 2 года
         price_ctx = await build_price_context(ticker)
 
+        # Генерируем график и получаем визуальный анализ Claude
+        chart_analysis = None
+        try:
+            candles = await ta.fetch_candles(ticker, days=120)
+            chart_b64 = await generate_chart_b64(
+                ticker=ticker,
+                closes=candles.get("close", []),
+                highs=candles.get("high", []),
+                lows=candles.get("low", []),
+                opens=candles.get("open", []),
+                dates=candles.get("dates", []),
+                days=120,
+            )
+            if chart_b64:
+                chart_analysis = await _claude.analyze_chart(
+                    ticker=ticker,
+                    image_b64=chart_b64,
+                    sentiment_index=sentiment_block["sentiment_index"] if sentiment_block else None,
+                    extra_context=price_ctx,
+                )
+                logger.info(f"📊 Claude chart → {ticker}: {chart_analysis.get('chart_signal')}")
+        except Exception as e:
+            logger.warning(f"Chart analysis failed for {ticker}: {e}")
+
         claude_result = await _claude.synthesize_ticker(
             ticker=ticker,
             company=company,
@@ -128,9 +153,22 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         )
 
         # Переводим сигнал Claude в направление
+        # Совмещаем текстовый анализ + визуальный анализ графика
         signal_map = {"bullish": "up", "bearish": "down", "neutral": "flat"}
-        direction  = signal_map.get(claude_result.get("signal", "neutral"), "flat")
-        confidence = round(claude_result.get("confidence", 0) / 100, 3)
+        text_signal  = signal_map.get(claude_result.get("signal", "neutral"), "flat")
+        text_conf    = claude_result.get("confidence", 0) / 100
+
+        if chart_analysis:
+            chart_signal = signal_map.get(chart_analysis.get("chart_signal", "neutral"), "flat")
+            chart_conf   = chart_analysis.get("chart_confidence", 0) / 100
+            # Взвешенное голосование: текст 60%, график 40%
+            score = 0.6 * ({"up": 1, "flat": 0, "down": -1}[text_signal]  * text_conf) + \
+                    0.4 * ({"up": 1, "flat": 0, "down": -1}[chart_signal] * chart_conf)
+            direction  = "up" if score > 0.1 else "down" if score < -0.1 else "flat"
+            confidence = round(abs(score), 3)
+        else:
+            direction  = text_signal
+            confidence = round(text_conf, 3)
         narrative  = claude_result.get("summary", "")
 
         logger.info(f"🤖 Claude → {ticker}: {direction} (уверенность {confidence})")
@@ -194,8 +232,9 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         "sentiment": sentiment_block,
         "technical": technical_block,
         "geopolitics": geo_snap,
-        "claude": claude_result,          # полный ответ Claude
-        "narrative": narrative,            # краткий вывод Claude
+        "claude": claude_result,
+        "chart_analysis": chart_analysis,
+        "narrative": narrative,
         "reasons": reasons,
         "model_weights": [round(w, 3) for w in weights],
         "decision_by": "claude" if claude_result else "fallback_model",

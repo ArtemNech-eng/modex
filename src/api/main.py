@@ -681,7 +681,44 @@ async def strategy_lab(days: int = 600):
     return result
 
 
-@app.get("/api/agent/stats/accuracy", summary="Точность прогнозов")
+@app.get("/api/agent/{ticker}/chart", summary="Визуальный анализ графика через Claude Vision")
+async def get_chart_analysis(ticker: str):
+    """
+    Claude смотрит на свечной график и делает визуальный технический анализ:
+    паттерны, уровни, тренд, сигнал RSI — всё что видно только глазами.
+    """
+    from src.agent.chart_generator import generate_chart_b64
+    ticker = ticker.upper()
+    if ticker not in MOEX_TICKERS:
+        raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
+
+    try:
+        candles = await ta.fetch_candles(ticker, days=120)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"MOEX недоступен: {e}")
+
+    chart_b64 = await generate_chart_b64(
+        ticker=ticker,
+        closes=candles.get("close", []),
+        highs=candles.get("high", []),
+        lows=candles.get("low", []),
+        opens=candles.get("open", []),
+        dates=candles.get("dates", []),
+        days=120,
+    )
+    if not chart_b64:
+        raise HTTPException(status_code=503, detail="Не удалось сгенерировать график (mplfinance не установлен?)")
+
+    idx = aggregator.get_ticker_index(ticker)
+    result = await claude.analyze_chart(
+        ticker=ticker,
+        image_b64=chart_b64,
+        sentiment_index=idx.sentiment_index if idx else None,
+    )
+    return result
+
+
+
 async def get_accuracy(ticker: Optional[str] = None):
     """Статистика точности прогнозов агента (основа для оценки качества)."""
     return await db.accuracy_stats(ticker=ticker)

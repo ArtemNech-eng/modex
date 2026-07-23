@@ -64,7 +64,6 @@ class ClaudeAgent:
                 "messages": [{"role": "user", "content": user}],
             }
         else:
-            # OpenAI chat/completions формат
             url = f"{self.base_url}/chat/completions"
             payload = {
                 "model": self.model,
@@ -85,6 +84,120 @@ class ClaudeAgent:
             return data["content"][0]["text"]
         else:
             return data["choices"][0]["message"]["content"]
+
+    async def _ask_with_image(self, system: str, user: str,
+                              image_b64: str, max_tokens: int = 1024) -> str:
+        """Отправить запрос с картинкой (vision). Поддерживает оба формата API."""
+        headers = self._build_headers()
+
+        if self.provider == "anthropic":
+            url = f"{self.base_url}/v1/messages"
+            payload = {
+                "model": self.model,
+                "max_tokens": max_tokens,
+                "system": system,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": image_b64,
+                            },
+                        },
+                        {"type": "text", "text": user},
+                    ],
+                }],
+            }
+        else:
+            # OpenAI vision формат (gen-api.ru / openrouter)
+            url = f"{self.base_url}/chat/completions"
+            payload = {
+                "model": self.model,
+                "max_tokens": max_tokens,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{image_b64}",
+                                },
+                            },
+                            {"type": "text", "text": user},
+                        ],
+                    },
+                ],
+            }
+
+        async with httpx.AsyncClient(timeout=90) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            if resp.status_code != 200:
+                raise RuntimeError(f"AI Vision error {resp.status_code}: {resp.text[:300]}")
+            data = resp.json()
+
+        if self.provider == "anthropic":
+            return data["content"][0]["text"]
+        else:
+            return data["choices"][0]["message"]["content"]
+
+    async def analyze_chart(self, ticker: str, image_b64: str,
+                            sentiment_index: Optional[float] = None,
+                            extra_context: Optional[str] = None) -> dict:
+        """
+        Claude смотрит на свечной график и выдаёт визуальный технический анализ.
+        Это дополняет числовые индикаторы — Claude видит паттерны, уровни,
+        формации свечей которые сложно формализовать в числах.
+        """
+        system = """Ты опытный технический аналитик Московской биржи с 15-летним опытом.
+Тебе показывают свечной график акции. Анализируй визуально:
+паттерны свечей, уровни поддержки/сопротивления, тренды, дивергенции RSI.
+Отвечай по-русски. Отвечай ТОЛЬКО валидным JSON."""
+
+        context_block = ""
+        if extra_context:
+            context_block = f"\nДополнительный контекст:\n{extra_context}\n"
+        sentiment_block = ""
+        if sentiment_index is not None:
+            mood = "бычье" if sentiment_index > 60 else "медвежье" if sentiment_index < 40 else "нейтральное"
+            sentiment_block = f"\nТекущее настроение толпы в Telegram/Пульс: {sentiment_index:.0f}/100 ({mood})\n"
+
+        user = f"""Посмотри на этот свечной график акции {ticker}.{context_block}{sentiment_block}
+Дай технический анализ в JSON:
+{{
+  "chart_signal": "bullish|bearish|neutral",
+  "chart_confidence": 0-100,
+  "trend": "краткое описание тренда",
+  "key_levels": "важные уровни поддержки и сопротивления которые видишь",
+  "patterns": "паттерны свечей или графика если есть (голова-плечи, флаг, клин и т.д.)",
+  "rsi_comment": "что говорит RSI на графике",
+  "visual_insight": "главное наблюдение которое видно только на графике",
+  "action": "что делать трейдеру прямо сейчас"
+}}"""
+
+        try:
+            result = await self._ask_with_image(system, user, image_b64, max_tokens=700)
+            import json
+            start = result.find("{")
+            end   = result.rfind("}") + 1
+            if start >= 0 and end > start:
+                data = json.loads(result[start:end])
+                data["ticker"]      = ticker
+                data["analyzed_at"] = datetime.now(timezone.utc).isoformat()
+                return data
+        except Exception as e:
+            logger.warning(f"Claude chart analysis failed for {ticker}: {e}")
+
+        return {
+            "ticker":          ticker,
+            "chart_signal":    "neutral",
+            "chart_confidence": 0,
+            "visual_insight":  f"Визуальный анализ недоступен: {e}",
+        }
 
     async def analyze_sentiment_batch(self, messages: list[str]) -> list[dict]:
         """

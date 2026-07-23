@@ -18,3 +18,8 @@ aiofiles==23.2.1
 sqlalchemy==2.0.30
 aiosqlite==0.20.0
 asyncpg==0.29.0
+
+# ─── Графики (для vision-анализа Claude) ──────────────────────────────────────
+matplotlib==3.9.0
+mplfinance==0.12.10b0
+pandas==2.2.2
