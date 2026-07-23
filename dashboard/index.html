@@ -122,6 +122,10 @@ header {
 /* ── Вкладка: Каналы ── */
 .channels-layout { padding: 16px; height: 100%; overflow-y: auto; max-width: 700px; }
 .ch-add { display: flex; gap: 8px; margin-bottom: 16px; }
+/* Надёжная прокручиваемая колонка (блок, дети не сжимаются) */
+.scroll-col { height: 100%; overflow-y: auto; padding: 16px; box-sizing: border-box; }
+.scroll-col > * { margin-bottom: 12px; }
+.scroll-col .ch-add { margin-bottom: 0; }
 .ch-input {
   flex: 1; background: var(--surface2); border: 1px solid var(--border);
   border-radius: 8px; color: var(--text); font-size: 13px;
@@ -178,7 +182,10 @@ header {
 
 <div class="tabs">
   <div class="tab active" onclick="switchTab('market', this)">📊 Рынок</div>
-  <div class="tab" onclick="switchTab('correlation', this)">🔗 Корреляция</div>
+  <div class="tab" onclick="switchTab('signals', this)">🎯 Сигналы</div>
+  <div class="tab" onclick="switchTab('agent', this)">🤖 AI-агент</div>
+  <div class="tab" onclick="switchTab('track', this)">🏆 Точность</div>
+  <div class="tab" onclick="switchTab('strategy', this)">🧪 Стратегия</div>
   <div class="tab" onclick="switchTab('channels', this)">📡 Каналы</div>
   <div class="tab" onclick="switchTab('analyze', this)">🔬 Анализ</div>
 </div>
@@ -196,6 +203,7 @@ header {
         <div class="index-num" id="mIdx">50.0</div>
         <div class="index-mood" id="mMood">Нейтральный ➡️</div>
         <div class="index-meta" id="mMeta">0 сообщ · 0 тикеров</div>
+        <div class="index-meta" id="geoFon" style="margin-top:6px;">🌍 Геофон: —</div>
       </div>
 
       <!-- График -->
@@ -237,25 +245,160 @@ header {
   </div>
 </div>
 
-<!-- ══ КОРРЕЛЯЦИЯ ══ -->
-<div class="content" id="tab-correlation">
-  <div class="corr-layout">
-    <div class="corr-header">
-      <div class="card-title">🔗 Корреляция настроения и цены акций</div>
-      <select id="corrSource" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;font-size:12px;">
-        <option value="pulse" selected>📱 Пульс Т-Инвестиции</option>
-        <option value="live">📡 Live данные (Telegram)</option>
-      </select>
-      <select id="corrDays" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;font-size:12px;">
-        <option value="1">За 1 день</option>
-        <option value="7" selected>За 7 дней</option>
-        <option value="30">За 30 дней</option>
-      </select>
-      <button class="btn" onclick="loadCorrelation()">▶ Рассчитать</button>
+<!-- ══ СИГНАЛЫ ══ -->
+<div class="content" id="tab-signals">
+  <div class="scroll-col">
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+      <div class="card-title">🎯 Сигналы <span id="sigMeta" style="color:var(--dim);font-weight:400;font-size:11px;"></span></div>
+      <div style="display:flex;gap:6px;align-items:center;">
+        <button class="btn" id="sigF_enter" onclick="setSigFilter('enter')">🟢 Входить сейчас</button>
+        <button class="btn btn-ghost" id="sigF_all" onclick="setSigFilter('all')">Все сетапы</button>
+        <button class="btn btn-ghost" onclick="loadSignals()">↻</button>
+      </div>
+    </div>
+    <div style="color:var(--dim);font-size:11px;">
+      «Входить сейчас» — цена уже в зоне входа с хорошим R/R. «Все сетапы» — включая те, где нужно ждать отката. Клик по строке — полный разбор.
+    </div>
+    <div id="signalsList" style="display:flex;flex-direction:column;gap:8px;">
+      <div style="color:var(--dim);font-size:12px;">Сканер собирает данные... Загляни через пару минут после запуска.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ AI-АГЕНТ ══ -->
+<div class="content" id="tab-agent">
+  <div style="display:flex;flex-direction:column;gap:10px;height:100%;padding:12px;box-sizing:border-box;">
+    <div class="ch-add" style="flex-shrink:0;">
+      <input class="ch-input" id="agentTicker" placeholder="Тикер, напр. SBER" value="SBER"
+             onkeydown="if(event.key==='Enter') runAgent()">
+      <button class="btn" onclick="runAgent()" id="agentBtn">Анализировать</button>
+      <button class="btn btn-ghost" onclick="triggerLearn()" title="Оценить прошлые прогнозы и переобучить">🧠 Обучить</button>
     </div>
 
-    <div id="corrContent">
-      <div class="corr-empty">Нажми "Обновить" чтобы рассчитать корреляцию</div>
+    <!-- Основная область: две колонки на всю высоту -->
+    <div style="flex:1;min-height:0;display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+      <!-- ЛЕВАЯ: рекомендация + план (своя прокрутка) -->
+      <div class="card" id="agentResult" style="min-height:0;overflow-y:auto;">
+        <div style="color:var(--dim);font-size:12px;">Выбери тикер и нажми «Анализировать».</div>
+      </div>
+      <!-- ПРАВАЯ: график сверху + сообщения снизу (растягиваются) -->
+      <div style="min-height:0;display:flex;flex-direction:column;gap:12px;">
+        <div class="card" style="padding:8px;flex-shrink:0;">
+          <div class="card-title" style="margin-bottom:6px;">📈 График <span id="tvSymbol" style="color:var(--dim);font-weight:400;"></span></div>
+          <div id="tvChart" style="height:200px;position:relative;"><canvas id="agentCanvas"></canvas></div>
+          <div id="chartLegend" style="font-size:10px;color:var(--dim);margin-top:4px;"></div>
+        </div>
+        <div class="card" style="flex:1;min-height:0;display:flex;flex-direction:column;">
+          <div class="card-title" style="margin-bottom:8px;flex-shrink:0;">🗣 Сообщения, повлиявшие на оценку <span id="msgHint" style="color:var(--dim);font-weight:400;font-size:11px;"></span></div>
+          <div id="agentMessages" style="font-size:12px;flex:1;min-height:0;overflow-y:auto;">Выбери тикер выше.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ ТОЧНОСТЬ (ТРЕК-РЕКОРД) ══ -->
+<div class="content" id="tab-track">
+  <div class="scroll-col">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+      <div class="card-title">🏆 Трек-рекорд агента — точность прогнозов <span id="trMeta" style="color:var(--dim);font-weight:400;font-size:11px;"></span></div>
+      <button class="btn btn-ghost" onclick="loadTrackRecord()">↻ Обновить</button>
+    </div>
+
+    <!-- Крупные метрики -->
+    <div id="trMetrics" style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;">
+      <div style="color:var(--dim);font-size:12px;">Загрузка...</div>
+    </div>
+
+    <!-- Диаграмма + разбивка -->
+    <div style="display:grid;grid-template-columns:260px 1fr;gap:12px;">
+      <div class="card" style="display:flex;flex-direction:column;">
+        <div class="card-title" style="margin-bottom:8px;">Верные / неверные</div>
+        <div style="flex:1;min-height:180px;position:relative;display:flex;align-items:center;justify-content:center;">
+          <canvas id="trDonut"></canvas>
+          <div id="trDonutEmpty" style="position:absolute;color:var(--dim);font-size:12px;text-align:center;display:none;">Пока нет оценённых прогнозов.<br>Появятся, когда пройдёт горизонт (по умолчанию 24ч).</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title" style="margin-bottom:10px;">Разбивка</div>
+        <div id="trBreakdown" style="font-size:13px;line-height:1.9;"></div>
+      </div>
+    </div>
+
+    <!-- Таблица прогнозов -->
+    <div class="card">
+      <div class="card-title" style="margin-bottom:8px;">Последние прогнозы</div>
+      <div id="trTable" style="font-size:12px;"></div>
+    </div>
+
+    <div style="font-size:11px;color:var(--dim);line-height:1.6;">
+      <b>Как считается точность:</b> прогноз помечается ✅, если фактическое движение цены за горизонт совпало с направлением (рост/падение), иначе ❌; «флэт» верен при движении менее 1%. Точность = верные ÷ оценённые. Оцениваются только прогнозы, у которых уже прошёл горизонт. Базовый уровень для угадывания направления ≈ 50% — всё, что стабильно выше, это статистическое преимущество модели, которое агент наращивает переобучением. <b>Не является инвестиционной рекомендацией.</b>
+    </div>
+  </div>
+</div>
+
+<!-- ══ СТРАТЕГИЯ / БЭКТЕСТ ══ -->
+<div class="content" id="tab-strategy">
+  <div class="scroll-col">
+    <div class="card-title">🧪 Стратегия и бэктест на истории MOEX</div>
+    <div class="card" style="font-size:12px;line-height:1.6;">
+      <b>Правила стратегии</b> (только качественные сетапы, риск 1% на сделку, без плеча):
+      <ul style="margin:6px 0;padding-left:18px;">
+        <li><b>Боковик (ADX&lt;25):</b> возврат к среднему — покупка у нижней границы при перепроданности (RSI≤45), шорт у верхней при перекупленности (RSI≥55). Цель — противоположная граница.</li>
+        <li><b>Тренд (ADX≥25):</b> по тренду — покупка на откате к SMA20 в аптренде, шорт на отскоке к SMA20 в даунтренде. Цель — проекция по ATR.</li>
+        <li><b>Фильтр:</b> вход только при R/R ≥ 2. Стоп по ATR/структуре. Максимум 20 дней в позиции.</li>
+      </ul>
+      Бэктест честно моделирует сделки по дневным свечам: стоп/цель по факту (high/low), без «загляда в будущее».
+    </div>
+
+    <div class="ch-add" style="flex-wrap:wrap;">
+      <input class="ch-input" id="btTicker" placeholder="Тикер, напр. SBER" value="SBER"
+             onkeydown="if(event.key==='Enter') runBacktest()">
+      <button class="btn" onclick="runBacktest()" id="btBtn">Прогнать бэктест</button>
+      <button class="btn btn-ghost" onclick="runPortfolio()" id="btPfBtn">Топ-портфель (12 бумаг)</button>
+      <button class="btn btn-ghost" onclick="runLab()" id="btLabBtn">🔬 Лаборатория стратегий</button>
+      <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--dim);cursor:pointer;">
+        <input type="checkbox" id="btSent"> учитывать настроение</label>
+    </div>
+
+    <div class="card" style="padding:10px 12px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+        <div style="font-size:12px;">🔗 <b>Связь настроения и цены</b> — что данные за 2 года говорят о том, как настроение влияет на будущее движение.</div>
+        <div style="display:flex;gap:6px;">
+          <button class="btn btn-ghost" onclick="runStudy('')" id="stBtn">Изучить по корзине</button>
+          <button class="btn btn-ghost" onclick="runStudy(document.getElementById('btTicker').value)" id="stBtnT">По тикеру</button>
+        </div>
+      </div>
+      <div id="studyResult" style="font-size:12px;margin-top:8px;"></div>
+    </div>
+
+    <div class="card" style="padding:10px 12px;font-size:12px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+        <div>📥 <b>История настроений</b> для бэктеста «настроение+техника». <span id="bfDays" style="color:var(--dim);">накоплено дней: —</span></div>
+        <div style="display:flex;gap:6px;">
+          <button class="btn btn-ghost" onclick="startBackfill('telegram')" id="bfBtn">Выкачать Telegram</button>
+          <button class="btn btn-ghost" onclick="startBackfill('pulse')" id="bfBtnP">Выкачать Пульс</button>
+        </div>
+      </div>
+      <div id="bfStatus" style="color:var(--dim);margin-top:6px;"></div>
+    </div>
+
+    <div id="btMetrics" style="display:grid;grid-template-columns:repeat(6,1fr);gap:10px;"></div>
+
+    <div id="btVerdict"></div>
+
+    <div class="card" style="padding:8px;">
+      <div class="card-title" style="margin-bottom:6px;">📈 Кривая капитала <span id="btEqMeta" style="color:var(--dim);font-weight:400;font-size:11px;"></span></div>
+      <div style="height:260px;position:relative;"><canvas id="btEquity"></canvas></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title" style="margin-bottom:8px;">Сделки / Портфель</div>
+      <div id="btTable" style="font-size:12px;">Прогони бэктест по тикеру или портфелю.</div>
+    </div>
+
+    <div style="font-size:11px;color:var(--dim);line-height:1.6;">
+      <b>Важно:</b> бэктест показывает, как стратегия вела себя <i>в прошлом</i> на дневных данных. Это НЕ гарантия будущей доходности — рынок меняется, проскальзывание и комиссии здесь не учтены. Используйте для оценки логики и риска, а не как обещание прибыли. <b>Не является инвестиционной рекомендацией.</b>
     </div>
   </div>
 </div>
@@ -309,7 +452,546 @@ function switchTab(name, el) {
   el.classList.add('active');
   document.getElementById('tab-' + name).classList.add('active');
   if (name === 'channels') loadChannels();
-  if (name === 'correlation') loadCorrelation();
+  if (name === 'signals') loadSignals();
+  if (name === 'track') loadTrackRecord();
+  if (name === 'strategy') { refreshBackfill(); if (!window._btLoaded) { window._btLoaded=true; runBacktest(); } }
+}
+
+// ── Стратегия / Бэктест ─────────────────────────────────────────────────────
+let btEquityChart = null;
+let bfPoll = null;
+async function refreshBackfill() {
+  try {
+    const s = await (await fetch(`${API}/api/backfill/status`)).json();
+    document.getElementById('bfDays').textContent = `накоплено дней: ${s.sentiment_history_days||0}`;
+    document.getElementById('bfStatus').textContent = s.message||'';
+    const btn = document.getElementById('bfBtn');
+    const btnP = document.getElementById('bfBtnP');
+    if (s.running) { btn.disabled=true; btnP.disabled=true; btn.textContent='Идёт выкачивание...'; }
+    else { btn.disabled=false; btnP.disabled=false; btn.textContent='Выкачать Telegram';
+      if (bfPoll) { clearInterval(bfPoll); bfPoll=null; } }
+  } catch(e) {}
+}
+async function startBackfill(source) {
+  const label = source==='pulse' ? 'Пульса' : 'Telegram-каналов';
+  if (!confirm(`Выкачать историю ${label} за ~2 года и разметить настроение? Может занять несколько минут.`)) return;
+  try {
+    const r = await fetch(`${API}/api/backfill?days=730&source=${source}`, {method:'POST'});
+    const d = await r.json();
+    if (d.status==='started' || d.status==='already_running') {
+      document.getElementById('bfStatus').textContent = 'Запущено...';
+      if (!bfPoll) bfPoll = setInterval(refreshBackfill, 4000);
+    } else { document.getElementById('bfStatus').innerHTML = `<span style="color:var(--red)">${d.detail||JSON.stringify(d)}</span>`; }
+  } catch(e) { document.getElementById('bfStatus').innerHTML = `<span style="color:var(--red)">Ошибка: ${e.message}</span>`; }
+}
+async function runStudy(ticker) {
+  ticker = (ticker||'').trim().toUpperCase();
+  const box = document.getElementById('studyResult');
+  box.innerHTML = '<span style="color:var(--dim)">Изучаю связь настроения и цены за 2 года...</span>';
+  try {
+    const d = await (await fetch(`${API}/api/sentiment-study${ticker?('?ticker='+ticker):''}`)).json();
+    const rows = d.horizons||[];
+    const corrColor = c => c==null?'var(--dim)': Math.abs(c)>=0.1?(c>0?'var(--green)':'var(--red)'):'var(--dim)';
+    // выбрать горизонт с сильнейшей связью для детальной разбивки
+    let best = rows.filter(r=>r.corr!=null).sort((a,b)=>Math.abs(b.corr)-Math.abs(a.corr))[0];
+    let html = `<div style="color:var(--dim);margin-bottom:6px;">Охват: ${d.scope==='portfolio'?('корзина, '+d.instruments_used+' бумаг'):d.scope}. ${d.note}</div>`;
+    html += `<div style="display:grid;grid-template-columns:1fr 1.2fr 3fr;gap:6px;border-bottom:1px solid var(--border);padding-bottom:4px;color:var(--dim);font-weight:600;">
+      <span>Горизонт</span><span>Корреляция</span><span>Вывод</span></div>`;
+    html += rows.map(r=>`<div style="display:grid;grid-template-columns:1fr 1.2fr 3fr;gap:6px;padding:4px 0;border-bottom:1px solid var(--border);">
+      <span>${r.horizon} дн.</span><span style="color:${corrColor(r.corr)};font-weight:600;">${r.corr??'—'}</span>
+      <span style="font-size:11px;">${r.interpretation}</span></div>`).join('');
+    if (best && best.buckets) {
+      html += `<div style="margin-top:10px;font-weight:600;">Средняя доходность через ${best.horizon} дн. по уровню настроения (n=${best.n}):</div>`;
+      html += `<div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:6px;color:var(--dim);font-weight:600;border-bottom:1px solid var(--border);padding:4px 0;">
+        <span>Настроение в день X</span><span>Ср. доходность</span><span>% вверх</span><span>n</span></div>`;
+      html += best.buckets.map(b=>{
+        const rc = b.avg_fwd_pct==null?'var(--dim)':(b.avg_fwd_pct>0?'var(--green)':'var(--red)');
+        return `<div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:6px;padding:3px 0;border-bottom:1px solid var(--border);">
+          <span>${b.label}</span><span style="color:${rc};font-weight:600;">${b.avg_fwd_pct==null?'—':(b.avg_fwd_pct>0?'+':'')+b.avg_fwd_pct+'%'}</span>
+          <span>${b.pct_up??'—'}%</span><span style="color:var(--dim)">${b.count}</span></div>`;
+      }).join('');
+    }
+    box.innerHTML = html;
+  } catch(e) { box.innerHTML = `<span style="color:var(--red)">Ошибка: ${e.message}</span>`; }
+}
+function btMetric(v, label, color) {
+  return `<div class="card" style="text-align:center;padding:12px 6px;">
+    <div style="font-size:22px;font-weight:800;color:${color||'var(--text)'};line-height:1;">${v}</div>
+    <div style="font-size:10px;color:var(--dim);margin-top:5px;">${label}</div></div>`;
+}
+async function runBacktest() {
+  const ticker = (document.getElementById('btTicker').value||'').trim().toUpperCase();
+  if (!ticker) return;
+  const btn = document.getElementById('btBtn');
+  btn.disabled=true; btn.textContent='Считаю...';
+  document.getElementById('btMetrics').innerHTML = '<div style="color:var(--dim);font-size:12px;">Загружаю историю MOEX и прогоняю стратегию...</div>';
+  try {
+    const useSent = document.getElementById('btSent').checked;
+    const r = await fetch(`${API}/api/backtest/${ticker}?days=500${useSent?'&sentiment=true':''}`);
+    if (!r.ok) throw new Error((await r.json()).detail || r.status);
+    const d = await r.json();
+    const retC = d.total_return_pct>=0?'var(--green)':'var(--red)';
+    document.getElementById('btMetrics').innerHTML =
+      btMetric((d.total_return_pct>0?'+':'')+d.total_return_pct+'%','Доходность',retC) +
+      btMetric(d.trades_count,'Сделок','var(--blue)') +
+      btMetric(d.win_rate!=null?d.win_rate+'%':'—','Винрейт', d.win_rate>=50?'var(--green)':'var(--text)') +
+      btMetric('-'+d.max_drawdown_pct+'%','Макс. просадка','var(--red)') +
+      btMetric(d.profit_factor??'—','Профит-фактор', (d.profit_factor||0)>=1.3?'var(--green)':'var(--text)') +
+      btMetric((d.expectancy_r>0?'+':'')+ (d.expectancy_r??'—')+'R','Матожидание', (d.expectancy_r||0)>0?'var(--green)':'var(--red)');
+    // Вердикт устойчивости + сравнение с buy&hold + in/out-sample
+    const rob = {robust:['✅ Стратегия устойчива: положительна и вне выборки','var(--green)','rgba(63,185,80,0.12)'],
+      overfit_risk:['⚠️ Риск переоптимизации: на «незнакомой» половине истории стратегия убыточна — вживую доверять нельзя','var(--red)','rgba(248,81,73,0.12)'],
+      insufficient:['ℹ️ Мало сделок вне выборки для надёжного вывода','var(--dim)','rgba(139,148,158,0.1)']}[d.robustness] || ['','',''];
+    const is=d.in_sample||{}, os=d.out_sample||{};
+    const bh=d.buy_hold_pct, bhCol=(d.total_return_pct>(bh??-1e9))?'var(--green)':'var(--red)';
+    document.getElementById('btVerdict').innerHTML = `
+      <div style="padding:10px 12px;border-radius:8px;background:${rob[2]};border:1px solid ${rob[1]};color:${rob[1]};font-size:13px;font-weight:600;margin-bottom:10px;">${rob[0]}</div>
+      <div class="card" style="font-size:12px;line-height:1.7;">
+        <div>📊 <b>Сравнение с «купил и держи»:</b> стратегия <b style="color:${d.total_return_pct>=0?'var(--green)':'var(--red)'}">${d.total_return_pct>0?'+':''}${d.total_return_pct}%</b> vs просто держать <b style="color:${bh>=0?'var(--green)':'var(--red)'}">${bh>0?'+':''}${bh}%</b> ${d.total_return_pct>(bh??-1e9)?'— стратегия лучше':'— держать было выгоднее'} <span style="color:var(--dim)">(с учётом издержек ${d.cost_pct}%)</span></div>
+        <div style="margin-top:6px;display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+          <div style="padding:8px;background:var(--bg);border-radius:6px;">
+            <div style="font-weight:600;margin-bottom:3px;">In-sample (первые 60%)</div>
+            сделок ${is.trades??0} · винрейт ${is.win_rate??'—'}% · мат.ож. <b style="color:${(is.expectancy_r||0)>0?'var(--green)':'var(--red)'}">${is.expectancy_r>0?'+':''}${is.expectancy_r??'—'}R</b> · PF ${is.profit_factor??'—'}
+          </div>
+          <div style="padding:8px;background:var(--bg);border-radius:6px;">
+            <div style="font-weight:600;margin-bottom:3px;">Out-of-sample (свежие 40%)</div>
+            сделок ${os.trades??0} · винрейт ${os.win_rate??'—'}% · мат.ож. <b style="color:${(os.expectancy_r||0)>0?'var(--green)':'var(--red)'}">${os.expectancy_r>0?'+':''}${os.expectancy_r??'—'}R</b> · PF ${os.profit_factor??'—'}
+          </div>
+        </div>
+        <div style="color:var(--dim);margin-top:6px;font-size:11px;">Главный критерий честности: стратегия должна быть в плюсе именно <b>вне выборки</b> (свежие 40%, которых «не видела»). Зелёный in-sample при красном out-of-sample = подгонка под прошлое.</div>
+        ${d.with_sentiment ? `<div style="margin-top:8px;padding:8px;background:var(--bg);border-radius:6px;">
+          <b>🗣 Сравнение: техника vs техника+настроение</b> (история настроений: ${d.sentiment_days_available} дней)
+          <div style="color:var(--dim);font-size:11px;margin:3px 0;">С настроением сделка проходит только при <b>подтверждении толпой</b> (лонг — позитив, шорт — негатив) и только за дни, где есть данные настроения. Поэтому сделок меньше — это фильтр качества.</div>
+          <div style="margin-top:4px;">Без настроения: доходность <b style="color:${d.total_return_pct>=0?'var(--green)':'var(--red)'}">${d.total_return_pct}%</b>, out-of-sample мат.ож <b>${d.out_sample?.expectancy_r??'—'}R</b>, сделок ${d.trades_count}</div>
+          <div>С настроением: доходность <b style="color:${d.with_sentiment.total_return_pct>=0?'var(--green)':'var(--red)'}">${d.with_sentiment.total_return_pct}%</b>, out-of-sample мат.ож <b>${d.with_sentiment.out_sample?.expectancy_r??'—'}R</b>, сделок ${d.with_sentiment.trades_count}</div>
+          ${(() => { const a=d.out_sample?.expectancy_r, b=d.with_sentiment.out_sample?.expectancy_r; if(a==null||b==null) return ''; return b>a ? '<div style="color:var(--green);margin-top:4px;">✅ Настроение улучшает результат вне выборки</div>' : '<div style="color:var(--red);margin-top:4px;">❌ Настроение не улучшает (или ухудшает) результат вне выборки</div>'; })()}
+          ${d.sentiment_days_available<30?`<div style="color:#d29922;margin-top:4px;">⚠️ Истории настроений мало (${d.sentiment_days_available} дн.) — вывод ненадёжен. Сначала выкачай историю чатов.</div>`:''}
+        </div>` : (document.getElementById('btSent').checked ? `<div style="margin-top:8px;color:#d29922;">⚠️ Нет накопленной истории настроений. Нажми «Выкачать историю чатов».</div>`:'')}
+      </div>`;
+    // Кривая капитала
+    document.getElementById('btEqMeta').textContent = `${ticker} · ${d.days} дней · старт ${d.start_equity.toLocaleString('ru-RU')}₽ → ${d.final_equity.toLocaleString('ru-RU')}₽`;
+    const cur = d.equity_curve||[];
+    if (btEquityChart) btEquityChart.destroy();
+    btEquityChart = new Chart(document.getElementById('btEquity'), {
+      type:'line',
+      data:{ labels: cur.map(p=>p.date), datasets:[{ data: cur.map(p=>p.equity), borderColor:'#58a6ff', borderWidth:1.5, pointRadius:0, fill:true, backgroundColor:'rgba(88,166,255,0.08)', tension:0.05 }] },
+      options:{ responsive:true, maintainAspectRatio:false, animation:false, plugins:{legend:{display:false}}, scales:{ x:{display:false}, y:{position:'right', ticks:{color:'#8b949e', font:{size:10}}, grid:{color:'rgba(255,255,255,0.05)'}} } }
+    });
+    // Таблица сделок
+    const tr = d.trades||[];
+    document.getElementById('btTable').innerHTML = tr.length ? (
+      `<div style="display:grid;grid-template-columns:1.2fr 1.2fr 1fr 1fr 1fr 1fr;gap:6px;color:var(--dim);font-weight:600;border-bottom:1px solid var(--border);padding-bottom:5px;">
+        <span>Вход</span><span>Выход</span><span>Напр.</span><span>Режим</span><span>Итог</span><span>R</span></div>` +
+      tr.slice().reverse().map(t => {
+        const col = t.direction==='long'?'var(--green)':'var(--red)';
+        const rcol = t.r_multiple>0?'var(--green)':'var(--red)';
+        const reason = {stop:'стоп',target:'цель',time:'время',eod:'закрытие'}[t.reason]||t.reason;
+        return `<div style="display:grid;grid-template-columns:1.2fr 1.2fr 1fr 1fr 1fr 1fr;gap:6px;padding:4px 0;border-bottom:1px solid var(--border);">
+          <span>${t.date_in} @${t.entry}</span><span>${t.date_out} @${t.exit}</span>
+          <span style="color:${col}">${t.direction==='long'?'лонг':'шорт'}</span>
+          <span style="color:var(--dim)">${t.regime==='range'?'боковик':'тренд'}</span>
+          <span>${reason}</span><span style="color:${rcol};font-weight:600;">${t.r_multiple>0?'+':''}${t.r_multiple}R</span></div>`;
+      }).join('')
+    ) : '<div style="color:var(--dim)">Стратегия не нашла сделок на этой истории.</div>';
+  } catch(e) {
+    document.getElementById('btMetrics').innerHTML = `<div style="color:var(--red);font-size:12px;">Ошибка: ${e.message}</div>`;
+  } finally { btn.disabled=false; btn.textContent='Прогнать бэктест'; }
+}
+
+async function runLab() {
+  const btn = document.getElementById('btLabBtn');
+  btn.disabled=true; btn.textContent='Считаю варианты...';
+  document.getElementById('btMetrics').innerHTML='';
+  document.getElementById('btVerdict').innerHTML='';
+  document.getElementById('btTable').innerHTML = '<div style="color:var(--dim);font-size:12px;">Прогоняю 5 вариантов стратегии по 12 бумагам и сравниваю ВНЕ выборки (до минуты)...</div>';
+  try {
+    const d = await (await fetch(`${API}/api/strategy-lab?days=600`)).json();
+    const rows = d.variants||[];
+    const verdict = (o) => {
+      if (!o.trades || o.trades < 20 || o.expectancy_r==null) return ['мало сделок','var(--dim)'];
+      if (o.expectancy_r > 0) return ['✅ есть эдж','var(--green)'];
+      return ['❌ нет эджа','var(--red)'];
+    };
+    document.getElementById('btTable').innerHTML =
+      `<div style="font-size:12px;color:var(--dim);margin-bottom:8px;">${d.note} Проверено бумаг: ${d.instruments}.</div>` +
+      `<div style="display:grid;grid-template-columns:2fr 1.2fr 1.2fr 1fr;gap:6px;color:var(--dim);font-weight:600;border-bottom:1px solid var(--border);padding-bottom:5px;">
+        <span>Вариант</span><span>In-sample (60%)</span><span>Out-of-sample (40%)</span><span>Вердикт</span></div>` +
+      rows.map((v,idx) => {
+        const io=v.in_sample||{}, oo=v.out_sample||{};
+        const ve=verdict(oo);
+        const bestTop = (idx===0 && ve[0].includes('эдж'));
+        const tickers = (v.best_tickers||[]).map(t=>t.ticker).join(', ');
+        return `<div style="display:grid;grid-template-columns:2fr 1.2fr 1.2fr 1fr;gap:6px;padding:6px 0;border-bottom:1px solid var(--border);${bestTop?'background:rgba(63,185,80,0.08);':''}">
+          <span>${bestTop?'⭐ ':''}<b>${v.label}</b>${tickers?`<div style="color:var(--dim);font-size:10px;">лучшие: ${tickers}</div>`:''}</span>
+          <span>мат.ож <b style="color:${(io.expectancy_r||0)>0?'var(--green)':'var(--red)'}">${io.expectancy_r>0?'+':''}${io.expectancy_r??'—'}R</b><br><span style="color:var(--dim);font-size:10px;">${io.trades||0} сделок · ${io.win_rate??'—'}%</span></span>
+          <span>мат.ож <b style="color:${(oo.expectancy_r||0)>0?'var(--green)':'var(--red)'}">${oo.expectancy_r>0?'+':''}${oo.expectancy_r??'—'}R</b><br><span style="color:var(--dim);font-size:10px;">${oo.trades||0} сделок · ${oo.win_rate??'—'}%</span></span>
+          <span style="color:${ve[1]};font-weight:600;">${ve[0]}</span></div>`;
+      }).join('');
+  } catch(e) {
+    document.getElementById('btTable').innerHTML = `<div style="color:var(--red);font-size:12px;">Ошибка: ${e.message}</div>`;
+  } finally { btn.disabled=false; btn.textContent='🔬 Лаборатория стратегий'; }
+}
+
+async function runPortfolio() {
+  const btn = document.getElementById('btPfBtn');
+  btn.disabled=true; btn.textContent='Считаю портфель...';
+  document.getElementById('btVerdict').innerHTML='';
+  document.getElementById('btTable').innerHTML = '<div style="color:var(--dim);font-size:12px;">Прогоняю стратегию по 12 бумагам (может занять до минуты)...</div>';
+  try {
+    const d = await (await fetch(`${API}/api/backtest-portfolio?days=500`)).json();
+    const a = d.aggregate||{};
+    document.getElementById('btMetrics').innerHTML =
+      btMetric(a.instruments||0,'Бумаг','var(--blue)') +
+      btMetric(a.total_trades||0,'Сделок всего','var(--text)') +
+      btMetric(a.avg_win_rate!=null?a.avg_win_rate+'%':'—','Ср. винрейт', (a.avg_win_rate||0)>=50?'var(--green)':'var(--text)') +
+      btMetric((a.avg_return_pct>0?'+':'')+(a.avg_return_pct??'—')+'%','Ср. доходность',(a.avg_return_pct||0)>=0?'var(--green)':'var(--red)') +
+      btMetric('-'+(a.avg_max_dd_pct??'—')+'%','Ср. просадка','var(--red)') +
+      btMetric((a.avg_expectancy_r>0?'+':'')+(a.avg_expectancy_r??'—')+'R','Ср. матожидание',(a.avg_expectancy_r||0)>0?'var(--green)':'var(--red)');
+    const rows = d.tickers||[];
+    document.getElementById('btTable').innerHTML =
+      `<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr 1fr;gap:6px;color:var(--dim);font-weight:600;border-bottom:1px solid var(--border);padding-bottom:5px;">
+        <span>Тикер</span><span>Сделок</span><span>Винрейт</span><span>Доходность</span><span>Просадка</span><span>Мат.ож.</span></div>` +
+      rows.map(r => {
+        const rc = r.return_pct>=0?'var(--green)':'var(--red)';
+        return `<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr 1fr;gap:6px;padding:4px 0;border-bottom:1px solid var(--border);cursor:pointer;" onclick="document.getElementById('btTicker').value='${r.ticker}';runBacktest()">
+          <span><b>${r.ticker}</b></span><span>${r.trades}</span><span>${r.win_rate??'—'}%</span>
+          <span style="color:${rc}">${r.return_pct>0?'+':''}${r.return_pct}%</span>
+          <span style="color:var(--red)">-${r.max_dd}%</span>
+          <span style="color:${(r.expectancy_r||0)>0?'var(--green)':'var(--red)'}">${r.expectancy_r>0?'+':''}${r.expectancy_r??'—'}R</span></div>`;
+      }).join('');
+  } catch(e) {
+    document.getElementById('btTable').innerHTML = `<div style="color:var(--red);font-size:12px;">Ошибка: ${e.message}</div>`;
+  } finally { btn.disabled=false; btn.textContent='Топ-портфель (12 бумаг)'; }
+}
+
+// ── Сигналы ────────────────────────────────────────────────────────────────────
+let signalMap = {};
+let lastSignals = [];
+let sigFilter = 'enter';
+function setSigFilter(f) {
+  sigFilter = f;
+  document.getElementById('sigF_enter').className = f==='enter'?'btn':'btn btn-ghost';
+  document.getElementById('sigF_all').className = f==='all'?'btn':'btn btn-ghost';
+  renderSignals();
+}
+function sigCard(s) {
+  const col = recColor(s.direction);
+  const strat = s.strategy==='range_reversal' ? 'разворот в боковике' : 'по тренду';
+  const posTxt = s.range_position!=null ? ` · позиция ${(s.range_position*100).toFixed(0)}%` : '';
+  const stMap = {enter:['✅ входить сейчас','var(--green)'], wait:['⏳ ждать отката','#d29922'], late:['⚠️ поздно','var(--red)'], above:['⚠️ близко к стопу','var(--red)'], below:['⚠️ риск слома','var(--red)'], invalid:['⛔ отработан','var(--red)']};
+  const stv = stMap[s.entry_status] || ['',''];
+  const crr = s.current_rr!=null ? ` · R/R сейчас ${s.current_rr}` : '';
+  return `<div class="card" style="cursor:pointer;padding:10px 12px;" onclick="openAgent('${s.ticker}')">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+      <div><b style="font-size:15px;">${s.ticker}</b> <span style="color:${col};font-weight:600;">${s.recommendation}</span>
+        <span style="color:var(--dim);font-size:11px;"> · ${regimeRu(s.regime)} (${strat})${posTxt}</span></div>
+      <div style="text-align:right;"><span style="color:${stv[1]};font-weight:700;font-size:11px;">${stv[0]}</span>
+        <span style="color:var(--green);font-weight:700;"> R/R ${s.risk_reward}</span></div>
+    </div>
+    <div style="font-size:11px;color:var(--text);margin-top:5px;">
+      🎯 вход <b style="color:${col}">${s.entry_low}–${s.entry_high}</b> · 🛑 стоп <b style="color:var(--red)">${s.stop_loss}</b>
+      · 🏁 цели <b style="color:var(--green)">${s.take_profit_1}</b> → ${s.take_profit_2}
+      <span style="color:var(--dim)"> · цена ${s.price ?? '—'}${crr}</span>
+    </div>
+  </div>`;
+}
+function renderSignals() {
+  const box = document.getElementById('signalsList');
+  if (!lastSignals.length) {
+    box.innerHTML = '<div style="color:var(--dim);font-size:12px;">Пока нет сетапов с R/R ≥ 1.5. Сканер обновляется в фоне — попробуй позже.</div>';
+    return;
+  }
+  if (sigFilter === 'enter') {
+    const enter = lastSignals.filter(s => s.entry_status === 'enter');
+    const buys = enter.filter(s => s.direction === 'up');
+    const sells = enter.filter(s => s.direction === 'down');
+    if (!enter.length) {
+      box.innerHTML = `<div class="card" style="padding:14px;color:var(--dim);font-size:13px;text-align:center;">
+        Сейчас нет чётких точек входа в зоне 🟢<br><span style="font-size:11px;">Это нормально: часто лучшее действие — подождать. Загляни во «Все сетапы» — там те, что ждут отката.</span></div>`;
+      return;
+    }
+    box.innerHTML =
+      `<div class="card-title" style="color:var(--green);">🟢 Покупать сейчас (${buys.length})</div>` +
+      (buys.map(sigCard).join('') || '<div style="color:var(--dim);font-size:12px;">— нет —</div>') +
+      `<div class="card-title" style="color:var(--red);margin-top:8px;">🔴 Шортить сейчас (${sells.length})</div>` +
+      (sells.map(sigCard).join('') || '<div style="color:var(--dim);font-size:12px;">— нет —</div>');
+  } else {
+    box.innerHTML = lastSignals.map(sigCard).join('');
+  }
+}
+async function loadSignals() {
+  try {
+    const d = await (await fetch(`${API}/api/signals?limit=40&min_rr=1.5`)).json();
+    signalMap = d.by_ticker || {};
+    lastSignals = d.signals || [];
+    const upd = d.updated_at ? new Date(d.updated_at).toLocaleTimeString('ru-RU').slice(0,5) : '—';
+    document.getElementById('sigMeta').textContent = `· просканировано ${d.scanned||0} · обновлено ${upd}`;
+    renderSignals();
+  } catch(e) { document.getElementById('signalsList').innerHTML = `<div style="color:var(--red);font-size:12px;">Ошибка: ${e.message}</div>`; }
+}
+
+// ── AI-агент ───────────────────────────────────────────────────────────────────
+function openAgent(ticker) {
+  const tabEl = [...document.querySelectorAll('.tab')].find(t => t.textContent.includes('AI-агент'));
+  switchTab('agent', tabEl);
+  document.getElementById('agentTicker').value = ticker;
+  runAgent();
+}
+
+function recColor(dir) { return dir==='up'||dir==='long'||dir==='bullish' ? 'var(--green)' : dir==='down'||dir==='short'||dir==='bearish' ? 'var(--red)' : 'var(--blue)'; }
+function regimeRu(r) { return r==='range'?'боковик':r==='uptrend'?'восходящий тренд':r==='downtrend'?'нисходящий тренд':r; }
+
+let agentChart = null;
+async function renderChart(ticker, tech) {
+  document.getElementById('tvSymbol').textContent = '(MOEX:' + ticker + ')';
+  const host = document.getElementById('tvChart');
+  host.innerHTML = '<canvas id="agentCanvas"></canvas>';
+  document.getElementById('chartLegend').textContent = '';
+  let data;
+  try {
+    data = await (await fetch(`${API}/api/technical/${ticker}/candles?days=120`)).json();
+  } catch (e) {
+    host.innerHTML = '<div style="color:var(--dim);font-size:12px;padding:20px;">Не удалось загрузить данные графика</div>';
+    return;
+  }
+  if (!data.close || !data.close.length) {
+    host.innerHTML = `<div style="color:var(--dim);font-size:12px;padding:20px;">Нет данных MOEX по ${ticker} (нерыночный тикер или биржа закрыта).</div>`;
+    return;
+  }
+  const labels = data.dates.map(d => (d || '').slice(0, 10));
+  const closes = data.close;
+  const smaCalc = (arr, p) => arr.map((_, i) => i < p - 1 ? null : arr.slice(i - p + 1, i + 1).reduce((a, b) => a + b, 0) / p);
+  const tp = (tech && tech.trade_plan) || {};
+  const hline = (val, color) => (val != null) ? { data: labels.map(() => val), borderColor: color, borderDash: [5, 4], borderWidth: 1, pointRadius: 0, fill: false } : null;
+  const ds = [
+    { label: 'Цена', data: closes, borderColor: '#58a6ff', borderWidth: 1.6, pointRadius: 0, fill: false, tension: 0.1 },
+    { label: 'SMA20', data: smaCalc(closes, 20), borderColor: '#8b949e', borderWidth: 1, pointRadius: 0, fill: false },
+  ];
+  [[tp.support, '#3fb950'], [tp.resistance, '#f85149'], [tp.stop_loss, '#d29922'], [tp.take_profit_1, '#3fb950']]
+    .forEach(([v, c]) => { const h = hline(v, c); if (h) ds.push(h); });
+  if (agentChart) agentChart.destroy();
+  agentChart = new Chart(document.getElementById('agentCanvas'), {
+    type: 'line',
+    data: { labels, datasets: ds },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      interaction: { intersect: false, mode: 'index' },
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { display: false },
+        y: { position: 'right', ticks: { color: '#8b949e', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.05)' } },
+      },
+    },
+  });
+  document.getElementById('chartLegend').innerHTML =
+    `🔵 цена · ⚪ SMA20 · <span style="color:#3fb950">─ поддержка/цель</span> · <span style="color:#f85149">─ сопротивление</span> · <span style="color:#d29922">─ стоп</span>`;
+}
+
+function planBlock(tp) {
+  if (!tp || !tp.direction) return '';
+  // Баннер тайминга входа
+  const st = tp.entry_status;
+  const stColor = st==='enter' ? 'var(--green)' : st==='wait' ? '#d29922' : 'var(--red)';
+  const stBg = st==='enter' ? 'rgba(63,185,80,0.15)' : st==='wait' ? 'rgba(210,153,34,0.15)' : 'rgba(248,81,73,0.15)';
+  const banner = tp.entry_note ? `<div style="margin-top:10px;padding:8px 10px;border-radius:8px;background:${stBg};border:1px solid ${stColor};font-size:12px;color:${stColor};font-weight:600;">${tp.entry_note}</div>` : '';
+  if (tp.direction === 'flat')
+    return `${banner}<div style="margin-top:8px;padding:8px;background:var(--bg);border-radius:8px;font-size:12px;line-height:1.5;">
+      <b>📋 План:</b> ${tp.entry_rule}<br>Коридор: <b>${tp.support}</b> – <b>${tp.resistance}</b> · ATR ${tp.atr}</div>`;
+  const isLong = tp.direction === 'long';
+  const col = isLong ? 'var(--green)' : 'var(--red)';
+  const crr = tp.current_rr!=null ? `${tp.current_rr}:1` : '—';
+  const crrColor = (tp.current_rr!=null && tp.current_rr>=1.5) ? 'var(--green)' : (tp.current_rr!=null && tp.current_rr<1) ? 'var(--red)' : 'var(--dim)';
+  return `${banner}<div style="margin-top:8px;padding:8px;background:var(--bg);border-radius:8px;font-size:12px;line-height:1.6;">
+    <b>📋 План сделки (${isLong?'ЛОНГ':'ШОРТ'}):</b>
+    <div>🎯 Зона входа: <b style="color:${col}">${tp.entry_low} – ${tp.entry_high}</b> <span style="color:var(--dim)">(текущая цена ${tp.price})</span></div>
+    <div>🛑 Стоп-лосс: <b style="color:var(--red)">${tp.stop_loss}</b> · 🏁 Цели: <b style="color:var(--green)">${tp.take_profit_1}</b> → ${tp.take_profit_2}</div>
+    <div>⚖️ R/R плана ≈ <b>${tp.risk_reward}:1</b> · R/R от текущей цены: <b style="color:${crrColor}">${crr}</b></div>
+    <div style="color:var(--dim);margin-top:4px;">Поддержка ${tp.support} / Сопротивление ${tp.resistance} · ATR ${tp.atr}</div>
+    <div style="color:var(--dim);margin-top:4px;">${tp.entry_rule} ${tp.exit_rule}</div>
+  </div>`;
+}
+
+async function runAgent() {
+  const ticker = (document.getElementById('agentTicker').value || '').trim().toUpperCase();
+  if (!ticker) return;
+  const box = document.getElementById('agentResult');
+  const btn = document.getElementById('agentBtn');
+  btn.disabled = true; btn.textContent = 'Анализирую...';
+  box.innerHTML = '<div style="color:var(--dim);font-size:12px;">Считаю сигналы...</div>';
+  loadMessages(ticker);
+  try {
+    const r = await fetch(`${API}/api/agent/${ticker}`);
+    if (!r.ok) throw new Error((await r.json()).detail || r.status);
+    const a = await r.json();
+    renderChart(ticker, a.technical);
+    const col = recColor(a.direction);
+    const t = a.technical, s = a.sentiment;
+    box.innerHTML = `
+      <div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;">
+        <div style="font-size:20px;font-weight:700;">${a.ticker}</div>
+        <div style="font-size:16px;font-weight:700;color:${col}">${a.recommendation}</div>
+      </div>
+      <div style="font-size:12px;color:var(--dim);margin:4px 0 10px;">
+        Уверенность: ${(a.confidence*100).toFixed(0)}% · P(рост)=${(a.prob_up*100).toFixed(0)}% · score=${a.combined_score}
+      </div>
+      ${a.regime ? `<div style="font-size:12px;margin-bottom:6px;">
+        🧭 Режим: <b>${regimeRu(a.regime)}</b> · стратегия: <b>${a.strategy==='range_reversal'?'разворот от границы':'по тренду'}</b>
+        ${a.range_position!=null?` · позиция в диапазоне ${(a.range_position*100).toFixed(0)}%`:''}
+      </div>` : ''}
+      ${a.geopolitics && a.geopolitics.events_analyzed ? `<div style="font-size:12px;margin-bottom:6px;">
+        🌍 Геофон: <b style="color:${a.geopolitics.score>0.1?'var(--green)':a.geopolitics.score<-0.1?'var(--red)':'var(--dim)'}">${a.geopolitics.label}</b> (score ${a.geopolitics.score}, по ${a.geopolitics.events_analyzed} новостям за 12ч)
+        ${(a.geopolitics.headlines||[]).slice(0,3).map(h=>`<div style="font-size:11px;color:var(--dim);margin-left:14px;">${h.net>0?'🟢':'🔴'} ${(h.text||'').replace(/</g,'&lt;').slice(0,90)}</div>`).join('')}
+      </div>` : `<div style="font-size:12px;margin-bottom:6px;color:var(--dim);">🌍 Геофон: нейтральный — пока мало геополитических новостей в потоке за 12ч.</div>`}
+      ${t ? `<div style="font-size:12px;margin-bottom:6px;">
+        💹 Цена ${t.price ?? '—'} · RSI ${t.rsi14 ?? '—'} · SMA20 ${t.sma20 ?? '—'} / SMA50 ${t.sma50 ?? '—'} ·
+        Δ1д ${t.change_1d ?? '—'}% · тренд <b style="color:${recColor(t.signal)}">${t.signal}</b>
+      </div>` : '<div style="font-size:12px;color:var(--dim);">Нет данных MOEX по тикеру.</div>'}
+      ${s ? `<div style="font-size:12px;margin-bottom:6px;">🗣 Настроение ${s.sentiment_index}/100 (${s.label}), ${s.message_count} сообщ.</div>` : ''}
+      <div style="font-size:12px;font-weight:600;margin:8px 0 4px;">Почему такая оценка:</div>
+      <ul style="margin:0;padding-left:18px;font-size:12px;line-height:1.5;">
+        ${a.reasons.map(x => `<li>${x}</li>`).join('')}
+      </ul>
+      ${t ? planBlock(t.trade_plan) : ''}
+      ${a.narrative ? `<div style="margin-top:10px;padding:8px;background:var(--bg);border-radius:8px;font-size:12px;line-height:1.5;">🤖 ${a.narrative}</div>` : ''}
+      <div style="margin-top:10px;font-size:10px;color:var(--dim);">${a.disclaimer}</div>
+    `;
+  } catch (e) {
+    box.innerHTML = `<div style="color:var(--red);font-size:12px;">Ошибка: ${e.message}</div>`;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Анализировать';
+  }
+}
+
+async function loadMessages(ticker) {
+  const box = document.getElementById('agentMessages');
+  box.innerHTML = '<div style="color:var(--dim)">Загрузка...</div>';
+  try {
+    const r = await fetch(`${API}/api/ticker/${ticker}/messages?limit=25`);
+    const d = await r.json();
+    document.getElementById('msgHint').textContent = d.index ? `· индекс ${d.index.sentiment_index}/100` : '· мало данных за час';
+    if (!d.messages?.length) {
+      box.innerHTML = `<div style="color:var(--dim)">Пока нет сообщений по ${ticker} за последний час. ${d.explanation}</div>`;
+      return;
+    }
+    box.innerHTML = d.messages.map(m => {
+      const c = m.label==='positive'?'var(--green)':m.label==='negative'?'var(--red)':'var(--dim)';
+      const emo = m.label==='positive'?'📈':m.label==='negative'?'📉':'➡️';
+      return `<div style="border-bottom:1px solid var(--border);padding:4px 0;">
+        <div style="display:flex;justify-content:space-between;gap:8px;">
+          <span>${emo} <b style="color:${c}">${m.label}</b> <span style="color:var(--dim)">${m.channel}</span></span>
+          <span style="color:var(--dim)">${(m.timestamp||'').slice(11,16)}</span>
+        </div>
+        <div style="color:var(--text);margin-top:2px;">${(m.text||'').replace(/</g,'&lt;')}</div>
+      </div>`;
+    }).join('') + `<div style="color:var(--dim);margin-top:8px;font-size:11px;">${d.explanation}</div>`;
+  } catch (e) { box.innerHTML = `<div style="color:var(--red)">Ошибка: ${e.message}</div>`; }
+}
+
+let trDonut = null;
+function accColor(acc) { return acc==null?'var(--dim)': acc>=0.55?'var(--green)': acc>=0.45?'var(--blue)':'var(--red)'; }
+function metricCard(value, label, color) {
+  return `<div class="card" style="text-align:center;padding:14px 10px;">
+    <div style="font-size:30px;font-weight:800;color:${color||'var(--text)'};line-height:1;">${value}</div>
+    <div style="font-size:11px;color:var(--dim);margin-top:6px;">${label}</div></div>`;
+}
+function bucketLine(name, b) {
+  const acc = b.accuracy!=null ? (b.accuracy*100).toFixed(0)+'%' : '—';
+  const col = accColor(b.accuracy);
+  const w = b.accuracy!=null ? Math.round(b.accuracy*100) : 0;
+  return `<div style="margin-bottom:8px;">
+    <div style="display:flex;justify-content:space-between;"><span>${name}</span>
+      <span><b style="color:${col}">${acc}</b> <span style="color:var(--dim)">(${b.correct}/${b.evaluated}, всего ${b.total})</span></span></div>
+    <div style="height:5px;background:var(--border);border-radius:3px;overflow:hidden;margin-top:3px;">
+      <div style="height:100%;width:${w}%;background:${col};"></div></div></div>`;
+}
+
+async function loadTrackRecord() {
+  const metrics = document.getElementById('trMetrics');
+  try {
+    const d = await (await fetch(`${API}/api/track-record`)).json();
+    const o = d.overall || {};
+    const accPct = o.accuracy!=null ? (o.accuracy*100).toFixed(0)+'%' : '—';
+    document.getElementById('trMeta').textContent = d.updated_at ? '· обновлено ' + new Date(d.updated_at).toLocaleTimeString('ru-RU').slice(0,5) : '';
+
+    metrics.innerHTML =
+      metricCard(accPct, `Точность (${o.correct||0} из ${o.evaluated||0} оценённых)`, accColor(o.accuracy)) +
+      metricCard(o.total||0, 'Всего прогнозов', 'var(--blue)') +
+      metricCard(o.evaluated||0, 'Проверено фактом', 'var(--text)') +
+      metricCard((o.total||0)-(o.evaluated||0), 'Ожидают проверки', 'var(--dim)');
+
+    // Разбивка
+    const bd = d.by_direction||{}, bc = d.by_confidence||{};
+    const retC = d.avg_return_correct, retW = d.avg_return_wrong;
+    document.getElementById('trBreakdown').innerHTML =
+      `<div style="font-weight:600;margin-bottom:4px;">По направлению</div>` +
+      bucketLine('📈 Рост (лонг)', bd.up||{}) + bucketLine('📉 Падение (шорт)', bd.down||{}) +
+      `<div style="font-weight:600;margin:10px 0 4px;">По уверенности</div>` +
+      bucketLine('🔥 Высокая (≥50%)', bc.high||{}) + bucketLine('🌫 Низкая (<50%)', bc.low||{}) +
+      `<div style="font-weight:600;margin:10px 0 4px;">Средняя доходность прогноза</div>` +
+      `<div>✅ по верным: <b style="color:var(--green)">${retC!=null?(retC>0?'+':'')+retC+'%':'—'}</b> · ❌ по неверным: <b style="color:var(--red)">${retW!=null?(retW>0?'+':'')+retW+'%':'—'}</b> · ср. уверенность ${d.avg_confidence!=null?(d.avg_confidence*100).toFixed(0)+'%':'—'}</div>` +
+      // Вклад настроения (форвард-тест)
+      (() => {
+        const se = d.sentiment_effect||{}, ag=se.agree||{}, di=se.disagree||{};
+        const days = d.sentiment_history_days||0;
+        let verdict = '';
+        if ((ag.evaluated||0)>=10 && (di.evaluated||0)>=10 && ag.accuracy!=null && di.accuracy!=null) {
+          verdict = ag.accuracy > di.accuracy
+            ? '<span style="color:var(--green)">✅ настроение добавляет ценность</span>'
+            : '<span style="color:var(--red)">❌ настроение пока не помогает</span>';
+        } else {
+          verdict = '<span style="color:var(--dim)">данных пока мало для вывода</span>';
+        }
+        return `<div style="font-weight:600;margin:10px 0 4px;">Вклад настроения толпы (форвард-тест) ${verdict}</div>` +
+          `<div>🤝 когда настроение совпадает с техникой: <b style="color:${(ag.accuracy||0)>=0.5?'var(--green)':'var(--red)'}">${ag.accuracy!=null?(ag.accuracy*100).toFixed(0)+'%':'—'}</b> <span style="color:var(--dim)">(${ag.correct||0}/${ag.evaluated||0})</span> · ` +
+          `⚔️ когда расходятся: <b style="color:${(di.accuracy||0)>=0.5?'var(--green)':'var(--red)'}">${di.accuracy!=null?(di.accuracy*100).toFixed(0)+'%':'—'}</b> <span style="color:var(--dim)">(${di.correct||0}/${di.evaluated||0})</span></div>` +
+          `<div style="color:var(--dim);font-size:11px;margin-top:4px;">📚 История настроений копится для будущего полноценного бэктеста: накоплено дней — <b>${days}</b>.</div>`;
+      })();
+
+    // Диаграмма
+    const empty = document.getElementById('trDonutEmpty');
+    const wrong = (o.evaluated||0) - (o.correct||0);
+    if ((o.evaluated||0) > 0) {
+      empty.style.display = 'none';
+      if (trDonut) trDonut.destroy();
+      trDonut = new Chart(document.getElementById('trDonut'), {
+        type: 'doughnut',
+        data: { labels: ['Верные','Неверные'], datasets: [{ data:[o.correct||0, wrong], backgroundColor:['#3fb950','#f85149'], borderWidth:0 }] },
+        options: { responsive:true, maintainAspectRatio:false, plugins:{ legend:{ position:'bottom', labels:{ color:'#8b949e', font:{size:11} } } } }
+      });
+    } else {
+      if (trDonut) { trDonut.destroy(); trDonut=null; }
+      empty.style.display = 'block';
+    }
+
+    // Таблица
+    const rows = d.recent||[];
+    document.getElementById('trTable').innerHTML = rows.length ? (
+      `<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1.4fr 1fr 1fr;gap:6px;color:var(--dim);font-weight:600;border-bottom:1px solid var(--border);padding-bottom:5px;">
+        <span>Тикер</span><span>Направл.</span><span>Увер.</span><span>Создан</span><span>Результат</span><span>Доходность</span></div>` +
+      rows.map(p => {
+        const col = recColor(p.direction);
+        const res = p.correct===true?'✅ верно':p.correct===false?'❌ неверно':'⏳ ждём';
+        const ret = p.realized_return!=null?`<b style="color:${p.realized_return>0?'var(--green)':'var(--red)'}">${p.realized_return>0?'+':''}${p.realized_return}%</b>`:'—';
+        const dir = p.direction==='up'?'рост':p.direction==='down'?'падение':'флэт';
+        return `<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1.4fr 1fr 1fr;gap:6px;padding:5px 0;border-bottom:1px solid var(--border);">
+          <span><b>${p.ticker}</b></span><span style="color:${col}">${dir}</span>
+          <span>${p.confidence!=null?(p.confidence*100).toFixed(0)+'%':'—'}</span>
+          <span style="color:var(--dim)">${(p.created_at||'').slice(5,16).replace('T',' ')}</span>
+          <span>${res}</span><span>${ret}</span></div>`;
+      }).join('')
+    ) : '<div style="color:var(--dim)">Пока нет прогнозов. Проанализируй тикер на вкладке «AI-агент» — прогноз сохранится здесь.</div>';
+  } catch (e) {
+    metrics.innerHTML = `<div style="color:var(--red);font-size:12px;">Ошибка загрузки: ${e.message}</div>`;
+  }
+}
+
+async function triggerLearn() {
+  try {
+    const r = await fetch(`${API}/api/agent/learn`, { method:'POST' });
+    const d = await r.json();
+    alert(`Обучение: оценено ${d.evaluated} прогнозов, переобучение=${d.retrained}\nВеса модели: ${JSON.stringify(d.model_weights)}`);
+    loadTrackRecord();
+  } catch (e) { alert('Ошибка обучения: ' + e.message); }
 }
 
 // ── График ────────────────────────────────────────────────────────────────────
@@ -386,8 +1068,21 @@ function updateTickers(tickers) {
     const v = t.sentiment_index;
     const c = idxColor(v);
     const barCls = v >= 55 ? 'green' : v >= 45 ? 'blue' : 'red';
+    const sig = signalMap[t.ticker];
+    let badge = '';
+    if (sig && sig.regime) {
+      if (sig.regime === 'range' && sig.range_position != null) {
+        const pos = Math.round(sig.range_position * 100);
+        const bc = pos <= 30 ? 'var(--green)' : pos >= 70 ? 'var(--red)' : 'var(--dim)';
+        badge = `<span style="color:${bc}">📦 боковик ${pos}%</span>`;
+      } else if (sig.regime === 'uptrend') {
+        badge = `<span style="color:var(--green)">📈 тренд↑</span>`;
+      } else if (sig.regime === 'downtrend') {
+        badge = `<span style="color:var(--red)">📉 тренд↓</span>`;
+      }
+    }
     return `
-      <div class="tc ${t.is_anomaly ? 'anomaly' : ''}">
+      <div class="tc ${t.is_anomaly ? 'anomaly' : ''}" style="cursor:pointer" onclick="openAgent('${t.ticker}')" title="AI-анализ ${t.ticker}">
         <div class="tc-top">
           <div><div class="tc-ticker">${t.ticker}</div><div class="tc-co">${t.company_name}</div></div>
           <div class="tc-idx" style="color:${c}">${v.toFixed(0)}</div>
@@ -395,88 +1090,10 @@ function updateTickers(tickers) {
         <div class="tc-bar"><div class="tc-fill" style="width:${v}%;background:${c}"></div></div>
         <div class="tc-bot">
           <span style="color:${c}">${idxMood(v).split(' ').slice(-1)[0]}</span>
-          <span>${t.message_count} сообщ</span>
+          ${badge || `<span>${t.message_count} сообщ</span>`}
         </div>
       </div>`;
   }).join('');
-}
-
-// ── Корреляция ───────────────────────────────────────────────────────────────
-async function loadCorrelation() {
-  const days = document.getElementById('corrDays').value;
-  const source = document.getElementById('corrSource').value;
-  const el = document.getElementById('corrContent');
-  el.innerHTML = `<div class="corr-empty">⏳ Загружаю посты из ${source === 'pulse' ? 'Пульса' : 'Live данных'} и цены с Мосбиржи...<br><small>Обычно занимает 10-20 секунд</small></div>`;
-
-  try {
-    const r = await fetch(`${API}/api/correlation?days=${days}&source=${source}`);
-    const d = await r.json();
-
-    if (!d.results || d.results.length === 0) {
-      el.innerHTML = `<div class="corr-empty">
-        ${d.message || 'Нет данных для анализа.'}<br><br>
-        <small>Попробуй переключить источник или увеличить период.</small>
-      </div>`;
-      return;
-    }
-
-    el.innerHTML = `
-      <div style="display:flex;gap:16px;margin-bottom:12px;flex-wrap:wrap;">
-        <span style="font-size:12px;color:var(--dim)">📊 Источник настроения: <b style="color:var(--text)">${d.sentiment_source}</b></span>
-        <span style="font-size:12px;color:var(--dim)">💹 Цены: <b style="color:var(--text)">${d.price_source}</b></span>
-        <span style="font-size:12px;color:var(--dim)">📝 Постов проанализировано: <b style="color:var(--blue)">${d.total_sentiment_points}</b></span>
-        <span style="font-size:12px;color:var(--dim)">🎯 Тикеров: <b style="color:var(--blue)">${d.analyzed_tickers}</b></span>
-      </div>
-      <table class="corr-table">
-        <thead>
-          <tr>
-            <th>Тикер</th>
-            <th>Корреляция</th>
-            <th>Сила связи</th>
-            <th>Опережение цены</th>
-            <th>Точность</th>
-            <th>После 🚀 бычий</th>
-            <th>После 🩸 медвежий</th>
-            <th>Выборка</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${d.results.map(r => {
-            const corr = r.correlation;
-            const absCorr = Math.abs(corr);
-            const barColor = corr > 0.1 ? '#3fb950' : corr < -0.1 ? '#f85149' : '#8b949e';
-            const strengthTag = absCorr >= 0.7 ? 'tag-green' : absCorr >= 0.4 ? 'tag-yellow' : 'tag-dim';
-            const accColor = r.signal_accuracy >= 60 ? 'var(--green)' : r.signal_accuracy >= 50 ? 'var(--yellow)' : 'var(--red)';
-            const bullColor = r.avg_price_after_bull > 0 ? 'var(--green)' : 'var(--red)';
-            const bearColor = r.avg_price_after_bear < 0 ? 'var(--green)' : 'var(--red)';
-            return `
-              <tr>
-                <td><b>${r.ticker}</b><br><span style="font-size:10px;color:var(--dim)">${r.company_name}</span></td>
-                <td>
-                  <div class="corr-bar-wrap">
-                    <div class="corr-bar" style="width:${absCorr*100}%;background:${barColor}"></div>
-                  </div>
-                  <span style="color:${barColor};font-weight:700">${corr > 0 ? '+' : ''}${corr.toFixed(2)}</span>
-                </td>
-                <td><span class="tag ${strengthTag}">${r.strength}</span></td>
-                <td style="color:var(--blue);font-weight:600">${r.lead_minutes === 0 ? 'Одновременно' : r.lead_minutes + ' мин раньше'}</td>
-                <td style="color:${accColor};font-weight:700">${r.signal_accuracy}%</td>
-                <td style="color:${bullColor};font-weight:600">${r.avg_price_after_bull > 0 ? '+' : ''}${r.avg_price_after_bull.toFixed(2)}%</td>
-                <td style="color:${bearColor};font-weight:600">${r.avg_price_after_bear > 0 ? '+' : ''}${r.avg_price_after_bear.toFixed(2)}%</td>
-                <td style="color:var(--dim)">${r.sample_size} ${r.is_significant ? '✅' : '⚠️'}</td>
-              </tr>`;
-          }).join('')}
-        </tbody>
-      </table>
-      <div style="font-size:11px;color:var(--dim);margin-top:12px;line-height:1.6;">
-        💡 <b>Опережение цены</b> — насколько минут настроение в чатах предшествует движению акции<br>
-        💡 <b>Точность</b> — % случаев когда рост настроения → рост цены (> 50% = полезный сигнал)<br>
-        ✅ = статистически значимо (10+ точек) · ⚠️ = мало данных
-      </div>
-    `;
-  } catch(e) {
-    el.innerHTML = '<div class="corr-empty" style="color:var(--red)">❌ Ошибка загрузки. Проверь подключение к серверу.</div>';
-  }
 }
 
 // ── Каналы ────────────────────────────────────────────────────────────────────
@@ -582,11 +1199,24 @@ async function poll() {
   go(); setInterval(go, 5000);
 }
 
+async function loadGeo() {
+  try {
+    const g = await (await fetch(`${API}/api/geopolitics`)).json();
+    const col = g.score>0.1?'var(--green)':g.score<-0.1?'var(--red)':'var(--dim)';
+    const el = document.getElementById('geoFon');
+    const cnt = g.events_analyzed||0;
+    const tail = cnt ? ` · ${cnt} новостей/12ч` : ' · нет свежих новостей';
+    if (el) el.innerHTML = `🌍 Геофон: <b style="color:${col}">${g.label}</b> (${g.score>0?'+':''}${g.score})<span style="color:var(--dim);font-size:11px;">${tail}</span>`;
+  } catch(e) {}
+}
+
 // ── Старт ─────────────────────────────────────────────────────────────────────
 initChart();
 window.addEventListener('resize', resizeChart);
 setTimeout(resizeChart, 100);
 connect();
+loadGeo(); setInterval(loadGeo, 15000);
+loadSignals(); setInterval(loadSignals, 60000);
 </script>
 </body>
 </html>
