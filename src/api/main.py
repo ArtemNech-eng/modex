@@ -24,9 +24,13 @@ from src.agent import scanner
 from src.agent import backtest as bt
 from src.agent import backfill as bf
 from src.agent import research as rs
+from src.agent.claude_agent import ClaudeAgent
 from config.settings import MOEX_TICKERS
 
 logger = logging.getLogger(__name__)
+
+# Инициализируем Claude агента
+claude = ClaudeAgent()
 
 # ─── Приложение ──────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -788,6 +792,105 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 # ─── Статика (дашборд) ────────────────────────────────────────────────────────
+
+# ─── Статика (дашборд) ────────────────────────────────────────────────────────
+
+@app.get("/api/ai/ticker/{ticker}", summary="AI анализ тикера")
+async def ai_analyze_ticker(ticker: str):
+    """Claude анализирует все сигналы по тикеру и даёт инсайт"""
+    ticker = ticker.upper()
+    if ticker not in MOEX_TICKERS:
+        raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
+
+    idx = aggregator.get_ticker_index(ticker)
+    if not idx:
+        raise HTTPException(status_code=404, detail="Недостаточно данных по тикеру")
+
+    # Берём топ сообщения по тикеру
+    points = list(aggregator._history.get(ticker, []))[-20:]
+    top_messages = [p.text_snippet for p in points if p.text_snippet]
+
+    result = await claude.synthesize_ticker(
+        ticker=ticker,
+        company=MOEX_TICKERS.get(ticker, ticker),
+        sentiment_index=idx.sentiment_index,
+        message_count=idx.message_count,
+        positive_pct=idx.positive_pct,
+        negative_pct=idx.negative_pct,
+        top_messages=top_messages,
+    )
+    return result
+
+
+@app.get("/api/ai/market", summary="AI сводка рынка")
+async def ai_market_summary():
+    """Claude делает краткую сводку текущего настроения рынка"""
+    market = aggregator.get_market_index()
+    indices = aggregator.get_all_indices()
+    anomalies = [idx.to_dict() for idx in indices.values() if idx.is_anomaly]
+
+    summary = await claude.market_summary(
+        market_index=market.sentiment_index,
+        top_bullish=market.top_bullish,
+        top_bearish=market.top_bearish,
+        total_messages=market.total_messages,
+        anomalies=anomalies,
+    )
+    return {"summary": summary, "market_index": market.sentiment_index}
+
+
+@app.get("/api/ai/correlations", summary="AI анализ корреляций")
+async def ai_correlations():
+    """Claude находит нелинейные паттерны в данных корреляции"""
+    from datetime import date, timedelta
+    from src.collector.moex_price_collector import MOEXPriceCollector
+    from src.collector.pulse_collector import PulseCollector, PULSE_TICKERS
+    from src.aggregator.correlation import CorrelationAnalyzer
+    from src.nlp.sentiment_analyzer import keyword_sentiment
+    from src.aggregator.aggregator import SentimentPoint
+
+    # Загружаем данные из Пульса
+    pulse = PulseCollector()
+    pulse_history = await pulse.fetch_history(tickers=PULSE_TICKERS[:10], limit_per_ticker=50)
+
+    sentiment_history = {}
+    for ticker, posts in pulse_history.items():
+        points = []
+        for post in posts:
+            sent = keyword_sentiment(post.text)
+            points.append(SentimentPoint(
+                timestamp=post.timestamp, ticker=ticker,
+                signal=sent.signal, label=sent.label,
+                score=sent.score, channel="pulse",
+                text_snippet=post.text[:100],
+            ))
+        if points:
+            sentiment_history[ticker] = points
+
+    price_collector = MOEXPriceCollector()
+    price_history = {}
+    from_date = date.today() - timedelta(days=7)
+    for ticker in list(sentiment_history.keys())[:10]:
+        try:
+            candles = await price_collector.get_candles(ticker, interval=10, from_date=from_date)
+            if candles:
+                price_history[ticker] = candles
+            await asyncio.sleep(0.1)
+        except Exception:
+            pass
+
+    corr_analyzer = CorrelationAnalyzer()
+    results = corr_analyzer.analyze_all(sentiment_history, price_history, MOEX_TICKERS)
+
+    # Claude анализирует результаты
+    ai_insights = await claude.find_correlations([r.to_dict() for r in results])
+
+    return {
+        "correlations": [r.to_dict() for r in results],
+        "ai_insights": ai_insights,
+        "analyzed_tickers": len(results),
+    }
+
 
 @app.get("/", include_in_schema=False)
 async def serve_dashboard():

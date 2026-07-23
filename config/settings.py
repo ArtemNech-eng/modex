@@ -16,6 +16,9 @@ TELEGRAM_SESSION = os.getenv("TELEGRAM_SESSION", "moodex_session")
 # Если задана — используется вместо файла сессии
 TELEGRAM_STRING_SESSION = os.getenv("TELEGRAM_STRING_SESSION", "")
 
+# ─── AI Агент ─────────────────────────────────────────────────────────────────
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
 # ─── Список каналов для парсинга ──────────────────────────────────────────────
 TELEGRAM_CHANNELS = [
     # ── Топ чаты трейдеров MOEX ──

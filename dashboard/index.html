@@ -158,6 +158,15 @@ header {
 /* ── Вкладка: Анализ ── */
 .analyze-layout { padding: 16px; height: 100%; overflow-y: auto; max-width: 700px; }
 .analyze-box { display: flex; gap: 8px; margin-bottom: 12px; }
+.ai-layout { padding: 16px; height: 100%; overflow-y: auto; max-width: 900px; }
+.ai-card { }
+.ai-insight { background: var(--surface2); border-radius: 8px; padding: 12px; margin-top: 8px; }
+.ai-insight-row { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 6px; font-size: 13px; }
+.ai-label { color: var(--dim); font-size: 11px; min-width: 120px; flex-shrink: 0; }
+.ai-signal { padding: 3px 10px; border-radius: 4px; font-size: 12px; font-weight: 700; }
+.ai-signal.bullish { background: rgba(63,185,80,.2); color: var(--green); }
+.ai-signal.bearish { background: rgba(248,81,73,.2); color: var(--red); }
+.ai-signal.neutral { background: var(--surface2); color: var(--dim); }
 .analyze-ta { flex: 1; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-size: 13px; padding: 10px 13px; resize: none; height: 80px; outline: none; font-family: inherit; transition: border-color .2s; }
 .analyze-ta:focus { border-color: var(--blue); }
 .analyze-result { background: var(--surface2); border-radius: 8px; padding: 12px 14px; display: none; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -188,6 +197,7 @@ header {
   <div class="tab" onclick="switchTab('strategy', this)">🧪 Стратегия</div>
   <div class="tab" onclick="switchTab('channels', this)">📡 Каналы</div>
   <div class="tab" onclick="switchTab('analyze', this)">🔬 Анализ</div>
+  <div class="tab" onclick="switchTab('ai', this)">🤖 AI Агент</div>
 </div>
 
 <!-- ══ РЫНОК ══ -->
@@ -437,6 +447,47 @@ header {
       <button class="btn" onclick="doAnalyze()" style="align-self:flex-end;">Анализ</button>
     </div>
     <div class="analyze-result" id="analyzeResult"></div>
+  </div>
+</div>
+
+<!-- ══ AI АГЕНТ ══ -->
+<div class="content" id="tab-ai">
+  <div class="ai-layout">
+
+    <!-- Сводка рынка -->
+    <div class="card ai-card" style="margin-bottom:12px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+        <div class="card-title">🤖 AI Сводка рынка (Claude Sonnet)</div>
+        <button class="btn" onclick="loadAIMarket()" id="aiMarketBtn">▶ Запустить</button>
+      </div>
+      <div id="aiMarketResult" style="font-size:14px;color:var(--dim);line-height:1.6;">
+        Нажми "Запустить" — Claude проанализирует текущее настроение рынка
+      </div>
+    </div>
+
+    <!-- Анализ тикера -->
+    <div class="card ai-card" style="margin-bottom:12px;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+        <div class="card-title">📊 AI Анализ тикера</div>
+        <input id="aiTicker" placeholder="SBER" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:6px 10px;font-size:13px;width:90px;outline:none;">
+        <button class="btn" onclick="loadAITicker()">Анализировать</button>
+      </div>
+      <div id="aiTickerResult" style="font-size:13px;color:var(--dim);">
+        Введи тикер и нажми "Анализировать"
+      </div>
+    </div>
+
+    <!-- AI корреляции -->
+    <div class="card ai-card">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+        <div class="card-title">🔗 AI Поиск паттернов (Пульс + MOEX)</div>
+        <button class="btn" onclick="loadAICorrelations()" id="aiCorrBtn">▶ Найти паттерны</button>
+      </div>
+      <div id="aiCorrResult" style="font-size:13px;color:var(--dim);">
+        Claude загрузит данные из Пульса, сравнит с ценами и найдёт нелинейные паттерны
+      </div>
+    </div>
+
   </div>
 </div>
 
@@ -1208,6 +1259,79 @@ async function loadGeo() {
     const tail = cnt ? ` · ${cnt} новостей/12ч` : ' · нет свежих новостей';
     if (el) el.innerHTML = `🌍 Геофон: <b style="color:${col}">${g.label}</b> (${g.score>0?'+':''}${g.score})<span style="color:var(--dim);font-size:11px;">${tail}</span>`;
   } catch(e) {}
+}
+
+// ── AI Агент ────────────────────────────────────────────────────────────────
+async function loadAIMarket() {
+  const el = document.getElementById('aiMarketResult');
+  const btn = document.getElementById('aiMarketBtn');
+  btn.textContent = '⏳...'; btn.disabled = true;
+  el.innerHTML = '<span style="color:var(--dim)">Claude анализирует рынок...</span>';
+  try {
+    const r = await fetch(`${API}/api/ai/market`);
+    const d = await r.json();
+    el.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+        <span style="font-size:24px;font-weight:800;color:${d.market_index>=55?'var(--green)':d.market_index>=45?'var(--blue)':'var(--red)'}">
+          ${d.market_index?.toFixed(1)}/100
+        </span>
+      </div>
+      <div style="color:var(--text);line-height:1.7;font-size:14px;">${d.summary}</div>`;
+  } catch(e) {
+    el.innerHTML = `<span style="color:var(--red)">Ошибка: ${e.message}</span>`;
+  } finally { btn.textContent = '▶ Запустить'; btn.disabled = false; }
+}
+
+async function loadAITicker() {
+  const ticker = (document.getElementById('aiTicker').value || 'SBER').toUpperCase();
+  const el = document.getElementById('aiTickerResult');
+  el.innerHTML = '<span style="color:var(--dim)">Claude анализирует ' + ticker + '...</span>';
+  try {
+    const r = await fetch(`${API}/api/ai/ticker/${ticker}`);
+    const d = await r.json();
+    if (d.summary === 'Анализ недоступен') { el.innerHTML = `<span style="color:var(--red)">${d.key_insight}</span>`; return; }
+    const sigCls = d.signal === 'bullish' ? 'bullish' : d.signal === 'bearish' ? 'bearish' : 'neutral';
+    const sigLabel = d.signal === 'bullish' ? '🚀 Бычий' : d.signal === 'bearish' ? '🩸 Медвежий' : '➡️ Нейтральный';
+    el.innerHTML = `
+      <div class="ai-insight">
+        <div class="ai-insight-row">
+          <span class="ai-label">Сигнал</span>
+          <span class="ai-signal ${sigCls}">${sigLabel}</span>
+          <span style="color:var(--dim);font-size:11px;margin-left:8px">Уверенность: ${d.confidence}%</span>
+        </div>
+        <div class="ai-insight-row"><span class="ai-label">Вывод</span><span>${d.summary}</span></div>
+        <div class="ai-insight-row"><span class="ai-label">Ключевой инсайт</span><span style="color:var(--blue)">${d.key_insight}</span></div>
+        <div class="ai-insight-row"><span class="ai-label">Поведение толпы</span><span>${d.crowd_behavior}</span></div>
+        <div class="ai-insight-row"><span class="ai-label">Риск</span><span style="color:var(--yellow)">${d.risk}</span></div>
+      </div>`;
+  } catch(e) {
+    el.innerHTML = `<span style="color:var(--red)">Ошибка: ${e.message}</span>`;
+  }
+}
+
+async function loadAICorrelations() {
+  const el = document.getElementById('aiCorrResult');
+  const btn = document.getElementById('aiCorrBtn');
+  btn.textContent = '⏳ Загружаю...'; btn.disabled = true;
+  el.innerHTML = '<span style="color:var(--dim)">⏳ Claude загружает Пульс + цены MOEX и ищет паттерны... (~20 сек)</span>';
+  try {
+    const r = await fetch(`${API}/api/ai/correlations`);
+    const d = await r.json();
+    const ins = d.ai_insights;
+    el.innerHTML = `
+      <div class="ai-insight">
+        <div style="margin-bottom:10px;">
+          <span style="color:var(--dim);font-size:11px;">Проанализировано тикеров: ${d.analyzed_tickers}</span>
+        </div>
+        ${ins.best_momentum?.length ? `<div class="ai-insight-row"><span class="ai-label">🚀 Моментум</span><span style="color:var(--green)">${ins.best_momentum.join(', ')}</span></div>` : ''}
+        ${ins.best_contrarian?.length ? `<div class="ai-insight-row"><span class="ai-label">🔄 Контртренд</span><span style="color:var(--yellow)">${ins.best_contrarian.join(', ')}</span></div>` : ''}
+        ${ins.key_findings?.length ? `<div class="ai-insight-row"><span class="ai-label">🔍 Находки</span><div>${ins.key_findings.map(f=>`<div style="margin-bottom:4px">• ${f}</div>`).join('')}</div></div>` : ''}
+        ${ins.strategy ? `<div class="ai-insight-row"><span class="ai-label">📋 Стратегия</span><span style="color:var(--blue)">${ins.strategy}</span></div>` : ''}
+        ${ins.warning ? `<div class="ai-insight-row"><span class="ai-label">⚠️ Важно</span><span style="color:var(--yellow)">${ins.warning}</span></div>` : ''}
+      </div>`;
+  } catch(e) {
+    el.innerHTML = `<span style="color:var(--red)">Ошибка: ${e.message}</span>`;
+  } finally { btn.textContent = '▶ Найти паттерны'; btn.disabled = false; }
 }
 
 // ── Старт ─────────────────────────────────────────────────────────────────────
