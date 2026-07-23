@@ -222,54 +222,105 @@ async def get_anomalies():
 
 
 @app.get("/api/correlation", summary="Корреляция настроения и цены")
-async def get_correlation(days: int = 7):
+async def get_correlation(days: int = 7, source: str = "pulse"):
     """
     Найти связь между индексом настроения и движением цены.
-    days: за сколько дней считать (1-30)
+    source: 'pulse' (Пульс Т-Инвестиции) или 'live' (накопленные данные)
+    days: за сколько дней (1-30)
     """
     from datetime import date, timedelta
     from src.collector.moex_price_collector import MOEXPriceCollector
+    from src.collector.pulse_collector import PulseCollector, PULSE_TICKERS
     from src.aggregator.correlation import CorrelationAnalyzer
+    from src.nlp.sentiment_analyzer import keyword_sentiment
+    from src.nlp.ticker_extractor import extract_tickers
+    from src.aggregator.aggregator import SentimentPoint
     from config.settings import MOEX_TICKERS
 
     days = max(1, min(30, days))
     price_collector = MOEXPriceCollector()
-    analyzer_corr = CorrelationAnalyzer()
+    corr_analyzer = CorrelationAnalyzer()
 
-    # Получаем тикеры с достаточной историей настроения
-    sentiment_history = {}
-    for ticker in MOEX_TICKERS:
-        points = list(aggregator._history.get(ticker, []))
-        if len(points) >= 5:
-            sentiment_history[ticker] = points
+    # ── Источник данных о настроении ──────────────────────────────────────────
+    sentiment_history: dict[str, list[SentimentPoint]] = {}
+
+    if source == "pulse":
+        # Загружаем историю из Пульса прямо сейчас
+        pulse = PulseCollector()
+        pulse_history = await pulse.fetch_history(
+            tickers=PULSE_TICKERS,
+            limit_per_ticker=100,
+        )
+
+        # Конвертируем посты Пульса → SentimentPoint
+        for ticker, posts in pulse_history.items():
+            points = []
+            for post in posts:
+                sent = keyword_sentiment(post.text)
+                # Взвешиваем по лайкам (популярные посты важнее)
+                weight = min(1.0 + post.likes * 0.01, 2.0)
+                points.append(SentimentPoint(
+                    timestamp=post.timestamp,
+                    ticker=ticker,
+                    signal=sent.signal * weight,
+                    label=sent.label,
+                    score=sent.score,
+                    channel="pulse",
+                    text_snippet=post.text[:100],
+                ))
+            if points:
+                sentiment_history[ticker] = points
+
+    else:
+        # Используем накопленные live-данные из агрегатора
+        for ticker in MOEX_TICKERS:
+            points = list(aggregator._history.get(ticker, []))
+            if len(points) >= 5:
+                sentiment_history[ticker] = points
 
     if not sentiment_history:
         return {
             "results": [],
-            "message": "Недостаточно данных. Система должна поработать минимум час.",
+            "source": source,
+            "message": "Пульс не вернул данные. Попробуйте позже.",
             "days": days,
         }
 
-    # Загружаем цены для тикеров с историей настроения
+    # ── Загружаем цены с Мосбиржи ─────────────────────────────────────────────
     price_history = {}
     from_date = date.today() - timedelta(days=days)
 
-    for ticker in list(sentiment_history.keys())[:15]:  # макс 15 тикеров за раз
+    for ticker in list(sentiment_history.keys())[:20]:
         try:
             candles = await price_collector.get_candles(
                 ticker, interval=10, from_date=from_date
             )
             if candles:
                 price_history[ticker] = candles
+            await asyncio.sleep(0.1)
         except Exception:
             pass
 
-    results = analyzer_corr.analyze_all(sentiment_history, price_history, MOEX_TICKERS)
+    if not price_history:
+        return {
+            "results": [],
+            "source": source,
+            "message": "Не удалось загрузить цены с Мосбиржи. Биржа может быть закрыта.",
+            "days": days,
+        }
+
+    # ── Считаем корреляцию ────────────────────────────────────────────────────
+    results = corr_analyzer.analyze_all(
+        sentiment_history, price_history, MOEX_TICKERS
+    )
 
     return {
         "results": [r.to_dict() for r in results],
         "analyzed_tickers": len(results),
+        "sentiment_source": "Пульс Т-Инвестиции" if source == "pulse" else "Live данные",
+        "price_source": "Московская биржа (ISS API)",
         "days": days,
+        "total_sentiment_points": sum(len(v) for v in sentiment_history.values()),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 

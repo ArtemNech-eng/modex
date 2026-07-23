@@ -241,13 +241,17 @@ header {
 <div class="content" id="tab-correlation">
   <div class="corr-layout">
     <div class="corr-header">
-      <div class="card-title">🔗 Корреляция настроения толпы и цены акций</div>
+      <div class="card-title">🔗 Корреляция настроения и цены акций</div>
+      <select id="corrSource" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;font-size:12px;">
+        <option value="pulse" selected>📱 Пульс Т-Инвестиции</option>
+        <option value="live">📡 Live данные (Telegram)</option>
+      </select>
       <select id="corrDays" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;font-size:12px;">
         <option value="1">За 1 день</option>
         <option value="7" selected>За 7 дней</option>
         <option value="30">За 30 дней</option>
       </select>
-      <button class="btn" onclick="loadCorrelation()">Обновить</button>
+      <button class="btn" onclick="loadCorrelation()">▶ Рассчитать</button>
     </div>
 
     <div id="corrContent">
@@ -400,27 +404,28 @@ function updateTickers(tickers) {
 // ── Корреляция ───────────────────────────────────────────────────────────────
 async function loadCorrelation() {
   const days = document.getElementById('corrDays').value;
+  const source = document.getElementById('corrSource').value;
   const el = document.getElementById('corrContent');
-  el.innerHTML = '<div class="corr-empty">⏳ Загружаю данные с Мосбиржи и считаю корреляцию...</div>';
+  el.innerHTML = `<div class="corr-empty">⏳ Загружаю посты из ${source === 'pulse' ? 'Пульса' : 'Live данных'} и цены с Мосбиржи...<br><small>Обычно занимает 10-20 секунд</small></div>`;
 
   try {
-    const r = await fetch(`${API}/api/correlation?days=${days}`);
+    const r = await fetch(`${API}/api/correlation?days=${days}&source=${source}`);
     const d = await r.json();
 
     if (!d.results || d.results.length === 0) {
       el.innerHTML = `<div class="corr-empty">
         ${d.message || 'Нет данных для анализа.'}<br><br>
-        <small>Система должна собрать данные из чатов минимум за час.<br>
-        Убедись что каналы подключены во вкладке 📡 Каналы.</small>
+        <small>Попробуй переключить источник или увеличить период.</small>
       </div>`;
       return;
     }
 
     el.innerHTML = `
-      <div style="font-size:12px;color:var(--dim);margin-bottom:12px;">
-        Проанализировано ${d.analyzed_tickers} тикеров за ${days} дн. · 
-        <span style="color:var(--green)">Зелёный</span> = настроение опережает рост цены · 
-        <span style="color:var(--red)">Красный</span> = настроение опережает падение
+      <div style="display:flex;gap:16px;margin-bottom:12px;flex-wrap:wrap;">
+        <span style="font-size:12px;color:var(--dim)">📊 Источник настроения: <b style="color:var(--text)">${d.sentiment_source}</b></span>
+        <span style="font-size:12px;color:var(--dim)">💹 Цены: <b style="color:var(--text)">${d.price_source}</b></span>
+        <span style="font-size:12px;color:var(--dim)">📝 Постов проанализировано: <b style="color:var(--blue)">${d.total_sentiment_points}</b></span>
+        <span style="font-size:12px;color:var(--dim)">🎯 Тикеров: <b style="color:var(--blue)">${d.analyzed_tickers}</b></span>
       </div>
       <table class="corr-table">
         <thead>
@@ -428,11 +433,11 @@ async function loadCorrelation() {
             <th>Тикер</th>
             <th>Корреляция</th>
             <th>Сила связи</th>
-            <th>Опережение</th>
-            <th>Точность сигнала</th>
-            <th>После 🚀</th>
-            <th>После 🩸</th>
-            <th>Данных</th>
+            <th>Опережение цены</th>
+            <th>Точность</th>
+            <th>После 🚀 бычий</th>
+            <th>После 🩸 медвежий</th>
+            <th>Выборка</th>
           </tr>
         </thead>
         <tbody>
@@ -440,7 +445,7 @@ async function loadCorrelation() {
             const corr = r.correlation;
             const absCorr = Math.abs(corr);
             const barColor = corr > 0.1 ? '#3fb950' : corr < -0.1 ? '#f85149' : '#8b949e';
-            const strengthTag = absCorr >= 0.7 ? 'tag-green' : absCorr >= 0.4 ? 'tag-yellow' : absCorr >= 0.2 ? 'tag-dim' : 'tag-dim';
+            const strengthTag = absCorr >= 0.7 ? 'tag-green' : absCorr >= 0.4 ? 'tag-yellow' : 'tag-dim';
             const accColor = r.signal_accuracy >= 60 ? 'var(--green)' : r.signal_accuracy >= 50 ? 'var(--yellow)' : 'var(--red)';
             const bullColor = r.avg_price_after_bull > 0 ? 'var(--green)' : 'var(--red)';
             const bearColor = r.avg_price_after_bear < 0 ? 'var(--green)' : 'var(--red)';
@@ -451,24 +456,26 @@ async function loadCorrelation() {
                   <div class="corr-bar-wrap">
                     <div class="corr-bar" style="width:${absCorr*100}%;background:${barColor}"></div>
                   </div>
-                  <span style="color:${barColor}">${corr > 0 ? '+' : ''}${corr.toFixed(2)}</span>
+                  <span style="color:${barColor};font-weight:700">${corr > 0 ? '+' : ''}${corr.toFixed(2)}</span>
                 </td>
                 <td><span class="tag ${strengthTag}">${r.strength}</span></td>
-                <td style="color:var(--blue)">${r.lead_minutes} мин</td>
-                <td style="color:${accColor};font-weight:600">${r.signal_accuracy}%</td>
-                <td style="color:${bullColor}">${r.avg_price_after_bull > 0 ? '+' : ''}${r.avg_price_after_bull.toFixed(2)}%</td>
-                <td style="color:${bearColor}">${r.avg_price_after_bear > 0 ? '+' : ''}${r.avg_price_after_bear.toFixed(2)}%</td>
+                <td style="color:var(--blue);font-weight:600">${r.lead_minutes === 0 ? 'Одновременно' : r.lead_minutes + ' мин раньше'}</td>
+                <td style="color:${accColor};font-weight:700">${r.signal_accuracy}%</td>
+                <td style="color:${bullColor};font-weight:600">${r.avg_price_after_bull > 0 ? '+' : ''}${r.avg_price_after_bull.toFixed(2)}%</td>
+                <td style="color:${bearColor};font-weight:600">${r.avg_price_after_bear > 0 ? '+' : ''}${r.avg_price_after_bear.toFixed(2)}%</td>
                 <td style="color:var(--dim)">${r.sample_size} ${r.is_significant ? '✅' : '⚠️'}</td>
               </tr>`;
           }).join('')}
         </tbody>
       </table>
-      <div style="font-size:11px;color:var(--dim);margin-top:12px;">
-        ✅ = статистически значимо (10+ точек) · ⚠️ = мало данных, требуется накопление
+      <div style="font-size:11px;color:var(--dim);margin-top:12px;line-height:1.6;">
+        💡 <b>Опережение цены</b> — насколько минут настроение в чатах предшествует движению акции<br>
+        💡 <b>Точность</b> — % случаев когда рост настроения → рост цены (> 50% = полезный сигнал)<br>
+        ✅ = статистически значимо (10+ точек) · ⚠️ = мало данных
       </div>
     `;
   } catch(e) {
-    el.innerHTML = '<div class="corr-empty" style="color:var(--red)">Ошибка загрузки данных</div>';
+    el.innerHTML = '<div class="corr-empty" style="color:var(--red)">❌ Ошибка загрузки. Проверь подключение к серверу.</div>';
   }
 }
 

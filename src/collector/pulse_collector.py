@@ -71,13 +71,14 @@ class PulseCollector:
         self._running = False
 
     async def fetch_ticker_posts(
-        self, client: httpx.AsyncClient, ticker: str
+        self, client: httpx.AsyncClient, ticker: str, limit: int = None
     ) -> list[PulsePost]:
         """Загрузить последние посты по тикеру"""
+        limit = limit or self.posts_per_ticker
         try:
             resp = await client.get(
                 PULSE_API,
-                params={"ticker": ticker, "limit": self.posts_per_ticker},
+                params={"ticker": ticker, "limit": limit},
                 headers=HEADERS,
                 timeout=10,
             )
@@ -121,6 +122,33 @@ class PulseCollector:
         except Exception as e:
             logger.debug(f"Pulse fetch error for {ticker}: {e}")
             return []
+
+    async def fetch_history(
+        self,
+        tickers: list[str] = None,
+        limit_per_ticker: int = 100,
+    ) -> dict[str, list[PulsePost]]:
+        """
+        Загрузить историю постов по всем тикерам.
+        Используется для немедленного расчёта корреляции.
+
+        Returns: {ticker: [PulsePost, ...]}
+        """
+        tickers = tickers or self.tickers
+        result = {}
+
+        logger.info(f"📱 Загружаем историю Пульса по {len(tickers)} тикерам...")
+        async with httpx.AsyncClient() as client:
+            for ticker in tickers:
+                posts = await self.fetch_ticker_posts(client, ticker, limit=limit_per_ticker)
+                if posts:
+                    result[ticker] = posts
+                    logger.info(f"  {ticker}: {len(posts)} постов")
+                await asyncio.sleep(0.3)
+
+        total = sum(len(v) for v in result.values())
+        logger.info(f"✅ Пульс история загружена: {total} постов по {len(result)} тикерам")
+        return result
 
     async def _poll_loop(self):
         """Основной цикл опроса"""
