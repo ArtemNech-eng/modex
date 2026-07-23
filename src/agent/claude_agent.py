@@ -248,6 +248,7 @@ class ClaudeAgent:
         trend: Optional[str] = None,
         historical_context: Optional[str] = None,
         price_context: Optional[str] = None,
+        tinkoff_context: Optional[str] = None,
         momentum: Optional[float] = None,
         momentum_label: Optional[str] = None,
         source_diversity: Optional[float] = None,
@@ -297,9 +298,13 @@ class ClaudeAgent:
 {price_context}
 """
 
+        tinkoff_block = ""
+        if tinkoff_context:
+            tinkoff_block = f"\n{tinkoff_context}\n"
+
         user = f"""Прими торговое решение по акции {ticker} ({company}).
 
-{price_block}{history_block}
+{price_block}{tinkoff_block}{history_block}
 📊 ТЕКУЩЕЕ НАСТРОЕНИЕ ТОЛПЫ (собрано из Telegram + Пульс):
 - Индекс настроения: {sentiment_index:.1f}/100
 - Сообщений за последний час: {message_count}

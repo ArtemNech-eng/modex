@@ -22,6 +22,9 @@ from src.agent import predictor as pred
 from src.agent.claude_agent import ClaudeAgent
 from src.agent.context_builder import build_ticker_context, build_price_context
 from src.agent.chart_generator import generate_chart_b64
+from src.collector.tinkoff_client import TinkoffClient
+
+_tinkoff = TinkoffClient()
 from src import db
 
 logger = logging.getLogger(__name__)
@@ -108,6 +111,9 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         # Строим ценовой дайджест за 2 года
         price_ctx = await build_price_context(ticker)
 
+        # Tinkoff: стакан + поток сделок + объём
+        tinkoff_snap = await _tinkoff.get_full_snapshot(ticker)
+
         # Генерируем график и получаем визуальный анализ Claude
         chart_analysis = None
         try:
@@ -145,6 +151,7 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
             trend=technical_block.get("regime") if technical_block else None,
             historical_context=hist_ctx.get("summary") if hist_ctx["patterns"] else None,
             price_context=price_ctx,
+            tinkoff_context=tinkoff_snap.get("summary") if tinkoff_snap else None,
             momentum=sentiment_block.get("momentum") if sentiment_block else None,
             momentum_label=sentiment_block.get("momentum_label") if sentiment_block else None,
             source_diversity=sentiment_block.get("source_diversity") if sentiment_block else None,
@@ -234,6 +241,10 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         "geopolitics": geo_snap,
         "claude": claude_result,
         "chart_analysis": chart_analysis,
+        "tinkoff": {
+            "orderbook": tinkoff_snap.get("orderbook"),
+            "trades":    tinkoff_snap.get("trades"),
+        } if tinkoff_snap else None,
         "narrative": narrative,
         "reasons": reasons,
         "model_weights": [round(w, 3) for w in weights],
