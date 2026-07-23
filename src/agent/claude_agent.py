@@ -133,8 +133,104 @@ class ClaudeAgent:
         price_change_1d: Optional[float] = None,
         rsi: Optional[float] = None,
         trend: Optional[str] = None,
-        historical_context: Optional[str] = None,   # ← история из context_builder
+        historical_context: Optional[str] = None,
+        momentum: Optional[float] = None,
+        momentum_label: Optional[str] = None,
+        source_diversity: Optional[float] = None,
+        volume_zscore: Optional[float] = None,
+        signal_confidence: Optional[float] = None,
     ) -> dict:
+        """
+        Синтез всех сигналов по тикеру → торговый инсайт.
+        Если передан historical_context — Claude видит реальные паттерны этого рынка.
+        """
+        messages_text = "\n".join(f"- {m[:150]}" for m in top_messages[:8])
+        price_info = f"Изменение цены за день: {price_change_1d:+.2f}%" if price_change_1d else "Цена: нет данных"
+        tech_info  = f"RSI: {rsi:.0f}, Тренд: {trend}" if rsi else "Технические данные: нет"
+
+        # Блок качества сигнала
+        quality_lines = []
+        if momentum_label:
+            quality_lines.append(f"- Моментум настроения: {momentum_label} (Δ={momentum:+.3f})")
+        if source_diversity is not None:
+            div_label = "высокое" if source_diversity > 0.6 else "среднее" if source_diversity > 0.3 else "низкое (1-2 канала)"
+            quality_lines.append(f"- Разнообразие источников: {div_label} ({source_diversity:.2f})")
+        if volume_zscore is not None:
+            vol_label = f"всплеск активности (+{volume_zscore:.1f}σ)" if volume_zscore > 2 else \
+                        f"пониженная активность ({volume_zscore:.1f}σ)" if volume_zscore < -1 else \
+                        f"нормальная активность ({volume_zscore:.1f}σ)"
+            quality_lines.append(f"- Объём сообщений: {vol_label}")
+        if signal_confidence is not None:
+            quality_lines.append(f"- Уверенность сигнала: {signal_confidence:.0%}")
+        quality_block = "\n".join(quality_lines) if quality_lines else "нет данных"
+
+        system = """Ты опытный трейдер и аналитик Московской биржи.
+Ты обучаешься на реальной истории рынка: тебе дают исторические данные о том,
+как настроение трейдеров коррелировало с движением цены в прошлом.
+Используй эти паттерны для принятия решений по текущей ситуации.
+Отвечай по-русски, конкретно. Отвечай ТОЛЬКО валидным JSON."""
+
+        history_block = ""
+        if historical_context:
+            history_block = f"""
+🎓 ОБУЧЕНИЕ НА ИСТОРИИ (реальные данные этого рынка):
+{historical_context}
+
+Используй эти паттерны как основу для решения.
+"""
+
+        user = f"""Прими торговое решение по акции {ticker} ({company}).
+
+{history_block}
+📊 ТЕКУЩЕЕ НАСТРОЕНИЕ ТОЛПЫ (собрано из Telegram + Пульс):
+- Индекс настроения: {sentiment_index:.1f}/100
+- Сообщений за последний час: {message_count}
+- Позитивных: {positive_pct:.0f}% | Негативных: {negative_pct:.0f}%
+
+📐 КАЧЕСТВО СИГНАЛА:
+{quality_block}
+
+💹 ТЕКУЩИЙ РЫНОК (MOEX):
+- {price_info}
+- {tech_info}
+
+💬 ЧТО ПИШУТ В ЧАТАХ ПРЯМО СЕЙЧАС:
+{messages_text}
+
+Сопоставь текущую ситуацию с историческими паттернами и дай решение в JSON:
+{{
+  "signal": "bullish|bearish|neutral",
+  "confidence": 0-100,
+  "summary": "вывод в 1-2 предложения опираясь на историю",
+  "key_insight": "что говорит история о такой ситуации",
+  "risk": "главный риск",
+  "crowd_behavior": "моментум|контртренд|неопределённость",
+  "history_based": true
+}}"""
+
+        try:
+            result = await self._ask(system, user, max_tokens=600)
+            import json
+            start = result.find("{")
+            end   = result.rfind("}") + 1
+            if start >= 0 and end > start:
+                data = json.loads(result[start:end])
+                data["ticker"]      = ticker
+                data["analyzed_at"] = datetime.now(timezone.utc).isoformat()
+                return data
+        except Exception as e:
+            logger.warning(f"Claude synthesis failed for {ticker}: {e}")
+
+        return {
+            "ticker":         ticker,
+            "signal":         "neutral",
+            "confidence":     0,
+            "summary":        "Анализ недоступен",
+            "key_insight":    "Ошибка запроса к Claude",
+            "risk":           "Нет данных",
+            "crowd_behavior": "неопределённость",
+            "history_based":  False,
+        }
         """
         Синтез всех сигналов по тикеру → торговый инсайт.
         Если передан historical_context — Claude видит реальные паттерны этого рынка.

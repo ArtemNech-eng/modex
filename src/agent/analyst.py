@@ -116,6 +116,11 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
             rsi=technical_block.get("rsi") if technical_block else None,
             trend=technical_block.get("regime") if technical_block else None,
             historical_context=hist_ctx.get("summary") if hist_ctx["patterns"] else None,
+            momentum=sentiment_block.get("momentum") if sentiment_block else None,
+            momentum_label=sentiment_block.get("momentum_label") if sentiment_block else None,
+            source_diversity=sentiment_block.get("source_diversity") if sentiment_block else None,
+            volume_zscore=sentiment_block.get("volume_zscore") if sentiment_block else None,
+            signal_confidence=sentiment_block.get("confidence") if sentiment_block else None,
         )
 
         # Переводим сигнал Claude в направление
