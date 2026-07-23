@@ -22,8 +22,8 @@ logger = logging.getLogger(__name__)
 RSS_SOURCES = [
     {
         "name": "Smart-lab",
-        "url": "https://smart-lab.ru/blog/rss/",
-        "weight": 1.5,   # вес при агрегации (аудитория трейдеров)
+        "url": "https://smart-lab.ru/rss/",   # обновлённый URL
+        "weight": 1.5,
     },
     {
         "name": "РБК Инвестиции",
@@ -37,12 +37,12 @@ RSS_SOURCES = [
     },
     {
         "name": "Финам Новости",
-        "url": "https://www.finam.ru/analysis/newsitem/rsspoint/",
+        "url": "https://www.finam.ru/analysis/newsitem/rss/",   # обновлённый URL
         "weight": 1.0,
     },
     {
-        "name": "Коммерсант Деньги",
-        "url": "https://www.kommersant.ru/RSS/section-money.xml",
+        "name": "БКС Экспресс",
+        "url": "https://bcs-express.ru/rss",   # замена Коммерсанту (работающий)
         "weight": 1.1,
     },
 ]
