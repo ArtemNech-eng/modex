@@ -133,64 +133,79 @@ class ClaudeAgent:
         price_change_1d: Optional[float] = None,
         rsi: Optional[float] = None,
         trend: Optional[str] = None,
+        historical_context: Optional[str] = None,   # ← история из context_builder
     ) -> dict:
         """
         Синтез всех сигналов по тикеру → торговый инсайт.
+        Если передан historical_context — Claude видит реальные паттерны этого рынка.
         """
         messages_text = "\n".join(f"- {m[:150]}" for m in top_messages[:8])
         price_info = f"Изменение цены за день: {price_change_1d:+.2f}%" if price_change_1d else "Цена: нет данных"
-        tech_info = f"RSI: {rsi:.0f}, Тренд: {trend}" if rsi else "Технические данные: нет"
+        tech_info  = f"RSI: {rsi:.0f}, Тренд: {trend}" if rsi else "Технические данные: нет"
 
         system = """Ты опытный трейдер и аналитик Московской биржи.
-Анализируй данные объективно. Не давай прямых инвестиционных рекомендаций,
-но делай конкретные выводы о настроении рынка и возможных сценариях.
-Отвечай по-русски, кратко и по делу."""
+Ты обучаешься на реальной истории рынка: тебе дают исторические данные о том,
+как настроение трейдеров коррелировало с движением цены в прошлом.
+Используй эти паттерны для принятия решений по текущей ситуации.
+Отвечай по-русски, конкретно. Отвечай ТОЛЬКО валидным JSON."""
 
-        user = f"""Анализируй сигналы по акции {ticker} ({company}):
+        history_block = ""
+        if historical_context:
+            history_block = f"""
+🎓 ОБУЧЕНИЕ НА ИСТОРИИ (реальные данные этого рынка):
+{historical_context}
 
-📊 НАСТРОЕНИЕ ТОЛПЫ:
+Используй эти паттерны как основу для решения.
+"""
+
+        user = f"""Прими торговое решение по акции {ticker} ({company}).
+
+{history_block}
+📊 ТЕКУЩЕЕ НАСТРОЕНИЕ ТОЛПЫ (собрано из Telegram + Пульс):
 - Индекс настроения: {sentiment_index:.1f}/100
-- Сообщений за час: {message_count}
+- Сообщений за последний час: {message_count}
 - Позитивных: {positive_pct:.0f}% | Негативных: {negative_pct:.0f}%
 
-💹 РЫНОК:
+💹 ТЕКУЩИЙ РЫНОК (MOEX):
 - {price_info}
 - {tech_info}
 
-💬 ТОП СООБЩЕНИЯ ИЗ ЧАТОВ:
+💬 ЧТО ПИШУТ В ЧАТАХ ПРЯМО СЕЙЧАС:
 {messages_text}
 
-Дай анализ в формате JSON:
+Сопоставь текущую ситуацию с историческими паттернами выше и дай решение в JSON:
 {{
   "signal": "bullish|bearish|neutral",
   "confidence": 0-100,
-  "summary": "краткий вывод в 1-2 предложения",
-  "key_insight": "главный инсайт который не видно без AI",
+  "summary": "вывод в 1-2 предложения опираясь на историю",
+  "key_insight": "что говорит история о такой ситуации",
   "risk": "главный риск",
-  "crowd_behavior": "моментум|контртренд|неопределённость"
+  "crowd_behavior": "моментум|контртренд|неопределённость",
+  "history_based": true
 }}"""
 
         try:
-            result = await self._ask(system, user, max_tokens=512)
+            result = await self._ask(system, user, max_tokens=600)
             import json
             start = result.find("{")
-            end = result.rfind("}") + 1
+            end   = result.rfind("}") + 1
             if start >= 0 and end > start:
                 data = json.loads(result[start:end])
-                data["ticker"] = ticker
+                data["ticker"]      = ticker
                 data["analyzed_at"] = datetime.now(timezone.utc).isoformat()
                 return data
         except Exception as e:
             logger.warning(f"Claude synthesis failed for {ticker}: {e}")
 
         return {
-            "ticker": ticker,
-            "signal": "neutral",
-            "confidence": 0,
-            "summary": "Анализ недоступен",
-            "key_insight": str(e) if 'e' in dir() else "Ошибка",
-            "risk": "Нет данных",
+            "ticker":         ticker,
+            "signal":         "neutral",
+            "confidence":     0,
+            "summary":        "Анализ недоступен",
+            "key_insight":    "Ошибка запроса к Claude",
+            "risk":           "Нет данных",
             "crowd_behavior": "неопределённость",
+            "history_based":  False,
         }
 
     async def find_correlations(

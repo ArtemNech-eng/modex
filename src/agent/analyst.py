@@ -20,6 +20,7 @@ from src.analysis import technical as ta
 from src.analysis import geopolitics as geo
 from src.agent import predictor as pred
 from src.agent.claude_agent import ClaudeAgent
+from src.agent.context_builder import build_ticker_context
 from src import db
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,12 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         from config.settings import MOEX_TICKERS
         company = MOEX_TICKERS.get(ticker, ticker)
 
+        # Строим исторический контекст (паттерны настроение → цена)
+        hist_ctx = await build_ticker_context(
+            ticker=ticker,
+            current_sentiment=sentiment_block["sentiment_index"] if sentiment_block else None,
+        )
+
         claude_result = await _claude.synthesize_ticker(
             ticker=ticker,
             company=company,
@@ -108,6 +115,7 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
             price_change_1d=technical_block.get("price_change_1d") if technical_block else None,
             rsi=technical_block.get("rsi") if technical_block else None,
             trend=technical_block.get("regime") if technical_block else None,
+            historical_context=hist_ctx.get("summary") if hist_ctx["patterns"] else None,
         )
 
         # Переводим сигнал Claude в направление
