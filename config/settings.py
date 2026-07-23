@@ -17,14 +17,28 @@ TELEGRAM_SESSION = os.getenv("TELEGRAM_SESSION", "moodex_session")
 TELEGRAM_STRING_SESSION = os.getenv("TELEGRAM_STRING_SESSION", "")
 
 # ─── Список каналов для парсинга ──────────────────────────────────────────────
-# Публичные Telegram-каналы/чаты трейдеров MOEX
 TELEGRAM_CHANNELS = [
-    "markettwits",           # MarketTwits — крупнейший чат трейдеров
-    "rdv_investor",          # РынкиДеньгиВласть
-    "moex_official",         # Московская биржа (официальный)
-    "smart_lab_official",    # Smart-lab
-    "invest_tinkoff",        # Т-Инвестиции
-    "cbrstocks",             # ЦБ акции
+    # ── Топ чаты трейдеров MOEX ──
+    "markettwits",           # MarketTwits — крупнейший чат трейдеров РФ
+    "rdv_investor",          # РынкиДеньгиВласть — аналитика и обсуждения
+    "smart_lab_official",    # Smart-lab — профессиональные трейдеры
+    "mozgovik",              # Mozgovik Research — аналитика
+    "cbrstocks",             # Акции и облигации РФ
+    "AlenkaCapital",         # Алёнка Капитал — популярный канал
+    "finfeed",               # ФинФид — новости рынка
+    "stocktrader_ru",        # Трейдинг РФ
+    "invst_ideas",           # Инвестиционные идеи
+    "finam_ru",              # Финам — брокер
+    "bcs_express",           # БКС Экспресс — аналитика
+    "sberinvestments",       # Сбер Инвестиции
+    "tinkoff_invest",        # Т-Инвестиции
+    "vtb_my_investments",    # ВТБ Мои Инвестиции
+    "invest_tinkoff",        # Инвестиции Тинькофф сообщество
+    "moex_official",         # Московская биржа официальный
+    "russianmacro",          # Русский Макро — макроэкономика
+    "helicoptermacro",       # Вертолётный Макро
+    "profinance_ru",         # Profinance — биржевые новости
+    "akprime",               # АК Прайм — новости экономики
 ]
 
 # ─── NLP ───────────────────────────────────────────────────────────────────────

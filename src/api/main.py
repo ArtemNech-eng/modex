@@ -221,6 +221,20 @@ async def get_anomalies():
     return {"anomalies": anomalies, "count": len(anomalies)}
 
 
+@app.get("/api/sources", summary="Все источники данных")
+async def get_sources():
+    """Список всех активных источников данных"""
+    from config.settings import TELEGRAM_CHANNELS
+    from src.collector.rss_collector import RSS_SOURCES
+    from src.collector.pulse_collector import PULSE_TICKERS
+    return {
+        "telegram": [{"name": ch, "type": "telegram"} for ch in TELEGRAM_CHANNELS],
+        "pulse": {"tickers": PULSE_TICKERS, "type": "pulse", "description": "Пульс Т-Инвестиции"},
+        "rss": [{"name": s["name"], "url": s["url"], "type": "rss"} for s in RSS_SOURCES],
+        "total_sources": len(TELEGRAM_CHANNELS) + 1 + len(RSS_SOURCES),
+    }
+
+
 @app.get("/api/stats", summary="Статистика системы")
 async def get_stats():
     """Статистика работы агрегатора"""

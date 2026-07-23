@@ -23,6 +23,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import uvicorn
 from src.collector.telegram_collector import TelegramCollector
+from src.collector.pulse_collector import PulseCollector
+from src.collector.rss_collector import RSSCollector
 from src.nlp.sentiment_analyzer import SentimentAnalyzer, keyword_sentiment
 from src.nlp.ticker_extractor import extract_tickers, is_market_related
 from src.aggregator.aggregator import SentimentAggregator
@@ -181,8 +183,64 @@ async def telegram_pipeline():
             logger.error(f"Ошибка обработки сообщения: {e}", exc_info=True)
 
 
+async def pulse_pipeline():
+    """Пульс Т-Инвестиции → NLP → Aggregator"""
+    pulse = PulseCollector(poll_interval=60)
+    await pulse.start()
+    logger.info("📱 Пульс pipeline запущен!")
+
+    async for post in pulse.listen():
+        try:
+            tickers = [post.ticker] if post.ticker else extract_tickers(post.text)
+            if not tickers:
+                continue
+            sentiment = keyword_sentiment(post.text)
+            for ticker in tickers:
+                api_aggregator.add_point(
+                    ticker=ticker,
+                    signal=sentiment.signal,
+                    label=sentiment.label,
+                    score=sentiment.score,
+                    channel="pulse",
+                    text=post.text,
+                    timestamp=post.timestamp,
+                )
+            stats["messages_processed"] += 1
+        except Exception as e:
+            logger.error(f"Ошибка обработки Пульса: {e}")
+
+
+async def rss_pipeline():
+    """RSS новости → NLP → Aggregator"""
+    rss = RSSCollector(poll_interval=300)
+    await rss.start()
+    logger.info("📰 RSS pipeline запущен!")
+
+    async for item in rss.listen():
+        try:
+            tickers = extract_tickers(item.full_text)
+            if not tickers:
+                continue
+            sentiment = keyword_sentiment(item.full_text)
+            # Новости взвешиваем по источнику
+            weighted_signal = sentiment.signal * item.weight
+            for ticker in tickers:
+                api_aggregator.add_point(
+                    ticker=ticker,
+                    signal=max(-1, min(1, weighted_signal)),
+                    label=sentiment.label,
+                    score=sentiment.score,
+                    channel=f"rss_{item.source}",
+                    text=item.full_text[:200],
+                    timestamp=item.timestamp,
+                )
+            stats["messages_processed"] += 1
+        except Exception as e:
+            logger.error(f"Ошибка обработки RSS: {e}")
+
+
 async def run():
-    """Запустить Telegram pipeline + FastAPI сервер параллельно"""
+    """Запустить все pipeline + FastAPI параллельно"""
 
     # Конфигурация uvicorn (без reload — он мешает asyncio)
     config = uvicorn.Config(
@@ -198,10 +256,12 @@ async def run():
     logger.info("  Запуск в режиме РЕАЛЬНОГО ВРЕМЕНИ")
     logger.info("=" * 55)
 
-    # Запускаем оба компонента параллельно
+    # Запускаем все компоненты параллельно
     await asyncio.gather(
         server.serve(),
         telegram_pipeline(),
+        pulse_pipeline(),
+        rss_pipeline(),
     )
 
 
