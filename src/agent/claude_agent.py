@@ -134,6 +134,7 @@ class ClaudeAgent:
         rsi: Optional[float] = None,
         trend: Optional[str] = None,
         historical_context: Optional[str] = None,
+        price_context: Optional[str] = None,
         momentum: Optional[float] = None,
         momentum_label: Optional[str] = None,
         source_diversity: Optional[float] = None,
@@ -173,15 +174,19 @@ class ClaudeAgent:
         history_block = ""
         if historical_context:
             history_block = f"""
-🎓 ОБУЧЕНИЕ НА ИСТОРИИ (реальные данные этого рынка):
+🎓 ПАТТЕРНЫ НАСТРОЕНИЕ → ЦЕНА (реальная история):
 {historical_context}
+"""
 
-Используй эти паттерны как основу для решения.
+        price_block = ""
+        if price_context:
+            price_block = f"""
+{price_context}
 """
 
         user = f"""Прими торговое решение по акции {ticker} ({company}).
 
-{history_block}
+{price_block}{history_block}
 📊 ТЕКУЩЕЕ НАСТРОЕНИЕ ТОЛПЫ (собрано из Telegram + Пульс):
 - Индекс настроения: {sentiment_index:.1f}/100
 - Сообщений за последний час: {message_count}
@@ -197,11 +202,11 @@ class ClaudeAgent:
 💬 ЧТО ПИШУТ В ЧАТАХ ПРЯМО СЕЙЧАС:
 {messages_text}
 
-Сопоставь текущую ситуацию с историческими паттернами и дай решение в JSON:
+Используй всю историю выше и дай решение в JSON:
 {{
   "signal": "bullish|bearish|neutral",
   "confidence": 0-100,
-  "summary": "вывод в 1-2 предложения опираясь на историю",
+  "summary": "вывод в 1-2 предложения с опорой на историю цены и паттерны",
   "key_insight": "что говорит история о такой ситуации",
   "risk": "главный риск",
   "crowd_behavior": "моментум|контртренд|неопределённость",

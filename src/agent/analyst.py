@@ -20,7 +20,7 @@ from src.analysis import technical as ta
 from src.analysis import geopolitics as geo
 from src.agent import predictor as pred
 from src.agent.claude_agent import ClaudeAgent
-from src.agent.context_builder import build_ticker_context
+from src.agent.context_builder import build_ticker_context, build_price_context
 from src import db
 
 logger = logging.getLogger(__name__)
@@ -104,6 +104,9 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
             current_sentiment=sentiment_block["sentiment_index"] if sentiment_block else None,
         )
 
+        # Строим ценовой дайджест за 2 года
+        price_ctx = await build_price_context(ticker)
+
         claude_result = await _claude.synthesize_ticker(
             ticker=ticker,
             company=company,
@@ -116,6 +119,7 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
             rsi=technical_block.get("rsi") if technical_block else None,
             trend=technical_block.get("regime") if technical_block else None,
             historical_context=hist_ctx.get("summary") if hist_ctx["patterns"] else None,
+            price_context=price_ctx,
             momentum=sentiment_block.get("momentum") if sentiment_block else None,
             momentum_label=sentiment_block.get("momentum_label") if sentiment_block else None,
             source_diversity=sentiment_block.get("source_diversity") if sentiment_block else None,

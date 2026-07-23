@@ -1,18 +1,196 @@
 """
 MOODEX — Context Builder для Claude
 
-Собирает исторический контекст из БД (sentiment_daily + MOEX свечи),
-чтобы Claude мог принимать решения на основе реальной истории рынка.
+Два вида контекста которые получает Claude перед принятием решения:
 
-Принцип: in-context learning.
-  — Ищем похожие ситуации в прошлом (похожий sentiment + похожая техника)
-  — Смотрим что происходило с ценой через 1/5/10 дней
-  — Отдаём Claude эти примеры как "обучающие данные" в промпте
+1. build_ticker_context()  — история настроений → движение цены
+   Паттерны: "когда настроение было X, цена шла Y"
 
-Claude не дообучается в смысле весов — но видит реальные паттерны
-конкретного рынка (MOEX) и делает решения на их основе.
+2. build_price_context()   — срез 2 лет ценовой истории
+   Не сырые свечи, а аналитический дайджест:
+   — Доходность за 1н/1м/3м/6м/1г/2г
+   — Текущее положение относительно диапазонов
+   — Волатильность (текущая vs историческая)
+   — Крупные движения (>5% за день) — что случалось и когда
+   — Ключевые уровни: 52н хай/лой, 2г хай/лой, текущая позиция %
+   — Фазы тренда: сколько раз разворачивался, средняя продолжительность
+
+Claude не получает 730 строк данных — только то, что реально помогает решению.
 """
 import logging
+import math
+from typing import Optional
+from src import db
+from src.analysis import technical as ta
+
+logger = logging.getLogger(__name__)
+
+
+async def build_price_context(ticker: str) -> str:
+    """
+    Аналитический дайджест 2 лет ценовой истории для Claude.
+    Возвращает готовый текстовый блок для промпта.
+    """
+    try:
+        data = await ta.fetch_candles(ticker, days=730)
+    except Exception as e:
+        return f"Ценовая история недоступна: {e}"
+
+    closes = data.get("close", [])
+    highs  = data.get("high", [])
+    lows   = data.get("low", [])
+    dates  = data.get("dates", [])
+
+    if len(closes) < 60:
+        return "Недостаточно исторических данных (< 60 дней)."
+
+    price = closes[-1]
+    n     = len(closes)
+
+    # ── 1. Доходность за разные периоды ──────────────────────────────────────
+    def ret(days: int) -> Optional[str]:
+        if n <= days or closes[-days - 1] == 0:
+            return None
+        r = (closes[-1] / closes[-days - 1] - 1) * 100
+        arrow = "↑" if r > 0 else "↓"
+        return f"{arrow}{abs(r):.1f}%"
+
+    periods = [
+        ("1 неделя",  5),
+        ("1 месяц",   21),
+        ("3 месяца",  63),
+        ("6 месяцев", 126),
+        ("1 год",     252),
+        ("2 года",    min(500, n - 1)),
+    ]
+    returns_lines = []
+    for label, d in periods:
+        r = ret(d)
+        if r:
+            returns_lines.append(f"  {label}: {r}")
+
+    # ── 2. Диапазоны: 52-недельный и 2-летний ────────────────────────────────
+    hi_52w  = max(highs[-252:])  if len(highs)  >= 252 else max(highs)
+    lo_52w  = min(lows[-252:])   if len(lows)   >= 252 else min(lows)
+    hi_2y   = max(highs)
+    lo_2y   = min(lows)
+
+    pos_52w = (price - lo_52w) / (hi_52w - lo_52w) * 100 if hi_52w != lo_52w else 50
+    pos_2y  = (price - lo_2y)  / (hi_2y  - lo_2y)  * 100 if hi_2y  != lo_2y  else 50
+
+    dist_from_hi_52w = (price / hi_52w - 1) * 100
+    dist_from_lo_52w = (price / lo_52w - 1) * 100
+
+    # ── 3. Волатильность ──────────────────────────────────────────────────────
+    def vol_period(n_days: int) -> Optional[float]:
+        if len(closes) < n_days + 1:
+            return None
+        rets = [closes[i] / closes[i-1] - 1 for i in range(len(closes)-n_days, len(closes))]
+        if len(rets) < 2:
+            return None
+        mean = sum(rets) / len(rets)
+        std  = math.sqrt(sum((r - mean)**2 for r in rets) / (len(rets)-1))
+        return round(std * math.sqrt(252) * 100, 1)
+
+    vol_20d  = vol_period(20)
+    vol_252d = vol_period(252)
+    vol_line = ""
+    if vol_20d and vol_252d:
+        regime_v = "повышенная" if vol_20d > vol_252d * 1.3 else \
+                   "пониженная" if vol_20d < vol_252d * 0.7 else "нормальная"
+        vol_line = f"  Текущая (20д): {vol_20d}% годовых | Историческая (1г): {vol_252d}% → {regime_v}"
+
+    # ── 4. Крупные движения >5% за день (последние 2 года) ───────────────────
+    big_moves = []
+    for i in range(1, min(n, 500)):
+        if closes[i-1] == 0:
+            continue
+        move = (closes[i] / closes[i-1] - 1) * 100
+        if abs(move) >= 5.0:
+            d = dates[i] if i < len(dates) else "?"
+            direction = "🔴" if move < 0 else "🟢"
+            big_moves.append(f"  {direction} {d}: {move:+.1f}%")
+    big_moves = big_moves[-8:]  # последние 8 крупных событий
+
+    # ── 5. Фазы тренда (простая детекция разворотов) ─────────────────────────
+    def detect_phases(closes: list[float], threshold_pct: float = 15.0) -> list[dict]:
+        """Находит фазы бычьего/медвежьего рынка (движения > threshold_pct%)."""
+        if len(closes) < 20:
+            return []
+        phases = []
+        peak = trough = closes[0]
+        peak_i = trough_i = 0
+        direction = None
+
+        for i, c in enumerate(closes[1:], 1):
+            if direction is None:
+                if c > peak:
+                    peak, peak_i = c, i
+                elif c < trough:
+                    trough, trough_i = c, i
+                if peak > 0 and (peak - trough) / trough * 100 >= threshold_pct:
+                    direction = "bull" if peak_i > trough_i else "bear"
+
+            elif direction == "bull":
+                if c > peak:
+                    peak, peak_i = c, i
+                elif peak > 0 and (peak - c) / peak * 100 >= threshold_pct:
+                    move = (peak / trough - 1) * 100
+                    phases.append({"type": "bull", "move": round(move, 1), "bars": peak_i - trough_i})
+                    trough, trough_i = c, i
+                    direction = "bear"
+
+            elif direction == "bear":
+                if c < trough:
+                    trough, trough_i = c, i
+                elif trough > 0 and (c - trough) / trough * 100 >= threshold_pct:
+                    move = (trough / peak - 1) * 100
+                    phases.append({"type": "bear", "move": round(move, 1), "bars": trough_i - peak_i})
+                    peak, peak_i = c, i
+                    direction = "bull"
+        return phases
+
+    phases = detect_phases(closes[-500:] if len(closes) > 500 else closes)
+    phase_lines = []
+    for ph in phases[-5:]:
+        emoji = "📈" if ph["type"] == "bull" else "📉"
+        label = "рост" if ph["type"] == "bull" else "снижение"
+        phase_lines.append(f"  {emoji} {label}: {ph['move']:+.1f}% за ~{ph['bars']} торговых дней")
+
+    # ── Текущий тренд из последних 252 свечей ────────────────────────────────
+    if len(closes) >= 252:
+        trend_1y = (closes[-1] / closes[-252] - 1) * 100
+        trend_label = "восходящий" if trend_1y > 5 else "нисходящий" if trend_1y < -5 else "боковой"
+    else:
+        trend_label = "нет данных"
+
+    # ── Собираем итоговый текст ───────────────────────────────────────────────
+    lines = [
+        f"📈 ЦЕНОВАЯ ИСТОРИЯ {ticker} (последние 2 года, {n} торговых дней):",
+        "",
+        f"  Текущая цена: {price:.2f} ₽",
+        f"  Тренд за год: {trend_label}",
+        "",
+        "  Доходность:",
+    ] + returns_lines + [
+        "",
+        "  Позиция в диапазонах:",
+        f"  52-нед. хай: {hi_52w:.2f} (от хая: {dist_from_hi_52w:.1f}%)",
+        f"  52-нед. лой: {lo_52w:.2f} (от лоя: {dist_from_lo_52w:+.1f}%)",
+        f"  Позиция в 52н диапазоне: {pos_52w:.0f}%  (0%=дно, 100%=вершина)",
+        f"  Позиция в 2г диапазоне:  {pos_2y:.0f}%",
+        "",
+        "  Волатильность:",
+        vol_line or "  нет данных",
+    ]
+
+    if big_moves:
+        lines += ["", f"  Крупные движения >5% за день (последние {len(big_moves)}):"] + big_moves
+
+    if phase_lines:
+        lines += ["", "  Фазы рынка (движения >15%):"] + phase_lines
+
+    return "\n".join(lines)
 from typing import Optional
 from src import db
 from src.analysis import technical as ta
