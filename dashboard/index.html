@@ -1657,6 +1657,32 @@ function planBlock(tp, opts) {
   </div>`;
 }
 
+// Первичный интрадей-блок (для нас старший ТФ — только вспомогательный).
+function intradayBlock(a) {
+  const iv = a.intraday;
+  if (!iv) return '';
+  const L = iv.levels || {};
+  const lvl = [
+    L.vwap != null ? `VWAP <b>${L.vwap}</b>` : null,
+    (L.or_low != null && L.or_high != null) ? `диап. открытия <b>${L.or_low}–${L.or_high}</b>` : null,
+    (L.session_low != null && L.session_high != null) ? `сессия <b>${L.session_low}–${L.session_high}</b>` : null,
+    L.atr != null ? `ATR <b>${L.atr}</b>` : null,
+  ].filter(Boolean).join(' · ');
+  const src = iv.delayed
+    ? '<span style="color:var(--red)">данные с задержкой ~15м</span>'
+    : '<span style="color:var(--green)">realtime</span>';
+  const meta = `<div style="color:var(--dim);margin-top:4px;">Фаза ${iv.phase||'—'} · волатильность ${iv.volatility_state||'—'}${iv.vwap_rel?(' · '+iv.vwap_rel):''}</div>`;
+  const head = a.trade_plan
+    ? `<b style="color:var(--green)">⚡ Интрадей: есть вход</b> · ${src}`
+    : `<b>⚡ Интрадей: входа сейчас нет</b> · ${src}`;
+  const noteLine = (!a.trade_plan && iv.note) ? `<div style="margin-top:2px;">${iv.note}</div>` : '';
+  return `<div style="margin-top:8px;padding:8px;background:var(--bg);border-radius:8px;border-left:3px solid var(--blue);font-size:12px;line-height:1.5;">
+    ${head}${noteLine}
+    <div style="color:var(--dim);margin-top:4px;">${lvl || 'нет интрадей-уровней'}</div>
+    ${meta}
+  </div>`;
+}
+
 async function runAgent() {
   const ticker = (document.getElementById('agentTicker').value || '').trim().toUpperCase();
   if (!ticker) return;
@@ -1697,8 +1723,14 @@ async function runAgent() {
       <ul style="margin:0;padding-left:18px;font-size:12px;line-height:1.5;">
         ${a.reasons.map(x => `<li>${x}</li>`).join('')}
       </ul>
-      ${a.trade_plan ? planBlock(a.trade_plan, {tf:'intraday'})
-                     : (t && t.trade_plan ? planBlock(t.trade_plan, {tf: a.intraday ? 'daily-context' : null}) : '')}
+      ${a.intraday ? intradayBlock(a) : ''}
+      ${a.trade_plan
+          ? planBlock(a.trade_plan, {tf:'intraday'})
+          : (t && t.trade_plan
+              ? (a.intraday
+                  ? `<details style="margin-top:8px;"><summary style="cursor:pointer;color:var(--dim);font-size:12px;">📈 Дневной ТФ (вспомогательный) — показать план старшего таймфрейма</summary>${planBlock(t.trade_plan, {tf:'daily-context'})}</details>`
+                  : planBlock(t.trade_plan))
+              : '')}
       ${a.narrative ? `<div style="margin-top:10px;padding:8px;background:var(--bg);border-radius:8px;font-size:12px;line-height:1.5;">🤖 ${a.narrative}</div>` : ''}
       <div style="margin-top:10px;font-size:10px;color:var(--dim);">${a.disclaimer}</div>
     `;

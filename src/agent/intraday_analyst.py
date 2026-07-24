@@ -144,6 +144,17 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
     summary = _summary_text(price, vwap_last, vwap_rel, atr, vol, phase,
                             setup, plan, observe, note, delayed)
 
+    levels = {
+        "vwap": vwap_last,
+        "or_high": (orr or {}).get("or_high"),
+        "or_low": (orr or {}).get("or_low"),
+        "session_high": round(max(h), 6) if h else None,
+        "session_low": round(min(l), 6) if l else None,
+        "atr": atr,
+        "spike_high": round(h[spike_idx], 6) if spike_idx is not None else None,
+        "spike_low": round(l[spike_idx], 6) if spike_idx is not None else None,
+    }
+
     return {
         "summary": summary,
         "signal": signal,
@@ -159,6 +170,7 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
         "event": event,
         "delayed": delayed,
         "note": note,
+        "levels": levels,
     }
 
 

@@ -385,6 +385,8 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
             "volatility_state": intraday_ctx.get("volatility_state"),
             "phase": intraday_ctx.get("phase"),
             "delayed": intraday_ctx.get("delayed"),
+            "note": intraday_ctx.get("note"),
+            "levels": intraday_ctx.get("levels"),
         } if intraday_ctx else None,
         "narrative": narrative,
         "reasons": reasons,
