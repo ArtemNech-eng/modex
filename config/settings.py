@@ -67,7 +67,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 USE_LLM_FALLBACK = os.getenv("USE_LLM_FALLBACK", "false").lower() == "true"
 
 # ─── База данных ───────────────────────────────────────────────────────────────
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./moodex.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./data/moodex.db")
 # Путь к старому JSON-файлу каналов (для одноразовой миграции в БД)
 CHANNELS_FILE = os.getenv("CHANNELS_FILE", "data/channels.json")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")

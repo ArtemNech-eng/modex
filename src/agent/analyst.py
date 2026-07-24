@@ -25,6 +25,7 @@ from src.agent.claude_agent import ClaudeAgent
 from src.agent.context_builder import (
     build_ticker_context, build_price_context,
     build_memory_context, build_news_context, build_multiframe_context,
+    build_lessons_context,
 )
 from src.agent.chart_generator import generate_chart_b64
 from src.collector.tinkoff_client import TinkoffClient
@@ -116,19 +117,21 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         # Строим ценовой дайджест за 2 года
         price_ctx = await build_price_context(ticker)
 
-        # Параллельно: макро + фундаментал + память + мультитаймфрейм
+        # Параллельно: макро + фундаментал + память + мультитаймфрейм + уроки
         import asyncio
-        macro_ctx, fund_ctx, memory_ctx, multiframe_ctx = await asyncio.gather(
+        macro_ctx, fund_ctx, memory_ctx, multiframe_ctx, lessons_ctx = await asyncio.gather(
             get_macro_context(),
             get_fundamentals(ticker),
             build_memory_context(ticker),
             build_multiframe_context(ticker),
+            build_lessons_context(ticker),
             return_exceptions=True,
         )
         macro_ctx      = macro_ctx      if not isinstance(macro_ctx, Exception)      else {}
         fund_ctx       = fund_ctx       if not isinstance(fund_ctx, Exception)       else {}
         memory_ctx     = memory_ctx     if not isinstance(memory_ctx, Exception)     else ""
         multiframe_ctx = multiframe_ctx if not isinstance(multiframe_ctx, Exception) else ""
+        lessons_ctx    = lessons_ctx    if not isinstance(lessons_ctx, Exception)    else ""
 
         # Tinkoff: стакан + поток сделок + объём
         tinkoff_snap = await _tinkoff.get_full_snapshot(ticker)
@@ -186,6 +189,7 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
             memory_context=memory_ctx or None,
             multiframe_context=multiframe_ctx or None,
             smart_money_context=smart_money_ctx,
+            lessons_context=lessons_ctx or None,
             momentum=sentiment_block.get("momentum") if sentiment_block else None,
             momentum_label=sentiment_block.get("momentum_label") if sentiment_block else None,
             source_diversity=sentiment_block.get("source_diversity") if sentiment_block else None,
@@ -202,9 +206,18 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         if chart_analysis:
             chart_signal = signal_map.get(chart_analysis.get("chart_signal", "neutral"), "flat")
             chart_conf   = chart_analysis.get("chart_confidence", 0) / 100
-            # Взвешенное голосование: текст 60%, график 40%
-            score = 0.6 * ({"up": 1, "flat": 0, "down": -1}[text_signal]  * text_conf) + \
-                    0.4 * ({"up": 1, "flat": 0, "down": -1}[chart_signal] * chart_conf)
+            # Взвешенное голосование текст vs график. По умолчанию текст 60% /
+            # график 40%: текстовый вывод опирается на МНОГО входов (макро,
+            # фундаментал, техника в числах, настроение, стакан, «умные деньги»,
+            # память), а разбор графика — это один визуальный сигнал, поэтому вес
+            # ниже. Это эвристика, не подобранная по бэктесту — вес вынесен в
+            # CHART_VOTE_WEIGHT, чтобы его можно было настраивать/со временем
+            # сделать обучаемым.
+            chart_w = float(os.getenv("CHART_VOTE_WEIGHT", "0.4"))
+            chart_w = min(max(chart_w, 0.0), 1.0)
+            text_w  = 1.0 - chart_w
+            score = text_w  * ({"up": 1, "flat": 0, "down": -1}[text_signal]  * text_conf) + \
+                    chart_w * ({"up": 1, "flat": 0, "down": -1}[chart_signal] * chart_conf)
             direction  = "up" if score > 0.1 else "down" if score < -0.1 else "flat"
             confidence = round(abs(score), 3)
         else:
@@ -290,6 +303,28 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
     # ── 7. Сохраняем прогноз в БД (память агента) ───────────────────────────
     if save:
         try:
+            # Снимок ключевых драйверов на момент прогноза — основа для будущего
+            # разбора ошибок (post-mortem): по нему станет ясно, на чём стоял сигнал.
+            context_snapshot = {
+                "direction": direction,
+                "confidence": confidence,
+                "decision_by": "claude" if claude_result else "fallback_model",
+                "sentiment_index": sentiment_block["sentiment_index"] if sentiment_block else None,
+                "sentiment_label": sentiment_block.get("label") if sentiment_block else None,
+                "sentiment_signal": sentiment_signal,
+                "message_count": sentiment_block.get("message_count") if sentiment_block else 0,
+                "regime": tech.regime if tech else None,
+                "rsi": technical_block.get("rsi") if technical_block else None,
+                "technical_score": technical_score,
+                "strategy": tech.strategy if tech else None,
+                "entry_status": entry_status,
+                "geo_score": geo_score,
+                "smart_money": smart_money_ctx,
+                "chart_signal": (chart_analysis or {}).get("chart_signal") if chart_analysis else None,
+                "key_insight": (claude_result or {}).get("key_insight") if claude_result else None,
+                "risk": (claude_result or {}).get("risk") if claude_result else None,
+                "narrative": narrative,
+            }
             pred_id = await db.add_prediction({
                 "ticker": ticker,
                 "horizon_hours": int(os.getenv("PREDICTION_HORIZON_HOURS", "24")),
@@ -300,6 +335,7 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
                 "confidence": confidence,
                 "direction": direction,
                 "price_at": tech.price if tech else None,
+                "context": context_snapshot,
             })
             result["prediction_id"] = pred_id
         except Exception as e:
@@ -336,8 +372,50 @@ async def evaluate_due_predictions() -> dict:
         await db.evaluate_prediction(p.id, realized_price, realized_return, correct)
         evaluated += 1
 
+    # Разбор ошибок по свежеоценённым (и любым неразобранным) прогнозам
+    analyzed = await generate_post_mortems()
+
     retrained = await retrain()
-    return {"evaluated": evaluated, "retrained": retrained}
+    return {"evaluated": evaluated, "post_mortems": analyzed, "retrained": retrained}
+
+
+async def generate_post_mortems(limit: int = 25) -> int:
+    """
+    Для оценённых, но ещё не разобранных прогнозов сформулировать причину
+    успеха/провала и урок, и сохранить их в БД. Возвращает число разборов.
+
+    Это замыкает цикл обучения: выводы копятся в журнале и через
+    build_lessons_context() попадают в промпт будущих прогнозов.
+    """
+    import json
+    pending = await db.get_predictions_for_post_mortem(limit=limit)
+    done = 0
+    for p in pending:
+        context = {}
+        raw = p.get("context_json")
+        if raw:
+            try:
+                context = json.loads(raw)
+            except Exception:
+                context = {}
+        try:
+            pm = await _claude.post_mortem(
+                ticker=p["ticker"],
+                direction=p.get("direction", "flat"),
+                confidence=p.get("confidence", 0.0),
+                context=context,
+                realized_return=p.get("realized_return"),
+                correct=p.get("correct"),
+                horizon_hours=p.get("horizon_hours", 24),
+            )
+            await db.set_post_mortem(
+                p["id"], pm.get("cause", ""), pm.get("lesson", ""), pm.get("tags", []))
+            done += 1
+        except Exception as e:
+            logger.warning(f"Не удалось разобрать прогноз id={p.get('id')}: {e}")
+    if done:
+        logger.info(f"🔎 Разобрано закрытых сигналов (post-mortem): {done}")
+    return done
 
 
 async def retrain() -> bool:
