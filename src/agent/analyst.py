@@ -136,6 +136,18 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         lessons_ctx    = lessons_ctx    if not isinstance(lessons_ctx, Exception)    else ""
         knowledge_ctx  = knowledge_ctx  if not isinstance(knowledge_ctx, Exception)  else ""
 
+        # Отдельный индекс настроения ПО СТАКАНУ (реальные деньги, без чатов) —
+        # подмешиваем в контекст знаний, чтобы Claude видел его самостоятельным сигналом.
+        try:
+            ob_idx = aggregator.get_orderbook_index(ticker)
+        except Exception:
+            ob_idx = None
+        if ob_idx:
+            ob_line = (f"📊 ИНДЕКС СТАКАНА (только реальные деньги, без чатов): "
+                       f"{ob_idx['orderbook_index']}/100 — {ob_idx['label']} "
+                       f"({ob_idx['snapshot_count']} снимков за час)")
+            knowledge_ctx = (ob_line + "\n" + knowledge_ctx) if knowledge_ctx else ob_line
+
         # Интрадей-контекст (VWAP, диапазон открытия, волатильность, вынос) —
         # именно он ведёт внутридневное решение; дневная техника выше остаётся
         # как контекст старшего таймфрейма.

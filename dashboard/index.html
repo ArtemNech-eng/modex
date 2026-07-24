@@ -216,6 +216,7 @@ header {
         <div class="index-mood" id="mMood">Нейтральный ➡️</div>
         <div class="index-meta" id="mMeta">0 сообщ · 0 тикеров</div>
         <div class="index-meta" id="geoFon" style="margin-top:6px;">🌍 Геофон: —</div>
+        <div class="index-meta" id="obFon" style="margin-top:2px;">📊 Стакан: —</div>
       </div>
 
       <!-- График -->
@@ -2164,9 +2165,14 @@ async function poll() {
   document.getElementById('statusTxt').textContent='REST';
   const go = async () => {
     try {
-      const [m, t] = await Promise.all([fetch(`${API}/api/market`), fetch(`${API}/api/tickers`)]);
+      const [m, t, ob] = await Promise.all([
+        fetch(`${API}/api/market`),
+        fetch(`${API}/api/tickers`),
+        fetch(`${API}/api/orderbook-index`),
+      ]);
       updateMarket(await m.json());
       updateTickers((await t.json()).tickers);
+      renderObIndex(await ob.json());
       document.getElementById('dot').style.background='#3fb950';
     } catch(e) { document.getElementById('dot').style.background='#f85149'; }
   };
@@ -2182,6 +2188,15 @@ async function loadGeo() {
     const tail = cnt ? ` · ${cnt} новостей/12ч` : ' · нет свежих новостей';
     if (el) el.innerHTML = `🌍 Геофон: <b style="color:${col}">${g.label}</b> (${g.score>0?'+':''}${g.score})<span style="color:var(--dim);font-size:11px;">${tail}</span>`;
   } catch(e) {}
+}
+
+function renderObIndex(d) {
+  const el = document.getElementById('obFon'); if (!el) return;
+  const m = d && d.market;
+  if (!m || !m.active_tickers) { el.innerHTML = '📊 Стакан: <span style="color:var(--dim)">нет данных</span>'; return; }
+  const v = m.orderbook_index;
+  const col = v>=55?'var(--green)':v<=45?'var(--red)':'var(--dim)';
+  el.innerHTML = `📊 Стакан: <b style="color:${col}">${v.toFixed(1)}</b>/100 <span style="color:var(--dim);font-size:11px;">· ${m.active_tickers} тик · 🟢${m.top_bullish?.[0]||'—'} 🔴${m.top_bearish?.[0]||'—'}</span>`;
 }
 
 // ── AI Агент ────────────────────────────────────────────────────────────────

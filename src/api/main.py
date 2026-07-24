@@ -190,6 +190,42 @@ async def get_all_tickers():
     }
 
 
+@app.get("/api/orderbook-index", summary="Индекс настроения по стакану (реальные деньги)")
+async def get_orderbook_index_all():
+    """
+    Отдельный индекс настроения ПО СТАКАНУ (только channel='orderbook' из Tinkoff),
+    НЕ смешанный с чатами/новостями: по всему рынку + разбивка по тикерам.
+    """
+    market = aggregator.get_market_orderbook_index()
+    tickers = list(aggregator.get_all_orderbook_indices().values())
+    tickers.sort(key=lambda x: x["orderbook_index"], reverse=True)
+    return {
+        "market": market,
+        "tickers": tickers,
+        "count": len(tickers),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/api/orderbook-index/{ticker}", summary="Индекс стакана по тикеру")
+async def get_orderbook_index_ticker(ticker: str):
+    """Индекс настроения по стакану для конкретного тикера (реальные деньги, без чатов)."""
+    ticker = ticker.upper()
+    if ticker not in MOEX_TICKERS:
+        raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
+    idx = aggregator.get_orderbook_index(ticker)
+    if not idx:
+        return {
+            "ticker": ticker,
+            "company_name": MOEX_TICKERS.get(ticker, ticker),
+            "orderbook_index": None,
+            "snapshot_count": 0,
+            "status": "insufficient_data",
+            "message": "Недостаточно снимков стакана (нужно накопить несколько за час)",
+        }
+    return idx
+
+
 @app.get("/api/ticker/{ticker}", summary="Индекс конкретного тикера")
 async def get_ticker_index(ticker: str):
     """Получить индекс настроения для тикера (например, SBER, GAZP)"""

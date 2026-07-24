@@ -26,6 +26,14 @@ logger = logging.getLogger(__name__)
 # Сообщение 15 минут назад весит в 2 раза меньше чем только что
 DECAY_HALF_LIFE_MINUTES = 15
 
+# Канал «настроения реальных денег» из стакана Tinkoff
+# (им помечаются точки в main.market_snapshot_pipeline). Отдельный индекс по
+# стакану считается ТОЛЬКО из этого канала — не смешиваясь с чатами/новостями.
+ORDERBOOK_CHANNEL = "orderbook"
+# Порог для индекса по стакану мягче основного MIN_MESSAGES_FOR_SIGNAL: стакан —
+# прямой сигнал реальных денег и обновляется регулярно, поэтому оживает быстрее.
+ORDERBOOK_MIN_POINTS = 3
+
 
 @dataclass
 class SentimentPoint:
@@ -412,6 +420,77 @@ class SentimentAggregator:
             if idx:
                 result[ticker] = idx
         return result
+
+    # ── Отдельный индекс настроения ПО СТАКАНУ (реальные деньги) ───────────────
+    # Считается ТОЛЬКО из точек channel="orderbook" (стакан Tinkoff) и НЕ
+    # смешивается с чатами/новостями/Пульсом. Основной индекс не меняется.
+
+    def _orderbook_points(self, ticker: str) -> list[SentimentPoint]:
+        now = datetime.now(timezone.utc)
+        cutoff = now - self.window
+        return [p for p in self._history[ticker]
+                if p.channel == ORDERBOOK_CHANNEL and p.timestamp >= cutoff]
+
+    def get_orderbook_index(self, ticker: str,
+                            min_points: int = ORDERBOOK_MIN_POINTS) -> Optional[dict]:
+        """
+        Индекс настроения по стакану для тикера (0-100), только из channel="orderbook".
+        Возвращает None, если снимков стакана в окне ещё мало.
+        """
+        from config.settings import MOEX_TICKERS
+        points = self._orderbook_points(ticker)
+        if len(points) < min_points:
+            return None
+        avg_signal, _ = self._weighted_signal(points)
+        index = (avg_signal + 1) / 2 * 100
+        if index >= 60:
+            label = "покупатели доминируют 🟢"
+        elif index <= 40:
+            label = "продавцы доминируют 🔴"
+        else:
+            label = "баланс ⚪"
+        return {
+            "ticker": ticker,
+            "company_name": MOEX_TICKERS.get(ticker, ticker),
+            "orderbook_index": round(index, 1),
+            "avg_signal": round(avg_signal, 3),
+            "snapshot_count": len(points),
+            "label": label,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def get_all_orderbook_indices(self) -> dict[str, dict]:
+        from config.settings import MOEX_TICKERS
+        out: dict[str, dict] = {}
+        for ticker in MOEX_TICKERS:
+            idx = self.get_orderbook_index(ticker)
+            if idx:
+                out[ticker] = idx
+        return out
+
+    def get_market_orderbook_index(self) -> dict:
+        """
+        Рыночный индекс по стакану (все тикеры со стаканом), взвешенный по числу
+        снимков. Это «настроение реальных денег» по всему МОЕХ — отдельно от чатов.
+        """
+        now = datetime.now(timezone.utc)
+        indices = list(self.get_all_orderbook_indices().values())
+        if not indices:
+            return {"orderbook_index": 50.0, "active_tickers": 0,
+                    "top_bullish": [], "top_bearish": [], "updated_at": now.isoformat()}
+        total_w = sum(v["snapshot_count"] for v in indices)
+        if total_w > 0:
+            market = sum(v["orderbook_index"] * v["snapshot_count"] for v in indices) / total_w
+        else:
+            market = statistics.mean(v["orderbook_index"] for v in indices)
+        ranked = sorted(indices, key=lambda x: x["orderbook_index"])
+        return {
+            "orderbook_index": round(market, 1),
+            "active_tickers": len(indices),
+            "top_bullish": [v["ticker"] for v in ranked[-3:][::-1]],
+            "top_bearish": [v["ticker"] for v in ranked[:3]],
+            "updated_at": now.isoformat(),
+        }
 
     def get_recent_points(self, ticker: str, limit: int = 20) -> list[dict]:
         points = self._get_window_points(ticker)
