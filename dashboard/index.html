@@ -378,6 +378,7 @@ header {
               <button onclick="setChartDays(90)"  id="btn90"  style="font-size:10px;padding:2px 7px;background:var(--surface2);border:1px solid var(--border);color:var(--dim);border-radius:4px;cursor:pointer;">3М</button>
               <button onclick="setChartDays(180)" id="btn180" style="font-size:10px;padding:2px 7px;background:var(--surface2);border:1px solid var(--border);color:var(--dim);border-radius:4px;cursor:pointer;">6М</button>
               <button onclick="setChartDays(365)" id="btn365" style="font-size:10px;padding:2px 7px;background:var(--blue);border:1px solid var(--blue);color:#fff;border-radius:4px;cursor:pointer;">1Г</button>
+              <button onclick="setChartIntraday()" id="btnIntraday" style="font-size:10px;padding:2px 7px;background:var(--surface2);border:1px solid var(--border);color:var(--dim);border-radius:4px;cursor:pointer;">Интрадей 5м</button>
             </span>
           </div>
           <!-- Основной свечной график -->
@@ -1383,7 +1384,7 @@ function regimeRu(r) { return r==='range'?'боковик':r==='uptrend'?'вос
 
 // ── Lightweight Charts (свечной график) ─────────────────────────────────────
 let lwMainChart = null, lwRsiChart = null, lwMacdChart = null;
-let lwCurrentTicker = null, lwCurrentDays = 365;
+let lwCurrentTicker = null, lwCurrentDays = 365, lwIntraday = false;
 
 const LW_OPTS = {
   layout: { background: { color: '#161b22' }, textColor: '#8b949e' },
@@ -1402,6 +1403,9 @@ function destroyCharts() {
 
 function setChartDays(days) {
   lwCurrentDays = days;
+  lwIntraday = false;
+  const bi = document.getElementById('btnIntraday');
+  if (bi) { bi.style.background = 'var(--surface2)'; bi.style.borderColor = 'var(--border)'; bi.style.color = 'var(--dim)'; }
   ['30','90','180','365'].forEach(d => {
     const b = document.getElementById('btn' + d);
     if (b) { b.style.background = d == days ? 'var(--blue)' : 'var(--surface2)';
@@ -1409,6 +1413,18 @@ function setChartDays(days) {
              b.style.color = d == days ? '#fff' : 'var(--dim)'; }
   });
   if (lwCurrentTicker) renderChart(lwCurrentTicker, null);
+}
+
+function setChartIntraday() {
+  lwIntraday = true;
+  ['30','90','180','365'].forEach(d => {
+    const b = document.getElementById('btn' + d);
+    if (b) { b.style.background = 'var(--surface2)'; b.style.borderColor = 'var(--border)'; b.style.color = 'var(--dim)'; }
+  });
+  const bi = document.getElementById('btnIntraday');
+  if (bi) { bi.style.background = 'var(--blue)'; bi.style.borderColor = 'var(--blue)'; bi.style.color = '#fff'; }
+  if (lwCurrentTicker) renderChart(lwCurrentTicker, null);
+}
 }
 
 function calcSMA(data, period) {
@@ -1476,21 +1492,24 @@ async function renderChart(ticker, tech) {
 
   let data;
   try {
-    data = await (await fetch(`${API}/api/technical/${ticker}/candles?days=${lwCurrentDays}`)).json();
+    const url = lwIntraday
+      ? `${API}/api/technical/${ticker}/intraday?tf_min=5`
+      : `${API}/api/technical/${ticker}/candles?days=${lwCurrentDays}`;
+    data = await (await fetch(url)).json();
   } catch(e) {
     document.getElementById('chartLegend').textContent = 'Ошибка загрузки данных';
     return;
   }
   if (!data.close || !data.close.length) {
-    document.getElementById('chartLegend').textContent = 'Нет данных MOEX';
+    document.getElementById('chartLegend').textContent = lwIntraday ? 'Нет интрадей-данных (биржа закрыта?)' : 'Нет данных MOEX';
     return;
   }
 
   destroyCharts();
 
-  // Строим массив OHLCV
+  // Строим массив OHLCV. Для интрадея время — UNIX-секунды, для дневок — YYYY-MM-DD.
   const ohlcv = data.dates.map((d, i) => ({
-    time:   d.slice(0, 10),
+    time:   lwIntraday ? Math.floor(new Date(d).getTime() / 1000) : String(d).slice(0, 10),
     open:   data.open[i],
     high:   data.high[i],
     low:    data.low[i],
@@ -1591,6 +1610,9 @@ async function renderChart(ticker, tech) {
   lwMainChart.timeScale().fitContent();
 
   document.getElementById('chartLegend').innerHTML =
+    (lwIntraday
+      ? `<span style="color:${data.delayed?'var(--red)':'var(--green)'}">● ${data.source||'?'} ${data.delayed?'(задержка ~15м)':'realtime'} · 5м</span> &nbsp; `
+      : '') +
     `<span style="color:#2196F3">─ SMA20</span> &nbsp;
      <span style="color:#FF9800">─ SMA50</span> &nbsp;
      <span style="color:#9C27B044">─ BB(20,2)</span> &nbsp;

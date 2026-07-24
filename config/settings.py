@@ -98,6 +98,11 @@ INTRADAY_TF_MIN = int(os.getenv("INTRADAY_TF_MIN", "5"))            # таймф
 INTRADAY_HORIZON_HOURS = int(os.getenv("INTRADAY_HORIZON_HOURS", "2"))  # горизонт прогноза, ч
 INTRADAY_OPENING_RANGE_BARS = int(os.getenv("INTRADAY_OPENING_RANGE_BARS", "6"))  # свечей в диапазоне открытия
 
+# ─── Триаж «словари+ML → Claude» (авто-скан) ──────────────────────────────────
+# Дешёвые слои постоянно скринят рынок; Claude подтверждает только интересное.
+SCAN_MIN_INTEREST = float(os.getenv("SCAN_MIN_INTEREST", "0.5"))   # порог «интересности» [0..1]
+SCAN_MAX_CLAUDE = int(os.getenv("SCAN_MAX_CLAUDE", "6"))            # макс. вызовов Claude за цикл
+
 # ─── Тикеры Мосбиржи (ТОП-50 IMOEX) ───────────────────────────────────────────
 MOEX_TICKERS = {
     "SBER": "Сбербанк",

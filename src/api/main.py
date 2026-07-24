@@ -407,9 +407,36 @@ async def get_candles(ticker: str, days: int = 120):
     return {"ticker": ticker, **data}
 
 
-@app.get("/api/geopolitics", summary="Геополитический фон рынка")
-async def get_geopolitics():
-    """Текущий геополитический фон (влияет на весь рынок РФ)."""
+@app.get("/api/technical/{ticker}/intraday", summary="Интрадей-свечи для графика")
+async def get_intraday_candles(ticker: str, tf_min: int = 5):
+    """
+    Внутридневные свечи (реалтайм Tinkoff при наличии токена, иначе MOEX ISS с
+    задержкой). Для интрадей-режима графика на карточке AI-агента.
+    """
+    ticker = ticker.upper()
+    from src.agent import intraday_analyst as ia
+    data = await ia.fetch_intraday(ticker, tf_min=tf_min)
+    if not data or not data.get("close"):
+        raise HTTPException(status_code=503, detail="Нет интрадей-данных (биржа закрыта или нет доступа)")
+    return {
+        "ticker": ticker, "tf_min": tf_min,
+        "delayed": bool(data.get("_delayed")), "source": data.get("_source"),
+        "dates": data.get("dates", []), "open": data.get("open", []),
+        "high": data.get("high", []), "low": data.get("low", []),
+        "close": data.get("close", []), "volume": data.get("volume", []),
+    }
+
+
+@app.get("/api/screen", summary="Триаж: что интересного прямо сейчас (без Claude)")
+async def get_screen(limit: int = 25):
+    """
+    Дешёвый скрин рынка (словари + индикаторы + интрадей) без Claude —
+    ранжированный список «интересности». Показывает, что фоновый движок
+    отправит на подтверждение Claude.
+    """
+    from src.agent import screen as screener
+    ranked = await screener.screen_all(aggregator)
+    return {"screened": len(ranked), "results": ranked[:limit]}
     return geo.MONITOR.snapshot()
 
 
@@ -916,10 +943,15 @@ def _now_iso() -> str:
 
 
 async def _live_scan_once() -> dict:
-    """Один цикл: сгенерировать+зафиксировать сигналы и оценить созревшие прогнозы."""
-    saved = await scanner.scan_all(aggregator, tickers=_live_status["tickers"], save=True)
+    """Один цикл: триаж (словари+ML) → Claude подтверждает интересное → журнал."""
+    from config.settings import SCAN_MIN_INTEREST, SCAN_MAX_CLAUDE
+    triage = await scanner.scan_interesting(
+        aggregator, tickers=_live_status["tickers"], save=True,
+        min_interest=SCAN_MIN_INTEREST, max_claude=SCAN_MAX_CLAUDE)
+    saved = triage.get("claude_confirmed", 0)
     _live_status["last_scan"] = _now_iso()
-    _live_status["scanned"] = len(scanner.CACHE.results)
+    _live_status["scanned"] = triage.get("screened", 0)
+    _live_status["interesting"] = triage.get("interesting", [])
     _live_status["saved"] = saved
     ev = await analyst.evaluate_due_predictions()
     _live_status["last_eval"] = _now_iso()

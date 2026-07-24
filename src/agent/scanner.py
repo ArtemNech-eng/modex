@@ -123,3 +123,42 @@ async def scan_all(aggregator, tickers: Optional[list[str]] = None, save: bool =
         await asyncio.sleep(0.3)  # бережём MOEX ISS
     logger.info(f"🔎 Скан завершён: обновлено {updated}/{len(targets)} тикеров")
     return updated
+
+
+async def scan_interesting(aggregator, tickers=None, save: bool = True,
+                           min_interest: float = 0.5, max_claude: int = 6) -> dict:
+    """
+    Триаж «словари+ML → Claude»: дёшево скринит рынок и зовёт Claude ТОЛЬКО на
+    интересном. Так работает всегда в фоне (а не по кнопке) и не жжёт токены.
+
+    1) screen.screen_all — интерес по каждому тикеру без Claude;
+    2) для тех, у кого interest >= min_interest (не более max_claude), —
+       полный analyst.analyze (с Claude), результат в кеш сигналов + журнал.
+    """
+    from src.agent import analyst, screen
+
+    screened = await screen.screen_all(aggregator, tickers=tickers)
+    interesting = [s for s in screened if s["interest"] >= min_interest][:max_claude]
+
+    confirmed = 0
+    for s in interesting:
+        try:
+            a = await analyst.analyze(s["ticker"], aggregator, save=save)  # ← Claude подтверждает
+            CACHE.update(s["ticker"], a)
+            confirmed += 1
+        except Exception as e:
+            logger.debug(f"claude confirm {s['ticker']}: {e}")
+
+    logger.info(
+        f"🔎 Триаж: просканировано {len(screened)}, интересных "
+        f"{len([s for s in screened if s['interest'] >= min_interest])}, "
+        f"подтверждено Claude {confirmed}"
+    )
+    return {
+        "screened": len(screened),
+        "interesting": [{"ticker": s["ticker"], "interest": s["interest"],
+                         "direction": s["direction"], "reasons": s["reasons"]}
+                        for s in screened if s["interest"] >= min_interest],
+        "claude_confirmed": confirmed,
+        "top": screened[:10],
+    }
