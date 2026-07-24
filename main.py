@@ -17,7 +17,7 @@ import logging
 import signal
 import sys
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # Чтобы импорты работали из корня проекта
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -355,6 +355,21 @@ async def market_snapshot_pipeline():
                         first_err = first_err or str(e)[:160]
                         tr = None
                     if tr:
+                        # Кумулятивный footprint за сессию: копим НОВЫЕ сделки с
+                        # дедупом по watermark. Сырьё (raw) — транзитное, в событие
+                        # НЕ пишем (иначе раздует базу).
+                        raw = tr.pop("raw", None)
+                        if raw:
+                            try:
+                                from src.collector.tinkoff_client import _footprint_increment
+                                day = (ts + timedelta(hours=3)).strftime("%Y-%m-%d")  # МСК-дата сессии
+                                prev = await db.get_session_footprint(t, day)
+                                inc = _footprint_increment(raw, (prev or {}).get("watermark"))
+                                if inc["new"]:
+                                    await db.merge_session_footprint(
+                                        day, t, inc["buckets"], inc["watermark"])
+                            except Exception as e:
+                                logger.debug(f"session footprint {t}: {e}")
                         await db.add_event({"source": "tinkoff", "kind": "trades",
                                             "ticker": t, "payload": tr, "ts": ts})
                         written["trades"] += 1
@@ -411,6 +426,7 @@ async def market_snapshot_pipeline():
             # Ретеншн: раз в ~50 циклов чистим старше 14 дней
             if cycle % 50 == 1:
                 await db.prune_events(keep_days=14)
+                await db.prune_session_footprint(keep_days=3)
         except Exception as e:
             logger.debug(f"market snapshot: {e}")
         await asyncio.sleep(90)

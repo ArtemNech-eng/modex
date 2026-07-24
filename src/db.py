@@ -226,6 +226,23 @@ class MarketEvent(Base):
         }
 
 
+class SessionFootprint(Base):
+    """
+    Кумулятивный footprint за торговый день: объём по РЕАЛЬНОЙ цене сделок со
+    сплитом buy/sell, накопленный дедупом по watermark. Одна строка на тикер/день —
+    компактно (сырые сделки не храним). Ключ: "YYYY-MM-DD:TICKER".
+    """
+    __tablename__ = "session_footprint"
+
+    key: Mapped[str] = mapped_column(String(48), primary_key=True)
+    date: Mapped[str] = mapped_column(String(10), index=True)
+    ticker: Mapped[str] = mapped_column(String(32), index=True)
+    buckets: Mapped[str] = mapped_column(Text, default="{}")  # JSON {price: [buy, sell, total]}
+    watermark: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)  # ISO ts последней сделки
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 def _ensure_sqlite_dir():
     """Для SQLite создаём директорию под файл БД (иначе connect упадёт)."""
     if "sqlite" in DATABASE_URL:
@@ -845,5 +862,61 @@ async def prune_events(keep_days: int = 14) -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
     async with async_session() as session:
         result = await session.execute(delete(MarketEvent).where(MarketEvent.ts < cutoff))
+        await session.commit()
+        return result.rowcount or 0
+
+
+# ─── Кумулятивный footprint за сессию (объём по цене из реальных сделок) ───────
+
+async def get_session_footprint(ticker: str, date: str) -> Optional[dict]:
+    """Вернуть {'buckets': {price: [buy, sell, total]}, 'watermark': str} или None."""
+    async with async_session() as session:
+        row = await session.get(SessionFootprint, f"{date}:{ticker.upper()}")
+        if not row:
+            return None
+        try:
+            buckets = json.loads(row.buckets or "{}")
+        except Exception:
+            buckets = {}
+        return {"buckets": buckets, "watermark": row.watermark}
+
+
+async def merge_session_footprint(date: str, ticker: str,
+                                  inc_buckets: dict, watermark: Optional[str]) -> None:
+    """
+    Влить инкремент (price -> [buy, sell, total]) в дневной footprint и сдвинуть
+    watermark. Пишем «мягко»: ошибки не должны ронять пайплайн сбора.
+    """
+    if not inc_buckets and watermark is None:
+        return
+    key = f"{date}:{ticker.upper()}"
+    try:
+        async with async_session() as session:
+            row = await session.get(SessionFootprint, key)
+            if row is None:
+                row = SessionFootprint(key=key, date=date, ticker=ticker.upper(), buckets="{}")
+                session.add(row)
+            try:
+                cur = json.loads(row.buckets or "{}")
+            except Exception:
+                cur = {}
+            for price, cell in inc_buckets.items():
+                c = cur.get(price) or [0, 0, 0]
+                cur[price] = [c[0] + cell[0], c[1] + cell[1], c[2] + cell[2]]
+            row.buckets = json.dumps(cur)
+            if watermark:
+                row.watermark = watermark
+            row.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+    except Exception as e:
+        logger.debug(f"merge_session_footprint failed: {e}")
+
+
+async def prune_session_footprint(keep_days: int = 3) -> int:
+    """Удалить дневные footprint старше keep_days (по строковой дате)."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+    async with async_session() as session:
+        result = await session.execute(
+            delete(SessionFootprint).where(SessionFootprint.date < cutoff))
         await session.commit()
         return result.rowcount or 0

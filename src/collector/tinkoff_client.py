@@ -278,7 +278,9 @@ class TinkoffClient:
         trades = sorted(data["trades"], key=lambda t: t.get("time", ""))[-limit:]
         if not trades:
             return None
-        return _classify_flow(trades)
+        result = _classify_flow(trades)
+        result["raw"] = trades   # транзитно для накопления footprint (в событии НЕ храним)
+        return result
 
     async def get_full_snapshot(self, ticker: str) -> dict:
         """
@@ -478,3 +480,43 @@ def _classify_flow(trades: list[dict]) -> dict:
         "direction_counts":  dir_counts,    # сырое распределение поля direction
         "footprint":         footprint,     # топ цен по впитанному объёму + buy%
     }
+
+
+def _footprint_increment(trades: list[dict], since_ts: Optional[str]) -> dict:
+    """
+    Дедуп для КУМУЛЯТИВНОГО footprint: из сырых сделок берём только НОВЫЕ
+    (time > since_ts) и бакетим по РЕАЛЬНОЙ цене (buy/sell/total). Пересекающиеся
+    опросы (одни и те же последние 50 сделок) не задваиваются — фильтр по времени.
+    Возвращает {buckets: {price_str: [buy, sell, total]}, watermark: max_ts, new: n}.
+    """
+    def _q(t) -> int:
+        try:
+            return int(t.get("quantity", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _price(p) -> float:
+        p = p or {}
+        return float(p.get("units", 0) or 0) + float(p.get("nano", 0) or 0) / 1e9
+
+    buckets: dict[str, list] = {}
+    new_n = 0
+    for t in trades:
+        ts = t.get("time")
+        if not ts or (since_ts is not None and ts <= since_ts):
+            continue
+        q = _q(t)
+        if q <= 0:
+            continue
+        new_n += 1
+        price = str(round(_price(t.get("price")), 6))
+        cell = buckets.setdefault(price, [0, 0, 0])
+        cell[2] += q
+        d = t.get("direction")
+        if d == "TRADE_DIRECTION_BUY":
+            cell[0] += q
+        elif d == "TRADE_DIRECTION_SELL":
+            cell[1] += q
+    all_ts = [t.get("time") for t in trades if t.get("time")]
+    watermark = max(all_ts) if all_ts else since_ts
+    return {"buckets": buckets, "watermark": watermark, "new": new_n}

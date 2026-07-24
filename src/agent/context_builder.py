@@ -574,6 +574,29 @@ async def build_orderbook_context(ticker: str, snapshots: int = 6) -> str:
     return _format_orderbook_read(ticker, obs, trs)
 
 
+def _format_session_footprint(buckets: dict) -> str:
+    """
+    Строка кумулятивного footprint за день: POC (цена с макс. объёмом за сессию) +
+    топ ценовых уровней по объёму со сплитом buy/sell. Чистая функция — тестируется.
+    """
+    rows = []
+    for price, cell in (buckets or {}).items():
+        try:
+            b, s, tot = float(cell[0]), float(cell[1]), float(cell[2])
+        except Exception:
+            continue
+        if tot <= 0:
+            continue
+        cl = b + s
+        rows.append((float(price), tot, round(b / cl * 100, 1) if cl else 50.0))
+    if not rows:
+        return ""
+    rows.sort(key=lambda r: r[1], reverse=True)
+    poc = rows[0]
+    top = " · ".join(f"{p} ({int(v)} лот, {bp}% buy)" for p, v, bp in rows[:4])
+    return f"За день (footprint по сделкам): POC {poc[0]} · {top}"
+
+
 async def build_levels_context(ticker: str) -> str:
     """
     Интрадей-уровни для Claude: профиль объёма (POC / зона стоимости / узлы),
@@ -621,6 +644,19 @@ async def build_levels_context(ticker: str) -> str:
             if gap is not None:
                 lines.append(f"  Открытие {round(today_open, 4)} · гэп {gap:+.2f}%")
             have = True
+    except Exception:
+        pass
+
+    # Кумулятивный footprint за сессию (объём по цене из реальных сделок за день)
+    try:
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        day = (_dt.now(_tz.utc) + _td(hours=3)).strftime("%Y-%m-%d")
+        sf = await db.get_session_footprint(ticker, day)
+        if sf and sf.get("buckets"):
+            txt = _format_session_footprint(sf["buckets"])
+            if txt:
+                lines.append("  " + txt)
+                have = True
     except Exception:
         pass
 
