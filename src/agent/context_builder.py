@@ -451,6 +451,100 @@ async def build_knowledge_context(ticker: str) -> str:
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
+def _format_orderbook_read(ticker: str, obs: list[dict], trs: list[dict]) -> str:
+    """
+    Чистый форматтер интрадей-среза по стакану/потоку (без сети/БД — легко тестить).
+    obs/trs — события market_events (payload внутри), от НОВЫХ к старым.
+    Синтезирует: давление стакана + тренд bid/ask за снимки, стены (уровни),
+    спред/ликвидность, поток (отдельно, с оговоркой), флаг абсорбции, вес-гайд.
+    """
+    if not obs:
+        return ""
+
+    def _pl(ev: dict) -> dict:
+        return ev.get("payload") or {}
+
+    latest = _pl(obs[0])
+    ratio = latest.get("bid_ask_ratio")
+    pressure = latest.get("pressure") or "—"
+    spread = latest.get("spread_pct")
+
+    lines = [f"📊 СТАКАН И ПОТОК — {ticker} (реальные деньги, интрадей):"]
+
+    # Давление стакана + тренд bid/ask за снимки (obs новые→старые → разворот в хроно)
+    ratios = [_pl(o).get("bid_ask_ratio") for o in reversed(obs)
+              if _pl(o).get("bid_ask_ratio") is not None]
+    trend_txt = ""
+    if len(ratios) >= 3:
+        first, last = ratios[0], ratios[-1]
+        if first and last > first * 1.15:
+            trend_txt = " · тренд: покупатели усиливаются ↑"
+        elif first and last < first * 0.87:
+            trend_txt = " · тренд: продавцы усиливаются ↓"
+        else:
+            trend_txt = " · тренд: без изменений →"
+    if ratio is not None:
+        spread_txt = f", спред {spread}%" if spread is not None else ""
+        lines.append(f"  Стакан: {pressure} (bid/ask {ratio}{spread_txt}){trend_txt}")
+
+    # Стены — крупнейшие уровни в топе стакана (интрадей поддержка/сопротивление)
+    top_bids = latest.get("top_bids") or []
+    top_asks = latest.get("top_asks") or []
+    if top_bids:
+        bb = max(top_bids, key=lambda x: x.get("qty", 0))
+        lines.append(f"    ├ поддержка: {bb.get('qty')} лотов @ {bb.get('price')}")
+    if top_asks:
+        ba = max(top_asks, key=lambda x: x.get("qty", 0))
+        lines.append(f"    └ сопротивление: {ba.get('qty')} лотов @ {ba.get('price')}")
+
+    # Поток сделок — ОТДЕЛЬНО от стакана, с оговоркой о надёжности
+    flow = _pl(trs[0]) if trs else {}
+    buy_pct = flow.get("buy_pct")
+    total_trades = flow.get("total_trades")
+    if buy_pct is not None:
+        note = ""
+        if not total_trades or total_trades < 10:
+            note = " ⚠️ мало сделок — поток ненадёжен"
+        elif buy_pct >= 95 or buy_pct <= 5:
+            note = " ⚠️ экстремум на ретейл-фиде — доверять осторожно"
+        lines.append(f"  Поток сделок: {flow.get('order_flow', '—')} (buy {buy_pct}%){note}")
+
+    # Абсорбция — расхождение стакан↔поток (сильный интрадей-сигнал)
+    if ratio is not None and buy_pct is not None:
+        if ratio < 0.7 and buy_pct >= 60:
+            lines.append("  🔀 Абсорбция: агрессивные покупки бьют в стену продавца — "
+                         "пробьют → импульс вверх, не пробьют → разворот вниз.")
+        elif ratio > 1.4 and buy_pct <= 40:
+            lines.append("  🔀 Абсорбция: агрессивные продажи в стену покупателя — "
+                         "продавят → импульс вниз, удержат → отскок.")
+
+    # Ликвидность — предупреждение о тонком стакане (риск проскальзывания)
+    if spread is not None and spread >= 0.2:
+        lines.append(f"  ⚠️ Тонкий стакан (спред {spread}%) — риск проскальзывания, R/R осторожно.")
+
+    lines.append("  Как использовать: подтверждающий сигнал, НЕ триггер. Соло — вес низкий; "
+                 "выше — при совпадении с VWAP/ORB. Геополитика поверх — риск-гейт.")
+
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+async def build_orderbook_context(ticker: str, snapshots: int = 6) -> str:
+    """
+    Интрадей-контекст по стакану и потоку для Claude — синтез из ИСТОРИИ снимков
+    в базе знаний (market_events, source="tinkoff"), а не одного среза: с трендом
+    давления, стенами-уровнями, ликвидностью, потоком (отдельно) и флагом абсорбции.
+    """
+    ticker = ticker.upper()
+    try:
+        obs = await db.recent_events(ticker=ticker, source="tinkoff",
+                                     kind="orderbook", since_minutes=60, limit=snapshots)
+        trs = await db.recent_events(ticker=ticker, source="tinkoff",
+                                     kind="trades", since_minutes=60, limit=3)
+    except Exception:
+        return ""
+    return _format_orderbook_read(ticker, obs, trs)
+
+
 async def build_lessons_context(ticker: str) -> str:
     """
     Уроки из разобранных ошибок (post-mortem): что уже приводило к провалам

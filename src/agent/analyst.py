@@ -25,7 +25,7 @@ from src.agent.claude_agent import ClaudeAgent
 from src.agent.context_builder import (
     build_ticker_context, build_price_context,
     build_memory_context, build_news_context, build_multiframe_context,
-    build_lessons_context, build_knowledge_context,
+    build_lessons_context, build_knowledge_context, build_orderbook_context,
 )
 from src.agent.chart_generator import generate_chart_b64
 from src.collector.tinkoff_client import TinkoffClient
@@ -136,17 +136,25 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         lessons_ctx    = lessons_ctx    if not isinstance(lessons_ctx, Exception)    else ""
         knowledge_ctx  = knowledge_ctx  if not isinstance(knowledge_ctx, Exception)  else ""
 
-        # Отдельный индекс настроения ПО СТАКАНУ (реальные деньги, без чатов) —
-        # подмешиваем в контекст знаний, чтобы Claude видел его самостоятельным сигналом.
+        # Стакан для Claude как отдельный сигнал: индекс (bid/ask, без потока) +
+        # синтез-контекст с трендом/стенами/абсорбцией/ликвидностью из истории БЗ.
+        try:
+            ob_ctx = await build_orderbook_context(ticker)
+        except Exception:
+            ob_ctx = ""
         try:
             ob_idx = aggregator.get_orderbook_index(ticker)
         except Exception:
             ob_idx = None
+        head = []
         if ob_idx:
-            ob_line = (f"📊 ИНДЕКС СТАКАНА (только реальные деньги, без чатов): "
-                       f"{ob_idx['orderbook_index']}/100 — {ob_idx['label']} "
-                       f"({ob_idx['snapshot_count']} снимков за час)")
-            knowledge_ctx = (ob_line + "\n" + knowledge_ctx) if knowledge_ctx else ob_line
+            head.append(f"📊 ИНДЕКС СТАКАНА (bid/ask, без потока): "
+                        f"{ob_idx['orderbook_index']}/100 — {ob_idx['label']} "
+                        f"({ob_idx['snapshot_count']} снимков за час)")
+        if ob_ctx:
+            head.append(ob_ctx)
+        if head:
+            knowledge_ctx = "\n".join(head + ([knowledge_ctx] if knowledge_ctx else []))
 
         # Интрадей-контекст (VWAP, диапазон открытия, волатильность, вынос) —
         # именно он ведёт внутридневное решение; дневная техника выше остаётся
