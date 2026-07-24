@@ -487,15 +487,25 @@ def _format_orderbook_read(ticker: str, obs: list[dict], trs: list[dict]) -> str
         spread_txt = f", спред {spread}%" if spread is not None else ""
         lines.append(f"  Стакан: {pressure} (bid/ask {ratio}{spread_txt}){trend_txt}")
 
-    # Стены — крупнейшие уровни в топе стакана (интрадей поддержка/сопротивление)
-    top_bids = latest.get("top_bids") or []
-    top_asks = latest.get("top_asks") or []
-    if top_bids:
-        bb = max(top_bids, key=lambda x: x.get("qty", 0))
-        lines.append(f"    ├ поддержка: {bb.get('qty')} лотов @ {bb.get('price')}")
-    if top_asks:
-        ba = max(top_asks, key=lambda x: x.get("qty", 0))
-        lines.append(f"    └ сопротивление: {ba.get('qty')} лотов @ {ba.get('price')}")
+    # Стены из карты стакана (до 20 уровней): крупнейшие лимитки = уровни
+    # поддержки/сопротивления, с дистанцией от середины спреда.
+    best_bid = latest.get("best_bid")
+    best_ask = latest.get("best_ask")
+    mid = ((best_bid + best_ask) / 2) if (best_bid and best_ask) else None
+
+    def _dist(p):
+        return f" ({(p / mid - 1) * 100:+.2f}%)" if (mid and p) else ""
+
+    ask_walls = latest.get("ask_walls") or (
+        [max(latest.get("top_asks") or [], key=lambda x: x.get("qty", 0))]
+        if latest.get("top_asks") else [])
+    bid_walls = latest.get("bid_walls") or (
+        [max(latest.get("top_bids") or [], key=lambda x: x.get("qty", 0))]
+        if latest.get("top_bids") else [])
+    for w in ask_walls[:2]:
+        lines.append(f"    ↑ сопротивление: {w.get('qty')} лотов @ {w.get('price')}{_dist(w.get('price'))}")
+    for w in bid_walls[:2]:
+        lines.append(f"    ↓ поддержка: {w.get('qty')} лотов @ {w.get('price')}{_dist(w.get('price'))}")
 
     # Поток сделок — ОТДЕЛЬНО от стакана, с оговоркой о надёжности
     flow = _pl(trs[0]) if trs else {}
@@ -543,6 +553,59 @@ async def build_orderbook_context(ticker: str, snapshots: int = 6) -> str:
     except Exception:
         return ""
     return _format_orderbook_read(ticker, obs, trs)
+
+
+async def build_levels_context(ticker: str) -> str:
+    """
+    Интрадей-уровни для Claude: профиль объёма (POC / зона стоимости / узлы),
+    сессионный VWAP + полосы, вчерашние уровни (закрытие/хай/лой) и гэп открытия.
+    Источники: интрадей-свечи Tinkoff (при наличии токена) + дневные свечи MOEX.
+    Настоящие торговые ориентиры «где цена притягивается / отбивается».
+    """
+    ticker = ticker.upper()
+    from src.analysis import intraday as iv
+    lines = [f"📐 УРОВНИ {ticker} (интрадей):"]
+    have = False
+
+    # Профиль объёма + VWAP-полосы из интрадей-свечей (5-мин текущей сессии)
+    try:
+        from src.collector.tinkoff_client import TinkoffClient
+        intr = await TinkoffClient().get_intraday_candles(ticker, tf_min=5, hours=9)
+    except Exception:
+        intr = None
+    if intr and intr.get("close"):
+        H = intr.get("high", []); L = intr.get("low", [])
+        C = intr.get("close", []); V = intr.get("volume", [])
+        vp = iv.volume_profile(H, L, C, V)
+        if vp:
+            lines.append(f"  Профиль объёма: POC {vp['poc']} (магнит) · "
+                         f"зона стоимости {vp['val']}–{vp['vah']} · "
+                         f"узлы {', '.join(str(x) for x in vp['nodes'])}")
+            have = True
+        vb = iv.vwap_bands(H, L, C, V)
+        if vb:
+            lines.append(f"  VWAP {vb['vwap']} · полосы {vb['lower']}–{vb['upper']} "
+                         f"(выше = дорого, ниже = дёшево)")
+            have = True
+
+    # Вчерашние уровни + гэп открытия из дневных свечей
+    try:
+        daily = await ta.fetch_candles(ticker, days=6)
+        c = daily.get("close", []); h = daily.get("high", [])
+        lo = daily.get("low", []); op = daily.get("open", [])
+        if len(c) >= 2 and c[-2]:
+            prev_close, prev_high, prev_low = c[-2], h[-2], lo[-2]
+            today_open = op[-1] if op else None
+            gap = ((today_open / prev_close - 1) * 100) if today_open else None
+            lines.append(f"  Вчера: закрытие {round(prev_close, 4)} · "
+                         f"хай {round(prev_high, 4)} · лой {round(prev_low, 4)}")
+            if gap is not None:
+                lines.append(f"  Открытие {round(today_open, 4)} · гэп {gap:+.2f}%")
+            have = True
+    except Exception:
+        pass
+
+    return "\n".join(lines) if have else ""
 
 
 async def build_lessons_context(ticker: str) -> str:

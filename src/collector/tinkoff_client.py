@@ -235,6 +235,11 @@ class TinkoffClient:
         else:
             pressure = "баланс ⚪"
 
+        # Карта стакана из ПОЛНЫХ уровней (до 20): крупнейшие стены-лимитки —
+        # реальные уровни поддержки/сопротивления, а не только верх стакана.
+        bid_walls = sorted(bids, key=lambda x: x["qty"], reverse=True)[:3]
+        ask_walls = sorted(asks, key=lambda x: x["qty"], reverse=True)[:3]
+
         return {
             "best_bid":      bids[0]["price"] if bids else None,
             "best_ask":      asks[0]["price"] if asks else None,
@@ -245,6 +250,9 @@ class TinkoffClient:
             "total_ask_qty": total_ask_qty,
             "top_bids":      bids[:5],
             "top_asks":      asks[:5],
+            "bid_walls":     bid_walls,
+            "ask_walls":     ask_walls,
+            "levels":        len(bids) + len(asks),
         }
 
     async def get_last_trades(self, ticker: str, limit: int = 50) -> Optional[dict]:

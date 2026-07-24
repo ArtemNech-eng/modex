@@ -315,3 +315,93 @@ def orderbook_sentiment(bid_ask_ratio: Optional[float],
     signal = max(-1.0, min(1.0, sum(parts) / len(parts)))
     label = "positive" if signal > 0.15 else "negative" if signal < -0.15 else "neutral"
     return {"signal": round(signal, 3), "label": label, "score": round(abs(signal), 3)}
+
+
+# ─── Профиль объёма и VWAP-полосы (интрадей-уровни) ───────────────────────────
+
+def volume_profile(highs: list[float], lows: list[float], closes: list[float],
+                   volumes: list[float], bins: int = 24) -> Optional[dict]:
+    """
+    Профиль объёма (объём по ценам) по свечам сессии. Объём каждой свечи
+    распределяется по ценовым корзинам её диапазона [low, high]. Возвращает:
+      poc     — цена корзины с макс. объёмом (Point of Control, «магнит»);
+      val/vah — границы зоны стоимости (~70% объёма вокруг POC);
+      nodes   — топ высокообъёмных ценовых узлов (уровни притяжения/отбоя).
+    Это настоящие торговые уровни: где реально наторговали больше всего.
+    """
+    n = min(len(highs), len(lows), len(closes), len(volumes))
+    if n < 5:
+        return None
+    lo = min(lows[:n])
+    hi = max(highs[:n])
+    if hi <= lo or bins < 2:
+        return None
+    width = (hi - lo) / bins
+    buckets = [0.0] * bins
+
+    def _idx(price: float) -> int:
+        return min(max(int((price - lo) / width), 0), bins - 1)
+
+    for i in range(n):
+        v = volumes[i] or 0
+        if v <= 0:
+            continue
+        b_lo, b_hi = _idx(lows[i]), _idx(highs[i])
+        share = v / (b_hi - b_lo + 1)
+        for b in range(b_lo, b_hi + 1):
+            buckets[b] += share
+
+    total = sum(buckets)
+    if total <= 0:
+        return None
+
+    def _price(b: int) -> float:
+        return round(lo + (b + 0.5) * width, 4)
+
+    poc_b = max(range(bins), key=lambda b: buckets[b])
+    # Зона стоимости: расширяемся от POC в сторону большего объёма, пока не 70%
+    covered = buckets[poc_b]
+    left, right = poc_b - 1, poc_b + 1
+    lo_b = hi_b = poc_b
+    while covered < 0.7 * total and (left >= 0 or right < bins):
+        tl = buckets[left] if left >= 0 else -1.0
+        tr = buckets[right] if right < bins else -1.0
+        if tr >= tl:
+            covered += max(tr, 0.0); hi_b = right; right += 1
+        else:
+            covered += max(tl, 0.0); lo_b = left; left -= 1
+
+    order = sorted(range(bins), key=lambda b: buckets[b], reverse=True)
+    return {
+        "poc": _price(poc_b),
+        "val": _price(lo_b),
+        "vah": _price(hi_b),
+        "nodes": [_price(b) for b in order[:3]],
+    }
+
+
+def vwap_bands(highs: list[float], lows: list[float], closes: list[float],
+               volumes: list[float], k: float = 1.0) -> Optional[dict]:
+    """
+    Сессионный VWAP + полосы ±k·σ (σ — объёмно-взвешенное стандартное отклонение
+    типичной цены от VWAP). Ориентир «дорого/дёшево» относительно средневзвешенной.
+    """
+    import math
+    n = min(len(highs), len(lows), len(closes), len(volumes))
+    if n < 5:
+        return None
+    tp = [(highs[i] + lows[i] + closes[i]) / 3 for i in range(n)]
+    vsum = sum((volumes[i] or 0) for i in range(n))
+    if vsum > 0:
+        v = sum(tp[i] * (volumes[i] or 0) for i in range(n)) / vsum
+        var = sum((volumes[i] or 0) * (tp[i] - v) ** 2 for i in range(n)) / vsum
+    else:
+        v = sum(tp) / n
+        var = sum((x - v) ** 2 for x in tp) / n
+    sigma = math.sqrt(var) if var > 0 else 0.0
+    return {
+        "vwap": round(v, 4),
+        "upper": round(v + k * sigma, 4),
+        "lower": round(v - k * sigma, 4),
+        "sigma": round(sigma, 4),
+    }

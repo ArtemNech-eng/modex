@@ -26,6 +26,7 @@ from src.agent.context_builder import (
     build_ticker_context, build_price_context,
     build_memory_context, build_news_context, build_multiframe_context,
     build_lessons_context, build_knowledge_context, build_orderbook_context,
+    build_levels_context,
 )
 from src.agent.chart_generator import generate_chart_b64
 from src.collector.tinkoff_client import TinkoffClient
@@ -120,13 +121,14 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
 
         # Параллельно: макро + фундаментал + память + мультитаймфрейм + уроки
         import asyncio
-        macro_ctx, fund_ctx, memory_ctx, multiframe_ctx, lessons_ctx, knowledge_ctx = await asyncio.gather(
+        macro_ctx, fund_ctx, memory_ctx, multiframe_ctx, lessons_ctx, knowledge_ctx, levels_ctx = await asyncio.gather(
             get_macro_context(),
             get_fundamentals(ticker),
             build_memory_context(ticker),
             build_multiframe_context(ticker),
             build_lessons_context(ticker),
             build_knowledge_context(ticker),
+            build_levels_context(ticker),
             return_exceptions=True,
         )
         macro_ctx      = macro_ctx      if not isinstance(macro_ctx, Exception)      else {}
@@ -135,6 +137,7 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         multiframe_ctx = multiframe_ctx if not isinstance(multiframe_ctx, Exception) else ""
         lessons_ctx    = lessons_ctx    if not isinstance(lessons_ctx, Exception)    else ""
         knowledge_ctx  = knowledge_ctx  if not isinstance(knowledge_ctx, Exception)  else ""
+        levels_ctx     = levels_ctx     if not isinstance(levels_ctx, Exception)     else ""
 
         # Стакан для Claude как отдельный сигнал: индекс (bid/ask, без потока) +
         # синтез-контекст с трендом/стенами/абсорбцией/ликвидностью из истории БЗ.
@@ -153,6 +156,8 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
                         f"({ob_idx['snapshot_count']} снимков за час)")
         if ob_ctx:
             head.append(ob_ctx)
+        if levels_ctx:
+            head.append(levels_ctx)
         if head:
             knowledge_ctx = "\n".join(head + ([knowledge_ctx] if knowledge_ctx else []))
 
