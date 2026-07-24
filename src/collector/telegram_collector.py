@@ -14,10 +14,39 @@ from telethon.tl.types import Channel, Chat, Message
 
 from config.settings import (
     TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE,
-    TELEGRAM_SESSION, TELEGRAM_STRING_SESSION, TELEGRAM_CHANNELS
+    TELEGRAM_SESSION, TELEGRAM_STRING_SESSION, TELEGRAM_CHANNELS,
+    TELEGRAM_PROXY, TELEGRAM_CONNECTION_RETRIES,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _build_proxy():
+    """
+    Разобрать TELEGRAM_PROXY (socks5://[user:pass@]host:port) в формат Telethon.
+    Возвращает кортеж для PySocks или None. При отсутствии PySocks — предупреждение.
+    """
+    if not TELEGRAM_PROXY:
+        return None
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(TELEGRAM_PROXY)
+        import socks  # PySocks
+        scheme = (u.scheme or "socks5").lower()
+        ptype = {"socks5": socks.SOCKS5, "socks4": socks.SOCKS4,
+                 "http": socks.HTTP}.get(scheme, socks.SOCKS5)
+        if not u.hostname or not u.port:
+            logger.warning(f"TELEGRAM_PROXY задан некорректно: {TELEGRAM_PROXY!r}")
+            return None
+        if u.username and u.password:
+            return (ptype, u.hostname, u.port, True, u.username, u.password)
+        return (ptype, u.hostname, u.port)
+    except ImportError:
+        logger.warning("TELEGRAM_PROXY задан, но не установлен PySocks (pip install PySocks) — игнорирую прокси")
+        return None
+    except Exception as e:
+        logger.warning(f"Не удалось разобрать TELEGRAM_PROXY: {e}")
+        return None
 
 
 @dataclass
@@ -61,6 +90,20 @@ class TelegramCollector:
         """Подключиться к Telegram и начать слушать каналы"""
         logger.info("Подключение к Telegram...")
 
+        # Общие параметры устойчивости соединения (авто-реконнект, повторы,
+        # опциональный прокси) — снижают «то подключается, то нет».
+        proxy = _build_proxy()
+        common = dict(
+            connection_retries=TELEGRAM_CONNECTION_RETRIES,
+            retry_delay=2,
+            timeout=30,
+            request_retries=5,
+            auto_reconnect=True,
+        )
+        if proxy:
+            common["proxy"] = proxy
+            logger.info("🌐 Telegram через прокси (TELEGRAM_PROXY задан)")
+
         if TELEGRAM_STRING_SESSION:
             from telethon.sessions import StringSession
             # Очищаем от лишних символов (пробелы, переносы, не-ASCII)
@@ -70,9 +113,9 @@ class TelegramCollector:
             )
             logger.info(f"🔑 Строковая сессия загружена ({len(clean_session)} символов)")
             session = StringSession(clean_session)
-            self.client = TelegramClient(session, TELEGRAM_API_ID, TELEGRAM_API_HASH)
-            # Подключаемся без интерактивного ввода
-            await self.client.connect()
+            self.client = TelegramClient(session, TELEGRAM_API_ID, TELEGRAM_API_HASH, **common)
+            # Подключаемся без интерактивного ввода, с несколькими попытками
+            await self._connect_with_retry()
             if not await self.client.is_user_authorized():
                 raise RuntimeError(
                     "❌ Сессия недействительна! Сгенерируй новую через Colab "
@@ -90,8 +133,8 @@ class TelegramCollector:
                 os.makedirs("data", exist_ok=True)
                 session_path = os.path.join("data", session_path)
 
-            self.client = TelegramClient(session_path, TELEGRAM_API_ID, TELEGRAM_API_HASH)
-            await self.client.connect()
+            self.client = TelegramClient(session_path, TELEGRAM_API_ID, TELEGRAM_API_HASH, **common)
+            await self._connect_with_retry()
             if not await self.client.is_user_authorized():
                 # В контейнере нет интерактивного ввода кода из SMS — не зависаем,
                 # а даём чёткую инструкцию. Надёжный способ для деплоя — строковая сессия.
@@ -115,6 +158,26 @@ class TelegramCollector:
                 await self._message_queue.put(msg)
 
         logger.info(f"👂 Слушаем {len(self.channels)} каналов: {self.channels}")
+
+    async def _connect_with_retry(self, attempts: int = 3, delay: float = 3.0):
+        """
+        Подключиться к Telegram с несколькими попытками. Спасает от разовых
+        сетевых сбоев при старте (нестабильный доступ к дата-центрам Telegram).
+        """
+        last_err = None
+        for i in range(1, attempts + 1):
+            try:
+                await self.client.connect()
+                return
+            except Exception as e:
+                last_err = e
+                logger.warning(f"Telegram connect: попытка {i}/{attempts} не удалась: {e}")
+                if i < attempts:
+                    await asyncio.sleep(delay)
+        raise RuntimeError(
+            f"Не удалось подключиться к Telegram за {attempts} попыток: {last_err}. "
+            f"Если хостинг блокирует Telegram — задай TELEGRAM_PROXY (socks5://host:port)."
+        )
 
     async def stop(self):
         """Отключиться от Telegram"""

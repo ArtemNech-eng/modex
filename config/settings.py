@@ -15,6 +15,12 @@ TELEGRAM_SESSION = os.getenv("TELEGRAM_SESSION", "moodex_session")
 # Строковая сессия для деплоя в контейнерах (генерируется через auth_telegram.py)
 # Если задана — используется вместо файла сессии
 TELEGRAM_STRING_SESSION = os.getenv("TELEGRAM_STRING_SESSION", "")
+# Необязательный прокси для обхода нестабильного доступа к серверам Telegram
+# (частая проблема на хостинге в РФ). Формат: socks5://[user:pass@]host:port
+# Поддерживаются также socks4:// и http://. Пусто — без прокси.
+TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "")
+# Сколько попыток переподключения делает Telethon перед ошибкой
+TELEGRAM_CONNECTION_RETRIES = int(os.getenv("TELEGRAM_CONNECTION_RETRIES", "5"))
 
 # ─── AI Агент ─────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
