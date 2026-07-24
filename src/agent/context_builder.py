@@ -408,6 +408,52 @@ async def build_memory_context(ticker: str) -> str:
     return "\n".join(lines)
 
 
+async def build_lessons_context(ticker: str) -> str:
+    """
+    Уроки из разобранных ошибок (post-mortem): что уже приводило к провалам
+    по этому тикеру и в целом. Подмешивается в промпт, чтобы Claude не наступал
+    на те же грабли. Это и есть замыкание цикла обучения на разборе ошибок.
+    """
+    try:
+        by_ticker = await db.recent_lessons(ticker=ticker, limit=5)
+        overall = await db.recent_lessons(limit=6)
+        tag_stats = await db.lesson_tag_stats()
+    except Exception as e:
+        return ""
+
+    if not by_ticker and not overall and not tag_stats.get("failure_tags"):
+        return ""
+
+    lines = ["🎓 УРОКИ ИЗ ПРОШЛЫХ ОШИБОК (разбор закрытых сигналов):"]
+
+    fails = tag_stats.get("failure_tags", [])[:5]
+    if fails:
+        tag_ru = {
+            "false_sentiment": "толпа обманула",
+            "crowd_trap": "ловушка толпы на развороте",
+            "news_shock": "внешняя новость",
+            "regime_change": "смена режима рынка",
+            "late_entry": "поздний вход",
+            "tech_break_fail": "ложный пробой",
+            "low_liquidity": "тонкий рынок",
+            "overconfidence": "завышенная уверенность",
+            "luck": "случайность/шум",
+        }
+        parts = [f"{tag_ru.get(t['tag'], t['tag'])} ×{t['count']}" for t in fails]
+        lines.append("  Частые причины провалов: " + ", ".join(parts))
+
+    src = by_ticker or overall
+    scope = f"по {ticker}" if by_ticker else "по рынку в целом"
+    lines.append(f"  Свежие уроки ({scope}):")
+    for r in src[:5]:
+        if not r.get("lesson"):
+            continue
+        mark = "✅" if r.get("correct") else "❌"
+        lines.append(f"    {mark} {r['lesson']}")
+
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
 async def build_news_context(ticker: str, news_cache: list) -> str:
     """
     Последние новости по тикеру из RSS-коллектора.

@@ -91,6 +91,13 @@ class Prediction(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # Разбор ошибок (post-mortem) — «почему сработало / не сработало»
+    context_json: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # снимок драйверов на момент прогноза (JSON)
+    post_mortem: Mapped[Optional[str]] = mapped_column(String, nullable=True)    # причина успеха/провала
+    lesson: Mapped[Optional[str]] = mapped_column(String, nullable=True)         # короткий вывод-правило
+    pm_tags: Mapped[Optional[str]] = mapped_column(String, nullable=True)        # теги причин через запятую
+    pm_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
     def to_dict(self) -> dict:
         return {
             "id": self.id,
@@ -111,6 +118,9 @@ class Prediction(Base):
             ),
             "correct": self.correct,
             "evaluated_at": self.evaluated_at.isoformat() if self.evaluated_at else None,
+            "post_mortem": self.post_mortem,
+            "lesson": self.lesson,
+            "pm_tags": [t for t in (self.pm_tags or "").split(",") if t],
         }
 
 
@@ -165,6 +175,40 @@ async def init_db():
     logger.info(f"🗄️  База данных готова ({DATABASE_URL.split('://', 1)[0]})")
 
 
+# Колонки разбора ошибок, которые могли отсутствовать в старой схеме predictions.
+_PREDICTION_ADDED_COLUMNS = {
+    "context_json": "TEXT",
+    "post_mortem": "TEXT",
+    "lesson": "TEXT",
+    "pm_tags": "TEXT",
+    "pm_at": "TIMESTAMP",
+}
+
+
+async def migrate_schema():
+    """
+    Мягкая миграция: дописать новые колонки в существующую таблицу predictions.
+
+    create_all() создаёт недостающие ТАБЛИЦЫ, но не добавляет колонки в уже
+    существующие. Здесь добавляем колонки post-mortem, если их ещё нет —
+    и на SQLite, и на PostgreSQL, идемпотентно.
+    """
+    is_sqlite = "sqlite" in DATABASE_URL
+    async with engine.begin() as conn:
+        if is_sqlite:
+            res = await conn.exec_driver_sql("PRAGMA table_info(predictions)")
+            existing = {row[1] for row in res.fetchall()}
+            for col, typ in _PREDICTION_ADDED_COLUMNS.items():
+                if col not in existing:
+                    await conn.exec_driver_sql(
+                        f'ALTER TABLE predictions ADD COLUMN "{col}" {typ}')
+                    logger.info(f"🧩 Добавлена колонка predictions.{col}")
+        else:
+            for col, typ in _PREDICTION_ADDED_COLUMNS.items():
+                await conn.exec_driver_sql(
+                    f'ALTER TABLE predictions ADD COLUMN IF NOT EXISTS "{col}" {typ}')
+
+
 async def migrate_from_json():
     """
     Перенести каналы из старого data/channels.json в БД (одноразово).
@@ -215,6 +259,7 @@ async def setup_db():
         if _setup_done:
             return
         await init_db()
+        await migrate_schema()
         await migrate_from_json()
         _setup_done = True
 
@@ -271,6 +316,13 @@ async def delete_channel(username: str) -> bool:
 
 async def add_prediction(data: dict) -> int:
     """Сохранить новый прогноз. Возвращает id."""
+    context = data.get("context")
+    context_json = None
+    if context is not None:
+        try:
+            context_json = json.dumps(context, ensure_ascii=False)
+        except Exception:
+            context_json = None
     async with async_session() as session:
         pred = Prediction(
             ticker=data["ticker"],
@@ -282,6 +334,7 @@ async def add_prediction(data: dict) -> int:
             confidence=data.get("confidence", 0.0),
             direction=data.get("direction", "flat"),
             price_at=data.get("price_at"),
+            context_json=context_json,
         )
         session.add(pred)
         await session.commit()
@@ -337,6 +390,102 @@ async def get_evaluated_predictions() -> list[dict]:
             select(Prediction).where(Prediction.correct.is_not(None))
         )
         return [p.to_dict() for p in result.scalars().all()]
+
+
+# ─── Разбор ошибок (post-mortem) ──────────────────────────────────────────────
+
+async def get_predictions_for_post_mortem(limit: int = 50) -> list[dict]:
+    """
+    Оценённые прогнозы, для которых ещё не сделан разбор (pm_at пустой).
+    Возвращает dict + сырой context_json для передачи в разбор.
+    """
+    async with async_session() as session:
+        result = await session.execute(
+            select(Prediction)
+            .where(Prediction.correct.is_not(None))
+            .where(Prediction.pm_at.is_(None))
+            .order_by(Prediction.evaluated_at.desc())
+            .limit(limit)
+        )
+        out = []
+        for p in result.scalars().all():
+            d = p.to_dict()
+            d["context_json"] = p.context_json
+            out.append(d)
+        return out
+
+
+async def set_post_mortem(pred_id: int, post_mortem: str, lesson: str,
+                          tags: Optional[list[str]] = None) -> None:
+    """Сохранить результат разбора по прогнозу."""
+    async with async_session() as session:
+        pred = await session.get(Prediction, pred_id)
+        if pred is None:
+            return
+        pred.post_mortem = (post_mortem or "")[:2000]
+        pred.lesson = (lesson or "")[:1000]
+        pred.pm_tags = ",".join(t.strip() for t in (tags or []) if t.strip())[:512]
+        pred.pm_at = datetime.now(timezone.utc)
+        await session.commit()
+
+
+async def recent_lessons(ticker: Optional[str] = None, limit: int = 15) -> list[dict]:
+    """Последние извлечённые уроки (по разобранным прогнозам)."""
+    async with async_session() as session:
+        stmt = (
+            select(Prediction)
+            .where(Prediction.pm_at.is_not(None))
+            .order_by(Prediction.pm_at.desc())
+            .limit(limit)
+        )
+        if ticker:
+            stmt = stmt.where(Prediction.ticker == ticker.upper())
+        result = await session.execute(stmt)
+        out = []
+        for p in result.scalars().all():
+            out.append({
+                "id": p.id,
+                "ticker": p.ticker,
+                "direction": p.direction,
+                "correct": p.correct,
+                "realized_return": (round(p.realized_return, 2)
+                                    if p.realized_return is not None else None),
+                "lesson": p.lesson,
+                "post_mortem": p.post_mortem,
+                "tags": [t for t in (p.pm_tags or "").split(",") if t],
+                "created_at": p.created_at.isoformat() if p.created_at else None,
+            })
+        return out
+
+
+async def lesson_tag_stats() -> dict:
+    """
+    Частота тегов причин по разобранным прогнозам, отдельно для провалов и успехов.
+    Помогает увидеть типовые причины ошибок.
+    """
+    async with async_session() as session:
+        result = await session.execute(
+            select(Prediction).where(Prediction.pm_at.is_not(None))
+        )
+        preds = result.scalars().all()
+
+    fail_tags: dict[str, int] = {}
+    win_tags: dict[str, int] = {}
+    for p in preds:
+        tags = [t for t in (p.pm_tags or "").split(",") if t]
+        bucket = win_tags if p.correct else fail_tags
+        for t in tags:
+            bucket[t] = bucket.get(t, 0) + 1
+
+    def _top(d: dict) -> list[dict]:
+        return [{"tag": k, "count": v}
+                for k, v in sorted(d.items(), key=lambda x: x[1], reverse=True)]
+
+    return {
+        "analyzed": len(preds),
+        "failure_tags": _top(fail_tags),
+        "success_tags": _top(win_tags),
+    }
 
 
 async def accuracy_stats(ticker: Optional[str] = None) -> dict:

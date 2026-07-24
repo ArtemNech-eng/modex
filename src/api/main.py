@@ -860,6 +860,29 @@ async def trigger_learning():
     return {**result, "model_weights": [round(w, 3) for w in weights]}
 
 
+@app.get("/api/lessons", summary="Разбор ошибок и извлечённые уроки")
+async def get_lessons(ticker: Optional[str] = None, limit: int = 15):
+    """
+    Журнал разбора закрытых сигналов (post-mortem): по каждому — причина
+    успеха/провала и урок, плюс частота типовых причин ошибок. Эти уроки
+    автоматически подмешиваются в промпт будущих прогнозов.
+    """
+    lessons = await db.recent_lessons(ticker=ticker, limit=limit)
+    tag_stats = await db.lesson_tag_stats()
+    return {
+        "lessons": lessons,
+        "count": len(lessons),
+        "tag_stats": tag_stats,
+    }
+
+
+@app.post("/api/agent/post-mortem", summary="Разобрать закрытые сигналы сейчас")
+async def trigger_post_mortem(limit: int = 25):
+    """Разово сформировать разбор по оценённым, но ещё не разобранным прогнозам."""
+    analyzed = await analyst.generate_post_mortems(limit=limit)
+    return {"analyzed": analyzed}
+
+
 # ─── Live-сигналы (форвард-тест в реальном времени) ───────────────────────────
 #
 # Почему это нужно: полный контекст (стакан, новости, макро) нельзя восстановить

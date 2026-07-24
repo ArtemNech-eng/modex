@@ -14,7 +14,9 @@ services:
       - API_HOST=0.0.0.0
       - API_PORT=8000
       - API_SECRET_KEY=${API_SECRET_KEY}
-      - DATABASE_URL=sqlite+aiosqlite:///./moodex.db
+      # ВАЖНО: БД лежит в ./data, который смонтирован на постоянный том
+      # moodex_data. Иначе при пересборке образа сигналы/журнал терялись бы.
+      - DATABASE_URL=sqlite+aiosqlite:///./data/moodex.db
       - SENTIMENT_WINDOW_MINUTES=${SENTIMENT_WINDOW_MINUTES:-60}
       - MIN_MESSAGES_FOR_SIGNAL=${MIN_MESSAGES_FOR_SIGNAL:-5}
     volumes:

@@ -254,6 +254,7 @@ class ClaudeAgent:
         memory_context: Optional[str] = None,
         multiframe_context: Optional[str] = None,
         smart_money_context: Optional[str] = None,
+        lessons_context: Optional[str] = None,
         momentum: Optional[float] = None,
         momentum_label: Optional[str] = None,
         source_diversity: Optional[float] = None,
@@ -306,6 +307,7 @@ class ClaudeAgent:
 {_block(smart_money_context)}
 {_block(historical_context)}
 {_block(memory_context)}
+{_block(lessons_context)}
 📊 ТЕКУЩЕЕ НАСТРОЕНИЕ ТОЛПЫ (Telegram + Пульс):
 - Индекс: {sentiment_index:.1f}/100 | Сообщений: {message_count}
 - Позитивных: {positive_pct:.0f}% | Негативных: {negative_pct:.0f}%
@@ -506,6 +508,115 @@ class ClaudeAgent:
             "risk":           "Нет данных",
             "crowd_behavior": "неопределённость",
             "history_based":  False,
+        }
+
+    # Разрешённые теги причин (единый словарь для агрегации по журналу)
+    POST_MORTEM_TAGS = [
+        "correct_read",     # верное прочтение ситуации
+        "false_sentiment",  # настроение толпы обмануло
+        "crowd_trap",       # пошли за толпой на развороте
+        "news_shock",       # внешняя новость/событие перебили сигнал
+        "regime_change",    # сменился режим рынка (боковик↔тренд)
+        "late_entry",       # поздний вход, движение уже реализовалось
+        "tech_break_fail",  # ложный пробой уровня/индикатора
+        "low_liquidity",    # тонкий рынок / мало данных
+        "overconfidence",   # завышенная уверенность на слабых данных
+        "luck",             # результат — скорее шум, чем следствие анализа
+    ]
+
+    async def post_mortem(
+        self,
+        ticker: str,
+        direction: str,
+        confidence: float,
+        context: dict,
+        realized_return: Optional[float],
+        correct: Optional[bool],
+        horizon_hours: int = 24,
+    ) -> dict:
+        """
+        Разбор закрытого сигнала: ПОЧЕМУ он сработал / не сработал.
+        Возвращает {"cause","lesson","tags"}.
+        При недоступности Claude — эвристический разбор по числам (без LLM).
+        """
+        outcome = ("верный" if correct else "неверный") if correct is not None else "неизвестен"
+        ret_str = f"{realized_return:+.2f}%" if realized_return is not None else "н/д"
+
+        # ── Попытка через Claude ─────────────────────────────────────────────
+        if self.api_key:
+            try:
+                import json
+                ctx_text = json.dumps(context or {}, ensure_ascii=False)[:2500]
+                system = (
+                    "Ты трейдер-наставник. Разбираешь ЗАКРЫТЫЙ прогноз по акции MOEX: "
+                    "почему он сработал или не сработал, и какой из этого урок на будущее. "
+                    "Пиши по-русски, коротко и по делу. Отвечай ТОЛЬКО валидным JSON."
+                )
+                user = f"""Разбери прогноз по {ticker}.
+
+Прогноз: направление={direction}, уверенность={confidence:.0%}, горизонт={horizon_hours}ч.
+Факт: результат {outcome}, доходность за горизонт: {ret_str}.
+
+Драйверы на момент прогноза (снимок):
+{ctx_text}
+
+Верни JSON:
+{{
+  "cause": "1-2 предложения: почему сигнал {('сработал' if correct else 'не сработал')}",
+  "lesson": "короткое правило-вывод на будущее (1 предложение)",
+  "tags": ["выбери 1-3 из: {', '.join(self.POST_MORTEM_TAGS)}"]
+}}"""
+                raw = await self._ask(system, user, max_tokens=400)
+                start, end = raw.find("{"), raw.rfind("}") + 1
+                if start >= 0 and end > start:
+                    data = json.loads(raw[start:end])
+                    tags = [t for t in data.get("tags", []) if t in self.POST_MORTEM_TAGS]
+                    return {
+                        "cause": (data.get("cause") or "").strip(),
+                        "lesson": (data.get("lesson") or "").strip(),
+                        "tags": tags or self._heuristic_pm(direction, context, correct)["tags"],
+                    }
+            except Exception as e:
+                logger.warning(f"post-mortem Claude failed for {ticker}: {e}")
+
+        # ── Fallback: эвристика без LLM ───────────────────────────────────────
+        h = self._heuristic_pm(direction, context, correct)
+        h["cause"] = h["cause"] + f" (факт: {ret_str} за {horizon_hours}ч)."
+        return h
+
+    @staticmethod
+    def _heuristic_pm(direction: str, context: dict, correct: Optional[bool]) -> dict:
+        """Простой разбор по числам, когда LLM недоступен."""
+        context = context or {}
+        sent = context.get("sentiment_index")
+        regime = context.get("regime")
+        entry = context.get("entry_status")
+
+        if correct:
+            return {
+                "cause": "Сигнал совпал с последующим движением цены.",
+                "lesson": "Похожая конфигурация уже отрабатывала — доверять при схожих условиях.",
+                "tags": ["correct_read"],
+            }
+
+        tags: list[str] = []
+        # Сильное настроение в сторону прогноза, но рынок пошёл против → толпа обманула
+        if sent is not None and (
+            (direction == "up" and sent >= 60) or (direction == "down" and sent <= 40)
+        ):
+            tags += ["false_sentiment", "crowd_trap"]
+        if regime in ("range", "боковик"):
+            tags.append("tech_break_fail")
+        elif regime in ("uptrend", "downtrend"):
+            tags.append("regime_change")
+        if entry in ("late", "invalid"):
+            tags.append("late_entry")
+        if not tags:
+            tags = ["luck"]
+        return {
+            "cause": "Прогноз разошёлся с движением цены; ведущие драйверы не подтвердились.",
+            "lesson": "Снижать уверенность, когда сигнал держится на одном факторе без подтверждения техникой.",
+            "tags": tags[:3],
         }
 
     async def find_correlations(
