@@ -22,3 +22,13 @@ asyncpg==0.29.0
 matplotlib==3.9.0
 mplfinance==0.12.10b0
 pandas==2.2.2
+
+# ─── NLP (RuBERT sentiment) ───────────────────────────────────────────────────
+# Без этих пакетов transformers.pipeline не импортируется и sentiment_analyzer
+# молча падает на словарный fallback (keyword_sentiment).
+# torch ставим CPU-сборкой с офиц. индекса PyTorch: дефолтное колесо с PyPI под
+# Linux тянет CUDA (~2.5GB) и ломает slim-образ. На Linux встанет 2.4.1+cpu
+# (~190MB), на macOS — обычный 2.4.1 (там он и так CPU).
+--extra-index-url https://download.pytorch.org/whl/cpu
+transformers==4.44.2
+torch==2.4.1
