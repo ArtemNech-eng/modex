@@ -103,6 +103,7 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
     direction     = fallback_direction
     confidence    = fallback_confidence
     narrative     = None
+    intraday_ctx  = None
 
     try:
         from config.settings import MOEX_TICKERS
@@ -132,6 +133,23 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         memory_ctx     = memory_ctx     if not isinstance(memory_ctx, Exception)     else ""
         multiframe_ctx = multiframe_ctx if not isinstance(multiframe_ctx, Exception) else ""
         lessons_ctx    = lessons_ctx    if not isinstance(lessons_ctx, Exception)    else ""
+
+        # Интрадей-контекст (VWAP, диапазон открытия, волатильность, вынос) —
+        # именно он ведёт внутридневное решение; дневная техника выше остаётся
+        # как контекст старшего таймфрейма.
+        intraday_ctx = None
+        try:
+            from config.settings import (
+                INTRADAY_MODE, INTRADAY_TF_MIN, INTRADAY_OPENING_RANGE_BARS)
+            if INTRADAY_MODE:
+                from src.agent import intraday_analyst as ia
+                intraday_ctx = await ia.build_intraday_context(
+                    ticker, tf_min=INTRADAY_TF_MIN,
+                    msg_zscore=(sentiment_block or {}).get("volume_zscore"),
+                    opening_range_bars=INTRADAY_OPENING_RANGE_BARS,
+                )
+        except Exception as e:
+            logger.debug(f"intraday context failed for {ticker}: {e}")
 
         # Tinkoff: стакан + поток сделок + объём
         tinkoff_snap = await _tinkoff.get_full_snapshot(ticker)
@@ -190,6 +208,7 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
             multiframe_context=multiframe_ctx or None,
             smart_money_context=smart_money_ctx,
             lessons_context=lessons_ctx or None,
+            intraday_context=(intraday_ctx or {}).get("summary") if intraday_ctx else None,
             momentum=sentiment_block.get("momentum") if sentiment_block else None,
             momentum_label=sentiment_block.get("momentum_label") if sentiment_block else None,
             source_diversity=sentiment_block.get("source_diversity") if sentiment_block else None,
@@ -244,6 +263,20 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         elif entry_status in ("wait", "above", "below"):
             recommendation = f"⏳ Ждать входа ({bias})"
 
+    # Интрадей-гвард: в новостной вынос / у края сессии — только наблюдение;
+    # если интрадей дал конкретный сетап (ORB / разрешение выноса) — берём его
+    # направление и торговый план как основной для внутридневного входа.
+    if intraday_ctx:
+        if intraday_ctx.get("observe"):
+            recommendation = f"⚪ Наблюдать — интрадей: {intraday_ctx.get('note') or 'высокая волатильность'}"
+            if intraday_ctx.get("setup") == "news_observe":
+                direction = "flat"
+        elif intraday_ctx.get("plan"):
+            plan = intraday_ctx["plan"]
+            direction = "up" if plan["signal"] == "long" else "down"
+            bias = "лонг" if direction == "up" else "шорт"
+            recommendation = f"🎯 Интрадей-вход ({bias}) — {intraday_ctx.get('note')}"
+
     # ── 6. Обоснование ──────────────────────────────────────────────────────
     reasons: list[str] = []
     if sentiment_block:
@@ -273,6 +306,16 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         if claude_result.get("risk"):
             reasons.append(f"Риск: {claude_result['risk']}")
 
+    if intraday_ctx:
+        reasons.append(
+            f"Интрадей: {intraday_ctx.get('vwap_rel') or 'VWAP н/д'}, "
+            f"волатильность {intraday_ctx.get('volatility_state')}, "
+            f"фаза {intraday_ctx.get('phase')}"
+            + (f", сетап {intraday_ctx.get('setup')}" if intraday_ctx.get('setup') not in (None, 'none') else "")
+        )
+        if intraday_ctx.get("delayed"):
+            reasons.append("⚠️ Интрадей-данные MOEX с задержкой ~15 мин (нет реалтайм-фида).")
+
     result = {
         "ticker": ticker,
         "recommendation": recommendation,
@@ -292,6 +335,18 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
             "orderbook": tinkoff_snap.get("orderbook"),
             "trades":    tinkoff_snap.get("trades"),
         } if tinkoff_snap else None,
+        "intraday": {
+            "setup": intraday_ctx.get("setup"),
+            "signal": intraday_ctx.get("signal"),
+            "plan": intraday_ctx.get("plan"),
+            "observe": intraday_ctx.get("observe"),
+            "vwap": intraday_ctx.get("vwap"),
+            "vwap_rel": intraday_ctx.get("vwap_rel"),
+            "atr": intraday_ctx.get("atr"),
+            "volatility_state": intraday_ctx.get("volatility_state"),
+            "phase": intraday_ctx.get("phase"),
+            "delayed": intraday_ctx.get("delayed"),
+        } if intraday_ctx else None,
         "narrative": narrative,
         "reasons": reasons,
         "model_weights": [round(w, 3) for w in weights],
@@ -324,10 +379,23 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
                 "key_insight": (claude_result or {}).get("key_insight") if claude_result else None,
                 "risk": (claude_result or {}).get("risk") if claude_result else None,
                 "narrative": narrative,
+                "intraday_setup": intraday_ctx.get("setup") if intraday_ctx else None,
+                "intraday_vwap_rel": intraday_ctx.get("vwap_rel") if intraday_ctx else None,
+                "intraday_volatility": intraday_ctx.get("volatility_state") if intraday_ctx else None,
+                "intraday_phase": intraday_ctx.get("phase") if intraday_ctx else None,
+                "intraday_delayed": intraday_ctx.get("delayed") if intraday_ctx else None,
             }
+            # В интрадей-режиме горизонт прогноза короткий (часы), а не сутки —
+            # это меняет и момент оценки результата (внутри сессии).
+            try:
+                from config.settings import INTRADAY_MODE, INTRADAY_HORIZON_HOURS
+                default_h = INTRADAY_HORIZON_HOURS if INTRADAY_MODE else 24
+            except Exception:
+                default_h = 24
+            horizon_h = int(os.getenv("PREDICTION_HORIZON_HOURS", str(default_h)))
             pred_id = await db.add_prediction({
                 "ticker": ticker,
-                "horizon_hours": int(os.getenv("PREDICTION_HORIZON_HOURS", "24")),
+                "horizon_hours": horizon_h,
                 "sentiment_index": sentiment_block["sentiment_index"] if sentiment_block else None,
                 "sentiment_signal": sentiment_signal,
                 "technical_score": technical_score,
@@ -353,13 +421,25 @@ async def evaluate_due_predictions() -> dict:
     for p in due:
         if not p.price_at:
             continue
+        realized_price = None
+        # Интрадей-прогнозы (короткий горизонт) оцениваем по интрадей-цене на
+        # момент created_at + horizon; иначе/при отсутствии данных — дневной close.
         try:
-            closes = await ta.fetch_closes(p.ticker, days=10)
+            from config.settings import INTRADAY_MODE
+            if INTRADAY_MODE and p.horizon_hours and p.horizon_hours < 24 and p.created_at:
+                from src.agent import intraday_analyst as ia
+                realized_price = await ia.realized_price_after(
+                    p.ticker, p.created_at.isoformat(), float(p.horizon_hours))
         except Exception:
-            continue
-        if not closes:
-            continue
-        realized_price  = closes[-1]
+            realized_price = None
+        if realized_price is None:
+            try:
+                closes = await ta.fetch_closes(p.ticker, days=10)
+            except Exception:
+                continue
+            if not closes:
+                continue
+            realized_price = closes[-1]
         realized_return = (realized_price / p.price_at - 1) * 100
         actual_up = realized_return > 0
         if p.direction == "up":
