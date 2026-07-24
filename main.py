@@ -29,7 +29,7 @@ from src.nlp.sentiment_analyzer import SentimentAnalyzer, keyword_sentiment
 from src.nlp.ticker_extractor import extract_tickers, is_market_related
 from src.aggregator.aggregator import SentimentAggregator
 from src.api.main import app, aggregator as api_aggregator, connected_websockets, analyzer as api_analyzer, set_collector
-from config.settings import TELEGRAM_CHANNELS
+from config.settings import TELEGRAM_CHANNELS, TELEGRAM_API_ID, TELEGRAM_API_HASH
 
 logging.basicConfig(
     level=logging.INFO,
@@ -154,6 +154,16 @@ async def stats_reporter():
 
 async def telegram_pipeline():
     """Основной цикл: Telegram → NLP → Aggregator"""
+    # Без Telegram-кредов пропускаем канал целиком, НЕ роняя приложение:
+    # дашборд/API, Пульс, RSS и интрадей продолжат работать.
+    if not TELEGRAM_API_ID or not TELEGRAM_API_HASH:
+        logger.warning(
+            "⚠️  Telegram не настроен (нет TELEGRAM_API_ID / TELEGRAM_API_HASH) — "
+            "пропускаю Telegram-канал. Настроение соберётся из Пульса и RSS; "
+            "API, дашборд и интрадей работают в обычном режиме."
+        )
+        return
+
     collector = TelegramCollector(channels=TELEGRAM_CHANNELS)
 
     logger.info("⏳ Подключаемся к Telegram...")
@@ -256,12 +266,20 @@ async def run():
     logger.info("  Запуск в режиме РЕАЛЬНОГО ВРЕМЕНИ")
     logger.info("=" * 55)
 
+    # Устойчивость: сбой любого фонового пайплайна логируем, но НЕ роняем
+    # веб-сервер — иначе healthcheck/деплой падает целиком.
+    async def _safe(name, coro):
+        try:
+            await coro
+        except Exception as e:
+            logger.error(f"Пайплайн «{name}» остановлен из-за ошибки: {e}", exc_info=True)
+
     # Запускаем все компоненты параллельно
     await asyncio.gather(
         server.serve(),
-        telegram_pipeline(),
-        pulse_pipeline(),
-        rss_pipeline(),
+        _safe("telegram", telegram_pipeline()),
+        _safe("pulse", pulse_pipeline()),
+        _safe("rss", rss_pipeline()),
     )
 
 
