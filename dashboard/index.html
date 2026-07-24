@@ -1621,22 +1621,34 @@ async function renderChart(ticker, tech) {
      <span style="color:#58a6ff">─ зона входа</span>`;
 }
 
-function planBlock(tp) {
+function planBlock(tp, opts) {
   if (!tp || !tp.direction) return '';
+  opts = opts || {};
+  const ctx = opts.tf === 'daily-context';   // дневной план показывается как КОНТЕКСТ
   // Баннер тайминга входа
   const st = tp.entry_status;
-  const stColor = st==='enter' ? 'var(--green)' : st==='wait' ? '#d29922' : 'var(--red)';
-  const stBg = st==='enter' ? 'rgba(63,185,80,0.15)' : st==='wait' ? 'rgba(210,153,34,0.15)' : 'rgba(248,81,73,0.15)';
-  const banner = tp.entry_note ? `<div style="margin-top:10px;padding:8px 10px;border-radius:8px;background:${stBg};border:1px solid ${stColor};font-size:12px;color:${stColor};font-weight:600;">${tp.entry_note}</div>` : '';
+  let stColor = st==='enter' ? 'var(--green)' : st==='wait' ? '#d29922' : 'var(--red)';
+  let stBg = st==='enter' ? 'rgba(63,185,80,0.15)' : st==='wait' ? 'rgba(210,153,34,0.15)' : 'rgba(248,81,73,0.15)';
+  let noteText = tp.entry_note || '';
+  if (ctx) {  // контекст старшего ТФ — нейтральный вид, явная подпись
+    stColor = 'var(--dim)'; stBg = 'rgba(139,148,158,0.12)';
+    if (noteText) noteText = 'Дневной ТФ (контекст, не интрадей-вход): ' + noteText;
+  }
+  const banner = noteText ? `<div style="margin-top:10px;padding:8px 10px;border-radius:8px;background:${stBg};border:1px solid ${stColor};font-size:12px;color:${stColor};font-weight:600;">${noteText}</div>` : '';
+  const isLong = tp.direction === 'long';
+  // Заголовок с указанием таймфрейма
+  const titleFlat = ctx ? '📈 Дневной ТФ (контекст)' : '📋 План';
+  const title = opts.tf === 'intraday' ? `📋 Интрадей-план (${isLong?'ЛОНГ':'ШОРТ'})`
+              : ctx ? `📈 Дневной ТФ (контекст, не интрадей-вход) — план ${isLong?'ЛОНГ':'ШОРТ'}`
+              : `📋 План сделки (${isLong?'ЛОНГ':'ШОРТ'})`;
   if (tp.direction === 'flat')
     return `${banner}<div style="margin-top:8px;padding:8px;background:var(--bg);border-radius:8px;font-size:12px;line-height:1.5;">
-      <b>📋 План:</b> ${tp.entry_rule}<br>Коридор: <b>${tp.support}</b> – <b>${tp.resistance}</b> · ATR ${tp.atr}</div>`;
-  const isLong = tp.direction === 'long';
+      <b>${titleFlat}:</b> ${tp.entry_rule}<br>Коридор: <b>${tp.support}</b> – <b>${tp.resistance}</b> · ATR ${tp.atr}</div>`;
   const col = isLong ? 'var(--green)' : 'var(--red)';
   const crr = tp.current_rr!=null ? `${tp.current_rr}:1` : '—';
   const crrColor = (tp.current_rr!=null && tp.current_rr>=1.5) ? 'var(--green)' : (tp.current_rr!=null && tp.current_rr<1) ? 'var(--red)' : 'var(--dim)';
-  return `${banner}<div style="margin-top:8px;padding:8px;background:var(--bg);border-radius:8px;font-size:12px;line-height:1.6;">
-    <b>📋 План сделки (${isLong?'ЛОНГ':'ШОРТ'}):</b>
+  return `${banner}<div style="margin-top:8px;padding:8px;background:var(--bg);border-radius:8px;font-size:12px;line-height:1.6;${ctx?'opacity:0.85;':''}">
+    <b>${title}:</b>
     <div>🎯 Зона входа: <b style="color:${col}">${tp.entry_low} – ${tp.entry_high}</b> <span style="color:var(--dim)">(текущая цена ${tp.price})</span></div>
     <div>🛑 Стоп-лосс: <b style="color:var(--red)">${tp.stop_loss}</b> · 🏁 Цели: <b style="color:var(--green)">${tp.take_profit_1}</b> → ${tp.take_profit_2}</div>
     <div>⚖️ R/R плана ≈ <b>${tp.risk_reward}:1</b> · R/R от текущей цены: <b style="color:${crrColor}">${crr}</b></div>
@@ -1685,7 +1697,8 @@ async function runAgent() {
       <ul style="margin:0;padding-left:18px;font-size:12px;line-height:1.5;">
         ${a.reasons.map(x => `<li>${x}</li>`).join('')}
       </ul>
-      ${planBlock(a.trade_plan || (t && t.trade_plan))}
+      ${a.trade_plan ? planBlock(a.trade_plan, {tf:'intraday'})
+                     : (t && t.trade_plan ? planBlock(t.trade_plan, {tf: a.intraday ? 'daily-context' : null}) : '')}
       ${a.narrative ? `<div style="margin-top:10px;padding:8px;background:var(--bg);border-radius:8px;font-size:12px;line-height:1.5;">🤖 ${a.narrative}</div>` : ''}
       <div style="margin-top:10px;font-size:10px;color:var(--dim);">${a.disclaimer}</div>
     `;
