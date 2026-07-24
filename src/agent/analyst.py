@@ -263,9 +263,11 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         elif entry_status in ("wait", "above", "below"):
             recommendation = f"⏳ Ждать входа ({bias})"
 
-    # Интрадей-гвард: в новостной вынос / у края сессии — только наблюдение;
-    # если интрадей дал конкретный сетап (ORB / разрешение выноса) — берём его
-    # направление и торговый план как основной для внутридневного входа.
+    # Интрадей-гвард: согласуем интрадей-сетап со старшим (дневным) трендом.
+    # Контртренд к сильному дневному тренду и слабый R/R уходят в «наблюдение»
+    # (а не в ложный «вход»). Если сетап реально ведёт вход — показываем именно
+    # интрадей-план и согласованные метрики, чтобы карточка не противоречила себе.
+    intraday_trade_plan = None
     if intraday_ctx:
         if intraday_ctx.get("observe"):
             recommendation = f"⚪ Наблюдать — интрадей: {intraday_ctx.get('note') or 'высокая волатильность'}"
@@ -273,9 +275,46 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
                 direction = "flat"
         elif intraday_ctx.get("plan"):
             plan = intraday_ctx["plan"]
-            direction = "up" if plan["signal"] == "long" else "down"
-            bias = "лонг" if direction == "up" else "шорт"
-            recommendation = f"🎯 Интрадей-вход ({bias}) — {intraday_ctx.get('note')}"
+            itf_dir = "up" if plan["signal"] == "long" else "down"
+            rr = plan.get("risk_reward") or 0
+            daily_dir = ("up" if tech and tech.regime == "uptrend"
+                         else "down" if tech and tech.regime == "downtrend" else None)
+            strong_daily = bool(tech and (tech.adx or 0) >= 25 and daily_dir)
+            is_news = intraday_ctx.get("setup") == "news_resolution"
+            counter_trend = strong_daily and daily_dir != itf_dir and not is_news
+            weak_rr = bool(rr) and rr < 1.0
+
+            if counter_trend or weak_rr:
+                bias = "лонг" if itf_dir == "up" else "шорт"
+                why = ("против сильного дневного тренда "
+                       f"(дн. {'вверх' if daily_dir=='up' else 'вниз'}, ADX {tech.adx})"
+                       if counter_trend else f"слабый R/R {rr}")
+                recommendation = f"⚪ Наблюдать — интрадей-{bias} {why}"
+                direction = "flat"
+                intraday_ctx = {**intraday_ctx, "observe": True, "signal": "observe"}
+            else:
+                direction = itf_dir
+                bias = "лонг" if direction == "up" else "шорт"
+                recommendation = f"🎯 Интрадей-вход ({bias}) — {intraday_ctx.get('note')}"
+                # уверенность из R/R сетапа; метрики согласуем с направлением,
+                # чтобы заголовок, P(рост) и score не противоречили друг другу
+                conf_i = max(0.3, min(0.7, rr / 3.0)) if rr else 0.4
+                confidence = round(conf_i, 3)
+                combined = conf_i if direction == "up" else -conf_i
+                # показываем ИМЕННО интрадей-план (а не дневной)
+                intraday_trade_plan = {
+                    "direction": "long" if direction == "up" else "short",
+                    "entry_low": plan.get("entry"), "entry_high": plan.get("entry"),
+                    "price": intraday_ctx.get("price"),
+                    "stop_loss": plan.get("stop_loss"),
+                    "take_profit_1": plan.get("take_profit"), "take_profit_2": None,
+                    "risk_reward": plan.get("risk_reward"), "current_rr": plan.get("risk_reward"),
+                    "entry_status": "enter",
+                    "entry_note": f"Интрадей: {intraday_ctx.get('note')}",
+                    "support": None, "resistance": None, "atr": intraday_ctx.get("atr"),
+                    "entry_rule": intraday_ctx.get("note") or "",
+                    "exit_rule": "Тайм-стоп к закрытию сессии; сопровождение по VWAP.",
+                }
 
     # ── 6. Обоснование ──────────────────────────────────────────────────────
     reasons: list[str] = []
@@ -354,6 +393,11 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         "disclaimer": DISCLAIMER,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
+
+    # Если вход ведёт интрадей-сетап — показываем его план как основной
+    # (иначе на карточке дневной план противоречил бы интрадей-заголовку).
+    if intraday_trade_plan:
+        result["trade_plan"] = intraday_trade_plan
 
     # ── 7. Сохраняем прогноз в БД (память агента) ───────────────────────────
     if save:
