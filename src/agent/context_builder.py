@@ -408,6 +408,44 @@ async def build_memory_context(ticker: str) -> str:
     return "\n".join(lines)
 
 
+async def build_knowledge_context(ticker: str) -> str:
+    """
+    Срез базы знаний (market_events) для Claude: свежая цена/стакан из Tinkoff,
+    нетто сделок трейдеров и последние сообщения из чатов/новостей/Пульса.
+    Это тот самый «поход в базу знаний» — единый контекст с историей.
+    """
+    try:
+        snap = await db.knowledge_snapshot(ticker, since_minutes=240)
+    except Exception:
+        return ""
+    msgs = snap.get("messages") or []
+    news = snap.get("news") or []
+    pulse = snap.get("pulse") or []
+    deals = snap.get("deals") or []
+    ob = snap.get("orderbook")
+    q = snap.get("quote")
+    if not (msgs or news or pulse or deals or ob or q):
+        return ""
+
+    lines = ["🧠 БАЗА ЗНАНИЙ (реальное время + история):"]
+    if q and q.get("payload"):
+        lines.append(f"  Цена (Tinkoff): {q['payload'].get('last')}")
+    if ob and ob.get("payload"):
+        p = ob["payload"]
+        lines.append(f"  Стакан: {p.get('pressure')} (bid/ask {p.get('bid_ask_ratio')})")
+    if deals:
+        buys = sum(1 for d in deals if (d.get("payload") or {}).get("action") == "buy")
+        sells = sum(1 for d in deals if (d.get("payload") or {}).get("action") == "sell")
+        lines.append(f"  Сделки трейдеров (Пульс): покупок {buys}, продаж {sells}")
+    for m in msgs[:3]:
+        lines.append(f"  💬 [{m.get('channel')}] {(m.get('text') or '')[:90]}")
+    for nz in news[:2]:
+        lines.append(f"  📰 [{nz.get('channel')}] {(nz.get('text') or '')[:90]}")
+    for pz in pulse[:2]:
+        lines.append(f"  📱 [{pz.get('channel')}] {(pz.get('text') or '')[:90]}")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
 async def build_lessons_context(ticker: str) -> str:
     """
     Уроки из разобранных ошибок (post-mortem): что уже приводило к провалам

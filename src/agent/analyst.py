@@ -25,7 +25,7 @@ from src.agent.claude_agent import ClaudeAgent
 from src.agent.context_builder import (
     build_ticker_context, build_price_context,
     build_memory_context, build_news_context, build_multiframe_context,
-    build_lessons_context,
+    build_lessons_context, build_knowledge_context,
 )
 from src.agent.chart_generator import generate_chart_b64
 from src.collector.tinkoff_client import TinkoffClient
@@ -120,12 +120,13 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
 
         # Параллельно: макро + фундаментал + память + мультитаймфрейм + уроки
         import asyncio
-        macro_ctx, fund_ctx, memory_ctx, multiframe_ctx, lessons_ctx = await asyncio.gather(
+        macro_ctx, fund_ctx, memory_ctx, multiframe_ctx, lessons_ctx, knowledge_ctx = await asyncio.gather(
             get_macro_context(),
             get_fundamentals(ticker),
             build_memory_context(ticker),
             build_multiframe_context(ticker),
             build_lessons_context(ticker),
+            build_knowledge_context(ticker),
             return_exceptions=True,
         )
         macro_ctx      = macro_ctx      if not isinstance(macro_ctx, Exception)      else {}
@@ -133,6 +134,7 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         memory_ctx     = memory_ctx     if not isinstance(memory_ctx, Exception)     else ""
         multiframe_ctx = multiframe_ctx if not isinstance(multiframe_ctx, Exception) else ""
         lessons_ctx    = lessons_ctx    if not isinstance(lessons_ctx, Exception)    else ""
+        knowledge_ctx  = knowledge_ctx  if not isinstance(knowledge_ctx, Exception)  else ""
 
         # Интрадей-контекст (VWAP, диапазон открытия, волатильность, вынос) —
         # именно он ведёт внутридневное решение; дневная техника выше остаётся
@@ -209,6 +211,7 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
             smart_money_context=smart_money_ctx,
             lessons_context=lessons_ctx or None,
             intraday_context=(intraday_ctx or {}).get("summary") if intraday_ctx else None,
+            knowledge_context=knowledge_ctx or None,
             momentum=sentiment_block.get("momentum") if sentiment_block else None,
             momentum_label=sentiment_block.get("momentum_label") if sentiment_block else None,
             source_diversity=sentiment_block.get("source_diversity") if sentiment_block else None,

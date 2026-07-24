@@ -30,6 +30,7 @@ from src.nlp.ticker_extractor import extract_tickers, is_market_related
 from src.aggregator.aggregator import SentimentAggregator
 from src.api.main import app, aggregator as api_aggregator, connected_websockets, analyzer as api_analyzer, set_collector
 from config.settings import TELEGRAM_CHANNELS, TELEGRAM_API_ID, TELEGRAM_API_HASH
+from src import db
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,7 +75,7 @@ async def process_message(msg, analyzer: SentimentAnalyzer):
     else:
         sentiment = keyword_sentiment(msg.text)
 
-    # Добавляем точку в агрегатор для каждого упомянутого тикера
+    # Добавляем точку в агрегатор + пишем в базу знаний (история для Claude)
     for ticker in tickers:
         api_aggregator.add_point(
             ticker=ticker,
@@ -85,6 +86,12 @@ async def process_message(msg, analyzer: SentimentAnalyzer):
             text=msg.text,
             timestamp=msg.timestamp,
         )
+        await db.add_event({
+            "source": "telegram", "kind": "message", "ticker": ticker,
+            "channel": msg.channel, "text": msg.text,
+            "label": sentiment.label, "score": sentiment.score,
+            "signal": sentiment.signal, "ts": msg.timestamp,
+        })
 
     stats["messages_processed"] += 1
     stats["tickers_found"] += len(tickers)
@@ -215,6 +222,12 @@ async def pulse_pipeline():
                     text=post.text,
                     timestamp=post.timestamp,
                 )
+                await db.add_event({
+                    "source": "pulse", "kind": "message", "ticker": ticker,
+                    "channel": getattr(post, "author", "") or "pulse", "text": post.text,
+                    "label": sentiment.label, "score": sentiment.score,
+                    "signal": sentiment.signal, "ts": post.timestamp,
+                })
             stats["messages_processed"] += 1
         except Exception as e:
             logger.error(f"Ошибка обработки Пульса: {e}")
@@ -244,9 +257,85 @@ async def rss_pipeline():
                     text=item.full_text[:200],
                     timestamp=item.timestamp,
                 )
+                await db.add_event({
+                    "source": "rss", "kind": "news", "ticker": ticker,
+                    "channel": item.source, "text": item.full_text[:500],
+                    "label": sentiment.label, "score": sentiment.score,
+                    "signal": max(-1, min(1, weighted_signal)), "ts": item.timestamp,
+                })
             stats["messages_processed"] += 1
         except Exception as e:
             logger.error(f"Ошибка обработки RSS: {e}")
+
+
+async def market_snapshot_pipeline():
+    """
+    Периодически наполняет базу знаний рыночными снимками:
+    Tinkoff (стакан/поток/цена) + реальные сделки трейдеров Пульса.
+    Всё пишется в market_events с меткой времени (реалтайм + история для Claude).
+    """
+    from config.settings import TINKOFF_TOKEN, MOEX_TICKERS
+    await db.setup_db()
+    watch = list(MOEX_TICKERS.keys())[:8]
+    tk = None
+    if TINKOFF_TOKEN:
+        from src.collector.tinkoff_client import TinkoffClient
+        tk = TinkoffClient()
+        logger.info("🧠 База знаний: снимки Tinkoff включены")
+    else:
+        logger.info("🧠 База знаний: TINKOFF_TOKEN не задан — стакан/цены Tinkoff недоступны")
+
+    seen_deals: set = set()
+    cycle = 0
+    while True:
+        cycle += 1
+        try:
+            if tk:
+                for t in watch:
+                    try:
+                        snap = await tk.get_full_snapshot(t)
+                    except Exception:
+                        continue
+                    ts = datetime.now(timezone.utc)
+                    if snap.get("orderbook"):
+                        await db.add_event({"source": "tinkoff", "kind": "orderbook",
+                                            "ticker": t, "payload": snap["orderbook"], "ts": ts})
+                    if snap.get("trades"):
+                        await db.add_event({"source": "tinkoff", "kind": "trades",
+                                            "ticker": t, "payload": snap["trades"], "ts": ts})
+                    c = snap.get("candles")
+                    if c and c.get("close"):
+                        await db.add_event({"source": "tinkoff", "kind": "quote", "ticker": t,
+                                            "payload": {"last": c["close"][-1],
+                                                        "volume": (c.get("volume") or [None])[-1]}, "ts": ts})
+                    await asyncio.sleep(0.2)
+
+            # Реальные сделки трейдеров Пульса («умные деньги»)
+            try:
+                from src.api.main import _smart_money_snapshot
+                snap = await _smart_money_snapshot(ttl=0)
+                for d in (snap.get("deals") or [])[:80]:
+                    sig = f"{d.get('author')}|{d.get('ticker')}|{d.get('action')}|{d.get('timestamp')}|{d.get('price')}"
+                    if sig in seen_deals:
+                        continue
+                    seen_deals.add(sig)
+                    await db.add_event({
+                        "source": "pulse_deal", "kind": "deal", "ticker": d.get("ticker"),
+                        "channel": d.get("author"), "payload": d,
+                        "text": f"{d.get('author')} {d.get('action')} {d.get('ticker')}"
+                                f"{(' @ ' + str(d.get('price'))) if d.get('price') else ''}",
+                    })
+                if len(seen_deals) > 5000:
+                    seen_deals.clear()
+            except Exception as e:
+                logger.debug(f"pulse deals snapshot: {e}")
+
+            # Ретеншн: раз в ~50 циклов чистим старше 14 дней
+            if cycle % 50 == 1:
+                await db.prune_events(keep_days=14)
+        except Exception as e:
+            logger.debug(f"market snapshot: {e}")
+        await asyncio.sleep(90)
 
 
 async def run():
@@ -280,6 +369,7 @@ async def run():
         _safe("telegram", telegram_pipeline()),
         _safe("pulse", pulse_pipeline()),
         _safe("rss", rss_pipeline()),
+        _safe("market", market_snapshot_pipeline()),
     )
 
 

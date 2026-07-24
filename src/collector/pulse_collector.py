@@ -82,10 +82,15 @@ class PulseCollector:
                 headers=HEADERS,
                 timeout=10,
             )
-            if resp.status_code != 200:
+            # Пульс иногда отдаёт 202 (принято/софт-лимит) — тоже пробуем распарсить.
+            if resp.status_code not in (200, 202):
+                logger.debug(f"Pulse {ticker}: HTTP {resp.status_code}")
                 return []
-
-            data = resp.json()
+            try:
+                data = resp.json()
+            except Exception:
+                # 202 без тела — данных нет (частый софт-блок/гео); не шумим
+                return []
             posts = data.get("payload", {}).get("items", [])
             result = []
 

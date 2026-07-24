@@ -246,6 +246,30 @@ header {
 
     </div>
 
+    <!-- База знаний: живая лента всех данных с метками времени -->
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+        <div class="card-title">🧠 База знаний · живая лента</div>
+        <div style="display:flex;gap:6px;align-items:center;">
+          <input class="ch-input" id="feedTicker" placeholder="Тикер (пусто = все)" style="width:150px;" onkeydown="if(event.key==='Enter') loadFeed()">
+          <select id="feedSource" onchange="loadFeed()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;font-size:12px;padding:4px 6px;">
+            <option value="">все источники</option>
+            <option value="telegram">💬 чаты</option>
+            <option value="pulse">📱 Пульс</option>
+            <option value="rss">📰 новости</option>
+            <option value="pulse_deal">💼 сделки</option>
+            <option value="tinkoff">📊 Tinkoff</option>
+          </select>
+          <button class="btn btn-ghost" onclick="loadFeed()">↻</button>
+        </div>
+      </div>
+      <div style="font-size:11px;color:var(--dim);margin:2px 0 6px;">Всё, что видит система, с отметкой времени. Отсюда же Claude берёт контекст.</div>
+      <div id="feedSources" style="font-size:11px;color:var(--dim);margin:6px 0;"></div>
+      <div id="feedList" style="max-height:420px;overflow:auto;font-size:12px;">
+        <div style="color:var(--dim);">Загрузка ленты...</div>
+      </div>
+    </div>
+
     <!-- Нижняя строка: Тикеры -->
     <div class="card market-bottom tickers-card">
       <div class="card-title" style="margin-bottom:10px;">Тикеры · Индексы настроения</div>
@@ -640,11 +664,82 @@ function switchTab(name, el) {
   document.querySelectorAll('.content').forEach(c => c.classList.remove('active'));
   el.classList.add('active');
   document.getElementById('tab-' + name).classList.add('active');
+  // Лента базы знаний живёт только пока открыта вкладка «Рынок»
+  if (feedPoll) { clearInterval(feedPoll); feedPoll = null; }
+  if (name === 'market') { loadFeed(); feedPoll = setInterval(loadFeed, 10000); }
   if (name === 'channels') loadChannels();
   if (name === 'signals') loadSignals();
   if (name === 'live') { loadLiveSignals(); loadTrackedTraders(); }
   if (name === 'track') loadTrackRecord();
   if (name === 'strategy') { refreshBackfill(); if (!window._btLoaded) { window._btLoaded=true; runBacktest(); } }
+}
+
+// ── База знаний: живая лента ─────────────────────────────────────────────────
+let feedPoll = null;
+async function loadFeed() {
+  const ticker = (document.getElementById('feedTicker')?.value || '').trim().toUpperCase();
+  const source = document.getElementById('feedSource')?.value || '';
+  try {
+    const qs = new URLSearchParams({ limit: '120', minutes: '720' });
+    if (ticker) qs.set('ticker', ticker);
+    if (source) qs.set('source', source);
+    const [fd, sd] = await Promise.all([
+      fetch(`${API}/api/feed?${qs}`).then(r => r.json()),
+      fetch(`${API}/api/feed/sources?minutes=60`).then(r => r.json()),
+    ]);
+    renderFeedSources(sd);
+    renderFeed(fd.events || []);
+  } catch (e) {
+    const box = document.getElementById('feedList');
+    if (box) box.innerHTML = `<div style="color:var(--red)">Ошибка ленты: ${e.message}</div>`;
+  }
+}
+function renderFeedSources(sd) {
+  const el = document.getElementById('feedSources'); if (!el) return;
+  const c = (sd && sd.counts) || {};
+  const map = { telegram: '💬 чаты', pulse: '📱 Пульс', rss: '📰 новости', pulse_deal: '💼 сделки', tinkoff: '📊 Tinkoff' };
+  const parts = Object.keys(map).map(k => {
+    const n = c[k] || 0; const col = n > 0 ? 'var(--green)' : 'var(--dim)';
+    return `<span style="margin-right:12px;color:${col}">${map[k]}: <b>${n}</b></span>`;
+  });
+  el.innerHTML = `За 60 мин: ${parts.join('')} · всего <b>${(sd && sd.total) || 0}</b>`;
+}
+function _feedBadge(s) {
+  const m = { telegram: ['💬', '#58a6ff'], pulse: ['📱', '#d29922'], rss: ['📰', '#8b949e'], pulse_deal: ['💼', '#a371f7'], tinkoff: ['📊', '#3fb950'] };
+  const v = m[s] || ['•', 'var(--dim)'];
+  return `<span style="color:${v[1]}">${v[0]} ${s}</span>`;
+}
+function _feedText(e) {
+  const p = e.payload || {};
+  if (e.source === 'tinkoff') {
+    if (e.kind === 'orderbook') return `стакан: ${p.pressure || ''} (bid/ask ${p.bid_ask_ratio ?? '—'})`;
+    if (e.kind === 'quote') return `цена <b>${p.last ?? '—'}</b>${p.volume ? (' · V ' + p.volume) : ''}`;
+    if (e.kind === 'trades') return `поток: ${p.order_flow || ''} (buy ${p.buy_pct ?? '—'}%)`;
+    return e.kind;
+  }
+  if (e.source === 'pulse_deal') {
+    const act = p.action === 'buy' ? '<span style="color:var(--green)">КУПИЛ</span>' : '<span style="color:var(--red)">ПРОДАЛ</span>';
+    return `${act} ${e.ticker || ''}${p.price ? (' @ ' + p.price) : ''}`;
+  }
+  const lbl = e.label ? ` <span style="color:${e.signal > 0 ? 'var(--green)' : e.signal < 0 ? 'var(--red)' : 'var(--dim)'}">[${e.label}]</span>` : '';
+  return `${(e.text || '').slice(0, 160)}${lbl}`;
+}
+function renderFeed(events) {
+  const box = document.getElementById('feedList'); if (!box) return;
+  if (!events.length) {
+    box.innerHTML = '<div style="color:var(--dim)">Пока нет событий. База наполняется в реальном времени из чатов/новостей/Пульса/Tinkoff — если пусто, значит поток не идёт (проверь источники выше).</div>';
+    return;
+  }
+  box.innerHTML = events.map(e => {
+    const t = e.ts ? new Date(e.ts).toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '';
+    const tk = e.ticker ? `<b>${e.ticker}</b> ` : '';
+    const ch = e.channel ? ` <span style="color:var(--dim);font-size:11px;">· ${e.channel}</span>` : '';
+    return `<div style="display:grid;grid-template-columns:60px 96px 1fr;gap:8px;padding:3px 4px;border-bottom:1px solid var(--border);align-items:baseline;">
+      <span style="color:var(--dim)">${t}</span>
+      <span>${_feedBadge(e.source)}</span>
+      <span>${tk}${_feedText(e)}${ch}</span>
+    </div>`;
+  }).join('');
 }
 
 // ── Стратегия / Бэктест ─────────────────────────────────────────────────────
@@ -2169,6 +2264,8 @@ setTimeout(resizeChart, 100);
 connect();
 loadGeo(); setInterval(loadGeo, 15000);
 loadSignals(); setInterval(loadSignals, 60000);
+// Рынок открыт по умолчанию — сразу запускаем живую ленту базы знаний
+loadFeed(); feedPoll = setInterval(loadFeed, 10000);
 </script>
 </body>
 </html>

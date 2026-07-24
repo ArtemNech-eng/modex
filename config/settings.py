@@ -103,6 +103,10 @@ INTRADAY_OPENING_RANGE_BARS = int(os.getenv("INTRADAY_OPENING_RANGE_BARS", "6"))
 SCAN_MIN_INTEREST = float(os.getenv("SCAN_MIN_INTEREST", "0.5"))   # порог «интересности» [0..1]
 SCAN_MAX_CLAUDE = int(os.getenv("SCAN_MAX_CLAUDE", "6"))            # макс. вызовов Claude за цикл
 
+# Демо-данные (фейковые сообщения) на старте — только для локальной проверки без
+# источников. В проде держать выключенным, иначе «Рынок» показывает выдумку.
+DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() == "true"
+
 # ─── Тикеры Мосбиржи (ТОП-50 IMOEX) ───────────────────────────────────────────
 MOEX_TICKERS = {
     "SBER": "Сбербанк",

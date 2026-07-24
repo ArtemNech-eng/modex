@@ -109,8 +109,12 @@ async def startup():
     # Готовим БД и переносим старые каналы из JSON (если были)
     await db.setup_db()
 
-    # Наполняем демо-данными для тестирования
-    _fill_demo_data()
+    # Демо-данные только если явно включено (DEMO_MODE) — иначе «Рынок» честно
+    # показывает реальные источники, а не выдуманные сообщения.
+    from config.settings import DEMO_MODE
+    if DEMO_MODE:
+        _fill_demo_data()
+        logger.info("🧪 DEMO_MODE: агрегатор наполнен демо-данными")
     logger.info("✅ MOODEX API готов")
 
 
@@ -269,6 +273,37 @@ async def get_anomalies():
 async def get_stats():
     """Статистика работы агрегатора"""
     return aggregator.get_stats()
+
+
+# ─── База знаний (реальное время + история) ───────────────────────────────────
+
+@app.get("/api/feed", summary="Лента базы знаний (события с метками времени)")
+async def get_feed(ticker: Optional[str] = None, source: Optional[str] = None,
+                   kind: Optional[str] = None, minutes: Optional[int] = None,
+                   limit: int = 200):
+    """
+    Единая лента данных для дашборда «Рынок» и Claude: сообщения из чатов,
+    новости, Пульс, сделки трейдеров и снимки Tinkoff (стакан/цена/поток).
+    Фильтры: ticker, source (telegram|pulse|rss|pulse_deal|tinkoff), kind, minutes.
+    """
+    events = await db.recent_events(ticker=ticker, source=source, kind=kind,
+                                    since_minutes=minutes, limit=limit)
+    return {"events": events, "count": len(events)}
+
+
+@app.get("/api/feed/sources", summary="Активность источников базы знаний")
+async def get_feed_sources(minutes: int = 60):
+    """Сколько событий по каждому источнику за последние N минут (панель «Источники»)."""
+    return await db.event_source_stats(since_minutes=minutes)
+
+
+@app.get("/api/knowledge/{ticker}", summary="Срез базы знаний по тикеру (для Claude)")
+async def get_knowledge(ticker: str, minutes: int = 240):
+    """
+    Компактный срез знаний по тикеру: последние сообщения/новости/Пульс/сделки +
+    последний стакан/цена/поток Tinkoff. Именно это Claude берёт как контекст.
+    """
+    return await db.knowledge_snapshot(ticker.upper(), since_minutes=minutes)
 
 
 # ─── Управление каналами ──────────────────────────────────────────────────────

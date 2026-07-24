@@ -15,7 +15,7 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from sqlalchemy import String, Integer, Float, Boolean, DateTime, select, delete
+from sqlalchemy import String, Integer, Float, Boolean, DateTime, Text, select, delete
 from sqlalchemy.ext.asyncio import (
     create_async_engine, async_sessionmaker, AsyncSession,
 )
@@ -176,6 +176,54 @@ class SentimentDaily(Base):
     sentiment_index: Mapped[float] = mapped_column(Float, default=50.0)
     avg_signal: Mapped[float] = mapped_column(Float, default=0.0)
     msg_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class MarketEvent(Base):
+    """
+    Единое событие «базы знаний» для Claude: любое входящее данное с меткой
+    времени — сообщение из чата, новость, пост/сделка Пульса, снимок стакана /
+    цены / потока сделок Tinkoff. Реальное время + история в одном месте.
+
+    Claude (и дашборд «Рынок») читают отсюда: по тикеру/источнику/времени.
+    """
+    __tablename__ = "market_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), index=True,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    source: Mapped[str] = mapped_column(String(24), index=True)  # telegram|pulse|rss|pulse_deal|tinkoff
+    kind: Mapped[str] = mapped_column(String(24), default="message")  # message|news|deal|orderbook|quote|trades
+    ticker: Mapped[Optional[str]] = mapped_column(String(32), index=True, nullable=True)
+    channel: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)  # канал/автор/источник
+    text: Mapped[Optional[str]] = mapped_column(String(2000), nullable=True)
+    label: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    signal: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    payload: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON для структурных данных
+
+    def to_dict(self) -> dict:
+        import json as _json
+        pl = None
+        if self.payload:
+            try:
+                pl = _json.loads(self.payload)
+            except Exception:
+                pl = None
+        return {
+            "id": self.id,
+            "ts": self.ts.isoformat() if self.ts else None,
+            "source": self.source,
+            "kind": self.kind,
+            "ticker": self.ticker,
+            "channel": self.channel,
+            "text": self.text,
+            "label": self.label,
+            "score": round(self.score, 3) if self.score is not None else None,
+            "signal": round(self.signal, 3) if self.signal is not None else None,
+            "payload": pl,
+        }
 
 
 def _ensure_sqlite_dir():
@@ -662,3 +710,132 @@ async def sentiment_history_days() -> int:
     async with async_session() as session:
         result = await session.execute(select(SentimentDaily.date).distinct())
         return len(result.all())
+
+
+# ─── База знаний: события рынка (реальное время + история) ────────────────────
+
+async def add_event(ev: dict) -> None:
+    """
+    Записать одно событие в базу знаний. Поля: source, kind, ticker, channel,
+    text, label, score, signal, payload(dict), ts(datetime, необязательно).
+    Пишем «мягко»: любые ошибки не должны ронять пайплайн сбора.
+    """
+    try:
+        payload = ev.get("payload")
+        payload_json = json.dumps(payload, ensure_ascii=False) if payload is not None else None
+        async with async_session() as session:
+            session.add(MarketEvent(
+                ts=ev.get("ts") or datetime.now(timezone.utc),
+                source=ev.get("source", "unknown"),
+                kind=ev.get("kind", "message"),
+                ticker=(ev.get("ticker") or None),
+                channel=ev.get("channel"),
+                text=(ev.get("text") or "")[:2000] or None,
+                label=ev.get("label"),
+                score=ev.get("score"),
+                signal=ev.get("signal"),
+                payload=payload_json,
+            ))
+            await session.commit()
+    except Exception as e:
+        logger.debug(f"add_event failed: {e}")
+
+
+async def add_events(evs: list[dict]) -> int:
+    """Массовая запись событий (например, снимок сделок/стакана). Возвращает число."""
+    n = 0
+    try:
+        async with async_session() as session:
+            for ev in evs:
+                payload = ev.get("payload")
+                payload_json = json.dumps(payload, ensure_ascii=False) if payload is not None else None
+                session.add(MarketEvent(
+                    ts=ev.get("ts") or datetime.now(timezone.utc),
+                    source=ev.get("source", "unknown"),
+                    kind=ev.get("kind", "message"),
+                    ticker=(ev.get("ticker") or None),
+                    channel=ev.get("channel"),
+                    text=(ev.get("text") or "")[:2000] or None,
+                    label=ev.get("label"),
+                    score=ev.get("score"),
+                    signal=ev.get("signal"),
+                    payload=payload_json,
+                ))
+                n += 1
+            await session.commit()
+    except Exception as e:
+        logger.debug(f"add_events failed: {e}")
+    return n
+
+
+async def recent_events(ticker: Optional[str] = None, source: Optional[str] = None,
+                        kind: Optional[str] = None, since_minutes: Optional[int] = None,
+                        limit: int = 200) -> list[dict]:
+    """Последние события базы знаний с фильтрами (для дашборда и Claude)."""
+    async with async_session() as session:
+        stmt = select(MarketEvent).order_by(MarketEvent.ts.desc()).limit(min(limit, 1000))
+        if ticker:
+            stmt = stmt.where(MarketEvent.ticker == ticker.upper())
+        if source:
+            stmt = stmt.where(MarketEvent.source == source)
+        if kind:
+            stmt = stmt.where(MarketEvent.kind == kind)
+        if since_minutes:
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
+            stmt = stmt.where(MarketEvent.ts >= cutoff)
+        result = await session.execute(stmt)
+        return [e.to_dict() for e in result.scalars().all()]
+
+
+async def event_source_stats(since_minutes: int = 60) -> dict:
+    """Сколько событий по каждому источнику за последние N минут (панель источников)."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
+    async with async_session() as session:
+        result = await session.execute(
+            select(MarketEvent.source).where(MarketEvent.ts >= cutoff)
+        )
+        counts: dict[str, int] = {}
+        for (src,) in result.all():
+            counts[src] = counts.get(src, 0) + 1
+        return {"since_minutes": since_minutes, "counts": counts,
+                "total": sum(counts.values())}
+
+
+async def knowledge_snapshot(ticker: str, since_minutes: int = 240,
+                             per_kind: int = 8) -> dict:
+    """
+    Компактный срез базы знаний по тикеру для Claude: последние сообщения из
+    чатов, новости, посты/сделки Пульса и последние снимки Tinkoff (стакан/цена).
+    """
+    ticker = ticker.upper()
+    events = await recent_events(ticker=ticker, since_minutes=since_minutes, limit=400)
+    buckets = {"messages": [], "news": [], "pulse": [], "deals": [],
+               "orderbook": None, "quote": None, "trades": None}
+    for e in events:
+        if e["source"] == "telegram" and len(buckets["messages"]) < per_kind:
+            buckets["messages"].append(e)
+        elif e["source"] == "rss" and len(buckets["news"]) < per_kind:
+            buckets["news"].append(e)
+        elif e["source"] == "pulse" and len(buckets["pulse"]) < per_kind:
+            buckets["pulse"].append(e)
+        elif e["source"] == "pulse_deal" and len(buckets["deals"]) < per_kind:
+            buckets["deals"].append(e)
+        elif e["source"] == "tinkoff":
+            if e["kind"] == "orderbook" and buckets["orderbook"] is None:
+                buckets["orderbook"] = e
+            elif e["kind"] == "quote" and buckets["quote"] is None:
+                buckets["quote"] = e
+            elif e["kind"] == "trades" and buckets["trades"] is None:
+                buckets["trades"] = e
+    buckets["ticker"] = ticker
+    buckets["event_count"] = len(events)
+    return buckets
+
+
+async def prune_events(keep_days: int = 14) -> int:
+    """Удалить события старше keep_days (ограничиваем рост базы). Возвращает rowcount."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
+    async with async_session() as session:
+        result = await session.execute(delete(MarketEvent).where(MarketEvent.ts < cutoff))
+        await session.commit()
+        return result.rowcount or 0

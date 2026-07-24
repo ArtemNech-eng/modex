@@ -256,6 +256,7 @@ class ClaudeAgent:
         smart_money_context: Optional[str] = None,
         lessons_context: Optional[str] = None,
         intraday_context: Optional[str] = None,
+        knowledge_context: Optional[str] = None,
         momentum: Optional[float] = None,
         momentum_label: Optional[str] = None,
         source_diversity: Optional[float] = None,
@@ -306,6 +307,7 @@ class ClaudeAgent:
 {_block(price_context)}
 {_block(tinkoff_context)}
 {_block(smart_money_context)}
+{_block(knowledge_context)}
 {_block(intraday_context)}
 {_block(historical_context)}
 {_block(memory_context)}
