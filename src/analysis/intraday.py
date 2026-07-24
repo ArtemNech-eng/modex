@@ -290,3 +290,28 @@ def _plan(signal: str, entry: float, stop: float, target: float,
         "risk_reward": rr,
         "reason": reason,
     }
+
+
+# ─── Настроение из стакана и потока сделок («реальные деньги») ─────────────────
+
+def orderbook_sentiment(bid_ask_ratio: Optional[float],
+                        buy_pct: Optional[float] = None) -> dict:
+    """
+    Перевести перекос стакана (bid/ask) и поток сделок (доля покупок) в сигнал
+    настроения [-1..1]. Это «настроение реальных денег» — можно подавать в
+    агрегатор наравне с настроением из чатов.
+
+    bid_ask_ratio: суммарный объём заявок bid / ask (>1 — доминируют покупатели).
+    buy_pct:       доля агрессивных покупок в потоке сделок (0..100), необязательно.
+    """
+    import math
+    parts = []
+    if bid_ask_ratio and bid_ask_ratio > 0:
+        parts.append(math.tanh(math.log(bid_ask_ratio)))  # r=1→0, растёт/падает симметрично
+    if buy_pct is not None:
+        parts.append(max(-1.0, min(1.0, (buy_pct - 50.0) / 50.0)))
+    if not parts:
+        return {"signal": 0.0, "label": "neutral", "score": 0.0}
+    signal = max(-1.0, min(1.0, sum(parts) / len(parts)))
+    label = "positive" if signal > 0.15 else "negative" if signal < -0.15 else "neutral"
+    return {"signal": round(signal, 3), "label": label, "score": round(abs(signal), 3)}

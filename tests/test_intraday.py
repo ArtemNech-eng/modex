@@ -97,6 +97,20 @@ def test_session_phase_and_last_minutes():
     assert iv.is_last_minutes(hm(10, 30)) is False
 
 
+def test_orderbook_sentiment():
+    # покупатели доминируют (bid/ask 2, поток 70% buy) -> позитив
+    r = iv.orderbook_sentiment(2.0, 70.0)
+    assert r["signal"] > 0.15 and r["label"] == "positive"
+    # продавцы доминируют
+    r = iv.orderbook_sentiment(0.5, 30.0)
+    assert r["signal"] < -0.15 and r["label"] == "negative"
+    # баланс
+    r = iv.orderbook_sentiment(1.0, 50.0)
+    assert r["label"] == "neutral"
+    # нет данных
+    assert iv.orderbook_sentiment(None, None)["signal"] == 0.0
+
+
 if __name__ == "__main__":
     passed = 0
     for name, fn in sorted(globals().items()):

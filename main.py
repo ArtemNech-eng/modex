@@ -331,6 +331,20 @@ async def market_snapshot_pipeline():
                         await db.add_event({"source": "tinkoff", "kind": "trades",
                                             "ticker": t, "payload": tr, "ts": ts})
                         written["trades"] += 1
+                    # «Настроение реальных денег» из стакана+потока → в агрегатор,
+                    # чтобы индекс рынка и сетка тикеров жили даже без чатов/Пульса.
+                    if ob or tr:
+                        from src.analysis.intraday import orderbook_sentiment
+                        sent = orderbook_sentiment(
+                            ob.get("bid_ask_ratio") if ob else None,
+                            tr.get("buy_pct") if tr else None)
+                        api_aggregator.add_point(
+                            ticker=t, signal=sent["signal"], label=sent["label"],
+                            score=max(0.5, sent["score"]), channel="orderbook",
+                            text=f"стакан: {ob.get('pressure') if ob else '—'} · "
+                                 f"поток: {tr.get('order_flow') if tr else '—'}",
+                            timestamp=ts,
+                        )
                     await asyncio.sleep(0.4)   # бережём лимиты Tinkoff
 
             # Сделки трейдеров Пульса — реже (Пульс часто блокируется в РФ),
