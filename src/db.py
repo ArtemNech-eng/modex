@@ -56,6 +56,37 @@ class Channel(Base):
         }
 
 
+class TrackedTrader(Base):
+    """
+    Трейдер Пульса, чьи РЕАЛЬНЫЕ сделки мы отслеживаем («умные деньги»).
+
+    Раньше список отслеживаемых трейдеров жил только в поле ввода дашборда
+    (и в PULSE_TRACKED_AUTHORS из .env), поэтому после перезагрузки страницы
+    и редеплоя терялся. Теперь он хранится здесь и переживает перезапуски.
+    """
+    __tablename__ = "tracked_traders"
+
+    nickname: Mapped[str] = mapped_column(String(255), primary_key=True)
+    title: Mapped[str] = mapped_column(String(512), default="")
+    source: Mapped[str] = mapped_column(String(32), default="pulse")  # config | manual
+    status: Mapped[str] = mapped_column(String(32), default="active")
+    note: Mapped[str] = mapped_column(String(1024), default="")
+    added_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    def to_dict(self) -> dict:
+        return {
+            "nickname": self.nickname,
+            "title": self.title,
+            "source": self.source,
+            "status": self.status,
+            "note": self.note,
+            "added_at": self.added_at.isoformat() if self.added_at else None,
+        }
+
+
 class Prediction(Base):
     """
     Прогноз AI-агента по тикеру — «память» системы.
@@ -216,6 +247,13 @@ async def setup_db():
             return
         await init_db()
         await migrate_from_json()
+        # При первом запуске наполняем список трейдеров ников из конфига,
+        # дальше он живёт в БД и редактируется через дашборд.
+        try:
+            from config.settings import PULSE_TRACKED_AUTHORS
+            await seed_tracked_traders(PULSE_TRACKED_AUTHORS)
+        except Exception as e:
+            logger.warning(f"Не удалось засеять трейдеров из конфига: {e}")
         _setup_done = True
 
 
@@ -265,6 +303,78 @@ async def delete_channel(username: str) -> bool:
         )
         await session.commit()
         return result.rowcount > 0
+
+
+# ─── CRUD по отслеживаемым трейдерам («умные деньги») ─────────────────────────
+
+async def list_tracked_traders() -> list[dict]:
+    """Все сохранённые трейдеры (по времени добавления)."""
+    async with async_session() as session:
+        result = await session.execute(
+            select(TrackedTrader).order_by(TrackedTrader.added_at)
+        )
+        return [t.to_dict() for t in result.scalars().all()]
+
+
+async def get_tracked_trader_nicks() -> list[str]:
+    """Только ники сохранённых трейдеров."""
+    async with async_session() as session:
+        result = await session.execute(
+            select(TrackedTrader.nickname).order_by(TrackedTrader.added_at)
+        )
+        return [row[0] for row in result.all()]
+
+
+async def trader_exists(nickname: str) -> bool:
+    async with async_session() as session:
+        result = await session.execute(
+            select(TrackedTrader.nickname).where(TrackedTrader.nickname == nickname)
+        )
+        return result.first() is not None
+
+
+async def upsert_tracked_trader(info: dict) -> None:
+    """Добавить или обновить отслеживаемого трейдера."""
+    async with async_session() as session:
+        await session.merge(TrackedTrader(
+            nickname=info["nickname"],
+            title=info.get("title", ""),
+            source=info.get("source", "pulse"),
+            status=info.get("status", "active"),
+            note=info.get("note", ""),
+        ))
+        await session.commit()
+
+
+async def delete_tracked_trader(nickname: str) -> bool:
+    """Удалить трейдера из отслеживания. True, если что-то удалилось."""
+    async with async_session() as session:
+        result = await session.execute(
+            delete(TrackedTrader).where(TrackedTrader.nickname == nickname)
+        )
+        await session.commit()
+        return result.rowcount > 0
+
+
+async def seed_tracked_traders(nicknames: list[str]) -> int:
+    """
+    Одноразовый посев: если таблица трейдеров пуста, наполнить её ников из
+    конфига (PULSE_TRACKED_AUTHORS). Возвращает число добавленных.
+    """
+    if await get_tracked_trader_nicks():
+        return 0
+    added = 0
+    async with async_session() as session:
+        for nick in nicknames:
+            nick = (nick or "").strip()
+            if not nick:
+                continue
+            await session.merge(TrackedTrader(nickname=nick, source="config"))
+            added += 1
+        await session.commit()
+    if added:
+        logger.info(f"🌱 Посев отслеживаемых трейдеров из конфига: {added}")
+    return added
 
 
 # ─── Прогнозы (память агента) ─────────────────────────────────────────────────
