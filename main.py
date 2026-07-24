@@ -17,6 +17,7 @@ import logging
 import signal
 import sys
 import os
+from datetime import datetime, timezone
 
 # Чтобы импорты работали из корня проекта
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -31,6 +32,7 @@ from src.aggregator.aggregator import SentimentAggregator
 from src.api.main import app, aggregator as api_aggregator, connected_websockets, analyzer as api_analyzer, set_collector
 from config.settings import TELEGRAM_CHANNELS, TELEGRAM_API_ID, TELEGRAM_API_HASH
 from src import db
+from src.analysis import geopolitics as geo
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,6 +50,22 @@ stats = {
 }
 
 
+async def _ingest_geopolitics(text, channel, timestamp):
+    """
+    Прогнать входящий текст через геополитический скоринг и, если есть сигнал,
+    записать его в базу знаний отдельной категорией (source="geopolitics").
+    Фон рынка рыночно-широкий (ticker=None). Вызывается ДО тикер-фильтра, т.к.
+    новость про санкции/переговоры может не содержать тикера. Ошибки глушим —
+    сбор данных не должен падать из-за геомодуля.
+    """
+    try:
+        ev = geo.ingest_event(text or "", channel=channel or "", timestamp=timestamp)
+        if ev:
+            await db.add_event(ev)
+    except Exception as e:
+        logger.debug(f"geo ingest failed: {e}")
+
+
 async def process_message(msg, analyzer: SentimentAnalyzer):
     """
     Обработать одно сообщение:
@@ -58,6 +76,11 @@ async def process_message(msg, analyzer: SentimentAnalyzer):
     5. Если аномалия — broadcast алерт через WebSocket
     """
     stats["messages_received"] += 1
+
+    # Геополитический фон: скорим ДО тикер/рыночного фильтра — санкции, переговоры,
+    # ставка ЦБ и т.п. могут не содержать тикера, но важны Claude как фон рынка.
+    await _ingest_geopolitics(msg.text, getattr(msg, "channel", ""),
+                              getattr(msg, "timestamp", None))
 
     # Пропускаем нерыночные сообщения (экономим GPU/CPU)
     if not is_market_related(msg.text):
@@ -208,6 +231,8 @@ async def pulse_pipeline():
 
     async for post in pulse.listen():
         try:
+            await _ingest_geopolitics(post.text, getattr(post, "author", "") or "pulse",
+                                      getattr(post, "timestamp", None))
             tickers = [post.ticker] if post.ticker else extract_tickers(post.text)
             if not tickers:
                 continue
@@ -242,6 +267,8 @@ async def rss_pipeline():
     seen_news: set = set()
     async for item in rss.listen():
         try:
+            await _ingest_geopolitics(item.full_text, getattr(item, "source", "") or "rss",
+                                      getattr(item, "timestamp", None))
             tickers = extract_tickers(item.full_text)
             if not tickers:
                 continue

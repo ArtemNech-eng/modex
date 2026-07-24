@@ -111,3 +111,37 @@ class GeopoliticsMonitor:
 
 # Глобальный синглтон — наполняется из пайплайнов новостей/сообщений
 MONITOR = GeopoliticsMonitor()
+
+
+def ingest_event(text: str, channel: str = "",
+                 timestamp: datetime | None = None) -> dict | None:
+    """
+    Прогнать текст через геополитический скоринг. Если геосигнал есть:
+      1) обновить скользящий монитор MONITOR (для «Геофона» и score в промпте),
+      2) вернуть готовое событие для записи в базу знаний отдельной категорией
+         (market_events, source="geopolitics", ticker=None — это фон рынка).
+    Если сигнала нет — вернуть None (ничего не пишем).
+
+    Персистит НЕ здесь: запись в БД делает вызывающий пайплайн (main.py),
+    чтобы модуль анализа не зависел от слоя БД (без циклических импортов).
+    """
+    pos, neg = score_text(text)
+    if pos == 0 and neg == 0:
+        return None
+    ts = timestamp or datetime.now(timezone.utc)
+    MONITOR.add(text, ts)
+    net = pos - neg
+    label = "positive" if net > 0 else "negative" if net < 0 else "neutral"
+    signal = math.tanh(net / 3.0)   # -1..+1 с насыщением при сильном перекосе
+    return {
+        "source": "geopolitics",
+        "kind": "geo",
+        "ticker": None,                 # рыночно-широкий фон, не привязан к тикеру
+        "channel": channel or "geo",
+        "text": (text or "").strip().replace("\n", " ")[:500],
+        "label": label,
+        "score": float(max(pos, neg)),
+        "signal": round(signal, 3),
+        "payload": {"pos": pos, "neg": neg, "net": net},
+        "ts": ts,
+    }

@@ -422,9 +422,10 @@ async def build_knowledge_context(ticker: str) -> str:
     news = snap.get("news") or []
     pulse = snap.get("pulse") or []
     deals = snap.get("deals") or []
+    geo = snap.get("geo") or []
     ob = snap.get("orderbook")
     q = snap.get("quote")
-    if not (msgs or news or pulse or deals or ob or q):
+    if not (msgs or news or pulse or deals or geo or ob or q):
         return ""
 
     lines = ["🧠 БАЗА ЗНАНИЙ (реальное время + история):"]
@@ -437,6 +438,10 @@ async def build_knowledge_context(ticker: str) -> str:
         buys = sum(1 for d in deals if (d.get("payload") or {}).get("action") == "buy")
         sells = sum(1 for d in deals if (d.get("payload") or {}).get("action") == "sell")
         lines.append(f"  Сделки трейдеров (Пульс): покупок {buys}, продаж {sells}")
+    if geo:
+        lines.append(f"  🌍 Геополитика — фон рынка ({len(geo)} свежих сигналов):")
+        for g in geo[:3]:
+            lines.append(f"    [{g.get('label')}] {(g.get('text') or '')[:90]}")
     for m in msgs[:3]:
         lines.append(f"  💬 [{m.get('channel')}] {(m.get('text') or '')[:90]}")
     for nz in news[:2]:

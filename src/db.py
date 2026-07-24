@@ -809,7 +809,7 @@ async def knowledge_snapshot(ticker: str, since_minutes: int = 240,
     """
     ticker = ticker.upper()
     events = await recent_events(ticker=ticker, since_minutes=since_minutes, limit=400)
-    buckets = {"messages": [], "news": [], "pulse": [], "deals": [],
+    buckets = {"messages": [], "news": [], "pulse": [], "deals": [], "geo": [],
                "orderbook": None, "quote": None, "trades": None}
     for e in events:
         if e["source"] == "telegram" and len(buckets["messages"]) < per_kind:
@@ -827,8 +827,16 @@ async def knowledge_snapshot(ticker: str, since_minutes: int = 240,
                 buckets["quote"] = e
             elif e["kind"] == "trades" and buckets["trades"] is None:
                 buckets["trades"] = e
+    # Геополитика — рыночно-широкий фон (ticker=None), поэтому её не вернёт
+    # фильтр по конкретному тикеру. Тянем отдельно, чтобы фон попадал в срез
+    # знаний Claude по ЛЮБОМУ тикеру.
+    try:
+        buckets["geo"] = await recent_events(
+            source="geopolitics", since_minutes=since_minutes, limit=per_kind)
+    except Exception:
+        buckets["geo"] = []
     buckets["ticker"] = ticker
-    buckets["event_count"] = len(events)
+    buckets["event_count"] = len(events) + len(buckets["geo"])
     return buckets
 
 
