@@ -153,6 +153,47 @@ class TinkoffClient:
 
         return result if result["close"] else None
 
+    async def get_intraday_candles(self, ticker: str, tf_min: int = 5,
+                                   hours: int = 8) -> Optional[dict]:
+        """
+        Реалтайм интрадей-свечи Tinkoff (без 15-мин задержки MOEX ISS).
+        tf_min: 1 / 5 / 15 / 60. hours — сколько последних часов взять.
+        Возвращает параллельные массивы dates/open/high/low/close/volume.
+        """
+        figi = await self.get_figi(ticker)
+        if not figi:
+            return None
+
+        interval = {
+            1:  "CANDLE_INTERVAL_1_MIN",
+            5:  "CANDLE_INTERVAL_5_MIN",
+            15: "CANDLE_INTERVAL_15_MIN",
+            60: "CANDLE_INTERVAL_HOUR",
+        }.get(tf_min, "CANDLE_INTERVAL_5_MIN")
+
+        now = datetime.now(timezone.utc)
+        from_ = (now - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        data = await self._post(
+            "tinkoff.public.invest.api.contract.v1.MarketDataService/GetCandles",
+            {"figi": figi, "from": from_, "to": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+             "interval": interval},
+        )
+        if not data or "candles" not in data:
+            return None
+
+        def _price(p):
+            return float(p.get("units", 0)) + float(p.get("nano", 0)) / 1e9
+
+        out = {"dates": [], "open": [], "high": [], "low": [], "close": [], "volume": []}
+        for c in data["candles"]:
+            out["dates"].append(c.get("time", ""))
+            out["open"].append(_price(c.get("open", {})))
+            out["high"].append(_price(c.get("high", {})))
+            out["low"].append(_price(c.get("low", {})))
+            out["close"].append(_price(c.get("close", {})))
+            out["volume"].append(int(c.get("volume", 0)))
+        return out if out["close"] else None
+
     async def get_orderbook(self, ticker: str, depth: int = 20) -> Optional[dict]:
         """
         Стакан — 20 уровней bid/ask.

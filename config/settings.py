@@ -85,6 +85,13 @@ MIN_MESSAGES_FOR_SIGNAL = int(os.getenv("MIN_MESSAGES_FOR_SIGNAL", "5"))
 # Порог аномалии (множитель от среднего)
 ANOMALY_THRESHOLD = float(os.getenv("ANOMALY_THRESHOLD", "3.0"))
 
+# ─── Интрадей (внутридневная торговля) ────────────────────────────────────────
+# Торгуем внутри дня: решение на 5-мин свечах, флэт к закрытию сессии.
+INTRADAY_MODE = os.getenv("INTRADAY_MODE", "true").lower() == "true"
+INTRADAY_TF_MIN = int(os.getenv("INTRADAY_TF_MIN", "5"))            # таймфрейм решений, мин
+INTRADAY_HORIZON_HOURS = int(os.getenv("INTRADAY_HORIZON_HOURS", "2"))  # горизонт прогноза, ч
+INTRADAY_OPENING_RANGE_BARS = int(os.getenv("INTRADAY_OPENING_RANGE_BARS", "6"))  # свечей в диапазоне открытия
+
 # ─── Тикеры Мосбиржи (ТОП-50 IMOEX) ───────────────────────────────────────────
 MOEX_TICKERS = {
     "SBER": "Сбербанк",
