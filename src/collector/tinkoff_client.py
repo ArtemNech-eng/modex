@@ -266,39 +266,11 @@ class TinkoffClient:
         if not data or "trades" not in data:
             return None
 
-        def _price(p): return float(p.get("units", 0)) + float(p.get("nano", 0)) / 1e9
-
-        trades = data["trades"][-limit:]
-        buys  = [t for t in trades if t.get("direction") == "TRADE_DIRECTION_BUY"]
-        sells = [t for t in trades if t.get("direction") == "TRADE_DIRECTION_SELL"]
-
-        buy_vol  = sum(int(t.get("quantity", 0)) for t in buys)
-        sell_vol = sum(int(t.get("quantity", 0)) for t in sells)
-        total    = buy_vol + sell_vol
-
-        buy_pct  = round(buy_vol  / total * 100, 1) if total else 50
-        sell_pct = round(sell_vol / total * 100, 1) if total else 50
-
-        if buy_pct >= 60:
-            flow = "агрессивные покупки 🟢"
-        elif sell_pct >= 60:
-            flow = "агрессивные продажи 🔴"
-        else:
-            flow = "смешанный поток ⚪"
-
-        avg_price = round(
-            sum(_price(t.get("price", {})) * int(t.get("quantity", 0)) for t in trades) / total, 2
-        ) if total else None
-
-        return {
-            "total_trades": len(trades),
-            "buy_pct":      buy_pct,
-            "sell_pct":     sell_pct,
-            "buy_volume":   buy_vol,
-            "sell_volume":  sell_vol,
-            "order_flow":   flow,
-            "avg_price":    avg_price,
-        }
+        # Хронологический порядок (нужен для tick-rule), затем последние `limit`.
+        trades = sorted(data["trades"], key=lambda t: t.get("time", ""))[-limit:]
+        if not trades:
+            return None
+        return _classify_flow(trades)
 
     async def get_full_snapshot(self, ticker: str) -> dict:
         """
@@ -366,3 +338,108 @@ class TinkoffClient:
             "trades":    trades,
             "summary":   "\n".join(lines),
         }
+
+
+def _classify_flow(trades: list[dict]) -> dict:
+    """
+    Чистая классификация потока сделок (без сети — легко тестировать) ДВУМЯ методами:
+      1) по полю `direction` Tinkoff (сторона агрессора);
+      2) tick-rule (знак изменения цены) — резерв на случай, если поле direction
+         вырождено (например, вернуло одну сторону на 100% — типичный артефакт).
+    Первичным берём direction, если он ДВУСТОРОННИЙ; иначе — tick-rule.
+    В payload кладём ОБЕ оценки и сырое распределение направлений, чтобы причина
+    артефактов была видна прямо в /api/feed (диагностика без отдельного лога).
+    `trades` — сделки в ХРОНОЛОГИЧЕСКОМ порядке.
+    """
+    def _q(t) -> int:
+        try:
+            return int(t.get("quantity", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _price(p) -> float:
+        p = p or {}
+        return float(p.get("units", 0) or 0) + float(p.get("nano", 0) or 0) / 1e9
+
+    n = len(trades)
+
+    # Сырое распределение направлений (диагностика)
+    dir_counts: dict[str, int] = {}
+    for t in trades:
+        d = t.get("direction") or "UNSPECIFIED"
+        dir_counts[d] = dir_counts.get(d, 0) + 1
+
+    buy_dir  = sum(_q(t) for t in trades if t.get("direction") == "TRADE_DIRECTION_BUY")
+    sell_dir = sum(_q(t) for t in trades if t.get("direction") == "TRADE_DIRECTION_SELL")
+    dir_total = buy_dir + sell_dir
+
+    # tick-rule: uptick → buy, downtick → sell, без изменения цены → прошлая сторона
+    buy_tick = sell_tick = 0
+    prev = None
+    last_side = None
+    for t in trades:
+        pr = _price(t.get("price"))
+        q = _q(t)
+        if prev is None or pr == prev:
+            side = last_side
+        elif pr > prev:
+            side = "buy"
+        else:
+            side = "sell"
+        if side == "buy":
+            buy_tick += q
+        elif side == "sell":
+            sell_tick += q
+        prev = pr
+        last_side = side or last_side
+    tick_total = buy_tick + sell_tick
+
+    def _pct(b: int, s: int) -> float:
+        tot = b + s
+        return round(b / tot * 100, 1) if tot else 50.0
+
+    buy_pct_dir  = _pct(buy_dir, sell_dir)
+    buy_pct_tick = _pct(buy_tick, sell_tick)
+
+    # Выбор первичного метода: aggressor-поле, если двустороннее; иначе tick-rule
+    dir_onesided = dir_total > 0 and (buy_dir == 0 or sell_dir == 0)
+    if dir_total > 0 and not dir_onesided:
+        buy_vol, sell_vol, method = buy_dir, sell_dir, "direction"
+    elif tick_total > 0:
+        buy_vol, sell_vol, method = buy_tick, sell_tick, "tick"
+    else:
+        buy_vol, sell_vol, method = buy_dir, sell_dir, "direction"
+
+    total = buy_vol + sell_vol
+    buy_pct  = round(buy_vol / total * 100, 1) if total else 50.0
+    sell_pct = round(100.0 - buy_pct, 1) if total else 50.0
+
+    if buy_pct >= 60:
+        flow = "агрессивные покупки 🟢"
+    elif buy_pct <= 40:
+        flow = "агрессивные продажи 🔴"
+    else:
+        flow = "смешанный поток ⚪"
+
+    # Уверенность: мало сделок или подозрительный экстремум → low
+    confidence = "low" if (n < 10 or buy_pct >= 97 or buy_pct <= 3) else "high"
+
+    den = sum(_q(t) for t in trades)
+    avg_price = (round(sum(_price(t.get("price")) * _q(t) for t in trades) / den, 2)
+                 if den else None)
+
+    return {
+        "total_trades": n,
+        "buy_pct":      buy_pct,
+        "sell_pct":     sell_pct,
+        "buy_volume":   buy_vol,
+        "sell_volume":  sell_vol,
+        "order_flow":   flow,
+        "avg_price":    avg_price,
+        # ── диагностика/прозрачность (видно в /api/feed) ──
+        "flow_method":       method,        # какой метод дал итог: direction | tick
+        "flow_confidence":   confidence,    # high | low
+        "buy_pct_direction": buy_pct_dir,   # оценка по полю Tinkoff
+        "buy_pct_tick":      buy_pct_tick,  # оценка по tick-rule
+        "direction_counts":  dir_counts,    # сырое распределение поля direction
+    }
