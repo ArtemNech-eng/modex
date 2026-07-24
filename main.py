@@ -303,48 +303,58 @@ async def market_snapshot_pipeline():
         try:
             if tk:
                 for t in watch:
+                    ts = datetime.now(timezone.utc)
+                    # Лёгкие последовательные вызовы (без тяжёлых 365-дневных
+                    # свечей и без пачки concurrent-запросов) — не упираемся в
+                    # лимиты Tinkoff API. get_orderbook уже проверен диагностикой.
                     try:
-                        snap = await tk.get_full_snapshot(t)
+                        ob = await tk.get_orderbook(t)
                     except Exception as e:
                         first_err = first_err or str(e)[:160]
-                        continue
-                    ts = datetime.now(timezone.utc)
-                    if snap.get("orderbook"):
+                        ob = None
+                    if ob:
                         await db.add_event({"source": "tinkoff", "kind": "orderbook",
-                                            "ticker": t, "payload": snap["orderbook"], "ts": ts})
+                                            "ticker": t, "payload": ob, "ts": ts})
                         written["orderbook"] += 1
-                    if snap.get("trades"):
+                        bid, ask = ob.get("best_bid"), ob.get("best_ask")
+                        if bid and ask:
+                            await db.add_event({"source": "tinkoff", "kind": "quote", "ticker": t,
+                                                "payload": {"last": round((bid + ask) / 2, 4),
+                                                            "bid": bid, "ask": ask}, "ts": ts})
+                            written["quote"] += 1
+                    try:
+                        tr = await tk.get_last_trades(t)
+                    except Exception as e:
+                        first_err = first_err or str(e)[:160]
+                        tr = None
+                    if tr:
                         await db.add_event({"source": "tinkoff", "kind": "trades",
-                                            "ticker": t, "payload": snap["trades"], "ts": ts})
+                                            "ticker": t, "payload": tr, "ts": ts})
                         written["trades"] += 1
-                    c = snap.get("candles")
-                    if c and c.get("close"):
-                        await db.add_event({"source": "tinkoff", "kind": "quote", "ticker": t,
-                                            "payload": {"last": c["close"][-1],
-                                                        "volume": (c.get("volume") or [None])[-1]}, "ts": ts})
-                        written["quote"] += 1
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.4)   # бережём лимиты Tinkoff
 
-            # Реальные сделки трейдеров Пульса («умные деньги»)
-            try:
-                from src.api.main import _smart_money_snapshot
-                snap = await _smart_money_snapshot(ttl=0)
-                for d in (snap.get("deals") or [])[:80]:
-                    sig = f"{d.get('author')}|{d.get('ticker')}|{d.get('action')}|{d.get('timestamp')}|{d.get('price')}"
-                    if sig in seen_deals:
-                        continue
-                    seen_deals.add(sig)
-                    await db.add_event({
-                        "source": "pulse_deal", "kind": "deal", "ticker": d.get("ticker"),
-                        "channel": d.get("author"), "payload": d,
-                        "text": f"{d.get('author')} {d.get('action')} {d.get('ticker')}"
-                                f"{(' @ ' + str(d.get('price'))) if d.get('price') else ''}",
-                    })
-                    written["deal"] += 1
-                if len(seen_deals) > 5000:
-                    seen_deals.clear()
-            except Exception as e:
-                logger.debug(f"pulse deals snapshot: {e}")
+            # Сделки трейдеров Пульса — реже (Пульс часто блокируется в РФ),
+            # чтобы не долбить заблокированный эндпоинт каждый цикл
+            if cycle % 4 == 1:
+                try:
+                    from src.api.main import _smart_money_snapshot
+                    snap = await _smart_money_snapshot(ttl=0)
+                    for d in (snap.get("deals") or [])[:80]:
+                        sig = f"{d.get('author')}|{d.get('ticker')}|{d.get('action')}|{d.get('timestamp')}|{d.get('price')}"
+                        if sig in seen_deals:
+                            continue
+                        seen_deals.add(sig)
+                        await db.add_event({
+                            "source": "pulse_deal", "kind": "deal", "ticker": d.get("ticker"),
+                            "channel": d.get("author"), "payload": d,
+                            "text": f"{d.get('author')} {d.get('action')} {d.get('ticker')}"
+                                    f"{(' @ ' + str(d.get('price'))) if d.get('price') else ''}",
+                        })
+                        written["deal"] += 1
+                    if len(seen_deals) > 5000:
+                        seen_deals.clear()
+                except Exception as e:
+                    logger.debug(f"pulse deals snapshot: {e}")
 
             # Лог результата цикла — видно, наполняется ли база из Tinkoff/Пульса
             if tk and written["orderbook"] == 0 and first_err:
