@@ -297,6 +297,64 @@ async def get_feed_sources(minutes: int = 60):
     return await db.event_source_stats(since_minutes=minutes)
 
 
+@app.get("/api/health/sources", summary="Живая диагностика источников данных")
+async def health_sources():
+    """
+    Проверяет каждый источник вживую и возвращает статус/ошибки (без секретов).
+    Открой этот адрес, чтобы понять, почему какой-то источник пуст.
+    """
+    from config.settings import (TINKOFF_TOKEN, TELEGRAM_API_ID,
+                                  TELEGRAM_STRING_SESSION, TELEGRAM_PROXY)
+    out: dict = {}
+
+    # Tinkoff Invest API (по токену; обычно доступен без прокси)
+    tk = {"token_set": bool(TINKOFF_TOKEN)}
+    if TINKOFF_TOKEN:
+        try:
+            from src.collector.tinkoff_client import TinkoffClient
+            ob = await TinkoffClient().get_orderbook("SBER")
+            tk["orderbook_ok"] = bool(ob)
+            tk["pressure"] = ob.get("pressure") if ob else None
+            if not ob:
+                tk["note"] = "нет стакана (рынок закрыт или у токена нет прав на маркет-данные)"
+        except Exception as e:
+            tk["error"] = str(e)[:250]
+    else:
+        tk["note"] = "TINKOFF_TOKEN не задан в окружении контейнера"
+    out["tinkoff"] = tk
+
+    # MOEX ISS (бесплатно, с задержкой)
+    moex = {}
+    try:
+        from src.collector.moex_price_collector import MOEXPriceCollector
+        price = await MOEXPriceCollector().get_current_price("SBER")
+        moex["ok"] = price is not None
+        moex["sber_last"] = price
+    except Exception as e:
+        moex["error"] = str(e)[:250]
+    out["moex_iss"] = moex
+
+    # Telegram / Пульс — конфиг-подсказки (сеть проверяется в пайплайне)
+    out["telegram"] = {
+        "api_configured": bool(TELEGRAM_API_ID),
+        "string_session": bool(TELEGRAM_STRING_SESSION),
+        "proxy_set": bool(TELEGRAM_PROXY),
+    }
+
+    # Фаза сессии MOEX (МСК)
+    try:
+        from src.analysis import intraday as iv
+        from datetime import timedelta
+        msk = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=3)))
+        out["session_phase_msk"] = iv.session_phase(msk.hour * 60 + msk.minute)
+    except Exception:
+        out["session_phase_msk"] = "?"
+
+    # Что реально попало в базу знаний за 60 минут
+    out["events_60m"] = (await db.event_source_stats(60)).get("counts", {})
+    return out
+
+
 @app.get("/api/knowledge/{ticker}", summary="Срез базы знаний по тикеру (для Claude)")
 async def get_knowledge(ticker: str, minutes: int = 240):
     """

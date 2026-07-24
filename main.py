@@ -298,25 +298,31 @@ async def market_snapshot_pipeline():
     cycle = 0
     while True:
         cycle += 1
+        written = {"orderbook": 0, "quote": 0, "trades": 0, "deal": 0}
+        first_err = None
         try:
             if tk:
                 for t in watch:
                     try:
                         snap = await tk.get_full_snapshot(t)
-                    except Exception:
+                    except Exception as e:
+                        first_err = first_err or str(e)[:160]
                         continue
                     ts = datetime.now(timezone.utc)
                     if snap.get("orderbook"):
                         await db.add_event({"source": "tinkoff", "kind": "orderbook",
                                             "ticker": t, "payload": snap["orderbook"], "ts": ts})
+                        written["orderbook"] += 1
                     if snap.get("trades"):
                         await db.add_event({"source": "tinkoff", "kind": "trades",
                                             "ticker": t, "payload": snap["trades"], "ts": ts})
+                        written["trades"] += 1
                     c = snap.get("candles")
                     if c and c.get("close"):
                         await db.add_event({"source": "tinkoff", "kind": "quote", "ticker": t,
                                             "payload": {"last": c["close"][-1],
                                                         "volume": (c.get("volume") or [None])[-1]}, "ts": ts})
+                        written["quote"] += 1
                     await asyncio.sleep(0.2)
 
             # Реальные сделки трейдеров Пульса («умные деньги»)
@@ -334,10 +340,19 @@ async def market_snapshot_pipeline():
                         "text": f"{d.get('author')} {d.get('action')} {d.get('ticker')}"
                                 f"{(' @ ' + str(d.get('price'))) if d.get('price') else ''}",
                     })
+                    written["deal"] += 1
                 if len(seen_deals) > 5000:
                     seen_deals.clear()
             except Exception as e:
                 logger.debug(f"pulse deals snapshot: {e}")
+
+            # Лог результата цикла — видно, наполняется ли база из Tinkoff/Пульса
+            if tk and written["orderbook"] == 0 and first_err:
+                logger.warning(f"🧠 База знаний: Tinkoff не отдал данные ({first_err}). "
+                               f"Проверь права токена/часы торгов.")
+            else:
+                logger.info(f"🧠 База знаний: +Tinkoff стакан {written['orderbook']}, "
+                            f"цена {written['quote']}, поток {written['trades']}; сделки {written['deal']}")
 
             # Ретеншн: раз в ~50 циклов чистим старше 14 дней
             if cycle % 50 == 1:
