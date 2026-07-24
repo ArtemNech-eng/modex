@@ -78,6 +78,11 @@ class ChannelRequest(BaseModel):
     username: str   # например "markettwits" или "https://t.me/markettwits"
 
 
+class TraderRequest(BaseModel):
+    nickname: str            # ник трейдера в Пульсе, напр. "Rostislavzzz"
+    note: Optional[str] = None
+
+
 # ─── Хранилище каналов (в БД, см. src/db.py) ─────────────────────────────────
 from src import db
 
@@ -1014,7 +1019,11 @@ async def _smart_money_snapshot(authors: Optional[list[str]] = None, ttl: int = 
     from src.collector.pulse_author_collector import PulseAuthorTracker
     from config.settings import PULSE_TRACKED_AUTHORS
 
-    authors = authors or PULSE_TRACKED_AUTHORS
+    if not authors:
+        # Приоритет — список из БД (добавленные через дашборд, переживают
+        # перезагрузку и редеплой). Если БД пуста — откат на список из .env.
+        db_nicks = await db.get_tracked_trader_nicks()
+        authors = db_nicks or PULSE_TRACKED_AUTHORS
     key = ",".join(sorted(authors))
     now = time.time()
     cached = _smart_money_cache.get("snapshot")
@@ -1039,6 +1048,63 @@ async def get_smart_money(authors: Optional[str] = None, force: bool = False):
     author_list = [a.strip() for a in authors.split(",") if a.strip()] if authors else None
     snap = await _smart_money_snapshot(author_list, ttl=0 if force else 300)
     return snap
+
+
+# ─── Управление отслеживаемыми трейдерами (сохраняются в БД) ──────────────────
+
+def _clean_nick(raw: str) -> str:
+    """Достать чистый ник трейдера из ссылки/строки Пульса."""
+    nick = (raw or "").strip()
+    for prefix in (
+        "https://www.tinkoff.ru/invest/social/profile/",
+        "https://www.tbank.ru/invest/social/profile/",
+        "https://tinkoff.ru/invest/social/profile/",
+    ):
+        nick = nick.replace(prefix, "")
+    return nick.replace("@", "").strip("/").strip()
+
+
+@app.get("/api/smart-money/traders", summary="Список отслеживаемых трейдеров")
+async def list_traders():
+    """
+    Отслеживаемые трейдеры Пульса. Хранятся в БД, поэтому переживают
+    перезагрузку страницы и редеплой.
+    """
+    traders = await db.list_tracked_traders()
+    return {"traders": traders, "count": len(traders)}
+
+
+@app.post("/api/smart-money/traders", summary="Добавить трейдера для отслеживания")
+async def add_trader(req: TraderRequest):
+    """Добавить трейдера Пульса в список отслеживания и сохранить в БД."""
+    nickname = _clean_nick(req.nickname)
+    if not nickname:
+        raise HTTPException(status_code=400, detail="Пустой ник трейдера")
+    if await db.trader_exists(nickname):
+        raise HTTPException(status_code=400, detail=f"Трейдер {nickname} уже отслеживается")
+
+    info = {
+        "nickname": nickname,
+        "source": "manual",
+        "status": "active",
+        "note": (req.note or "").strip(),
+    }
+    await db.upsert_tracked_trader(info)
+    # сбрасываем кеш, чтобы новый трейдер попал в ближайший снимок «умных денег»
+    _smart_money_cache.update({"ts": 0.0, "snapshot": None, "key": None})
+    logger.info(f"✅ Трейдер добавлен в отслеживание: {nickname}")
+    return {"success": True, "trader": info}
+
+
+@app.delete("/api/smart-money/traders/{nickname}", summary="Удалить трейдера")
+async def remove_trader(nickname: str):
+    """Убрать трейдера из отслеживания (удаляет запись из БД)."""
+    nickname = _clean_nick(nickname)
+    deleted = await db.delete_tracked_trader(nickname)
+    _smart_money_cache.update({"ts": 0.0, "snapshot": None, "key": None})
+    if deleted:
+        return {"success": True, "message": f"Трейдер {nickname} удалён из отслеживания"}
+    raise HTTPException(status_code=404, detail=f"Трейдер {nickname} не найден")
 
 
 # ─── WebSocket (реалтайм) ─────────────────────────────────────────────────────

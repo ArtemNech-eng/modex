@@ -318,14 +318,16 @@ header {
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
         <div class="card-title" style="color:var(--yellow);">💼 Сделки отслеживаемых трейдеров («умные деньги»)</div>
         <div style="display:flex;gap:6px;align-items:center;">
-          <input class="ch-input" id="smAuthors" placeholder="Ники через запятую" value="Rostislavzzz" style="width:220px;">
+          <input class="ch-input" id="smAuthors" placeholder="Ник трейдера в Пульсе" onkeydown="if(event.key==='Enter') addTrader()" style="width:200px;">
+          <button class="btn btn-green" onclick="addTrader()" id="smAddBtn">＋ Добавить</button>
           <button class="btn btn-ghost" onclick="loadSmartMoney(true)" id="smBtn">↻ Обновить</button>
         </div>
       </div>
       <div style="font-size:11px;color:var(--dim);margin:4px 0 8px;">
         Реальные покупки/продажи трейдеров из Пульса — сильнее, чем их посты. Идёт в контекст Claude как отдельный сигнал.
-        Помните: сделку видно с задержкой, размер позиции и плечо не видны. Не инвестрекомендация.
+        Список отслеживаемых трейдеров сохраняется в базе и не пропадает после перезагрузки. Помните: сделку видно с задержкой, размер позиции и плечо не видны. Не инвестрекомендация.
       </div>
+      <div id="smTraders" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;"><span style="color:var(--dim);font-size:11px;">Загрузка списка...</span></div>
       <div id="smResult" style="font-size:12px;"><div style="color:var(--dim);">Нажми «↻ Обновить», чтобы подтянуть сделки.</div></div>
     </div>
 
@@ -639,7 +641,7 @@ function switchTab(name, el) {
   document.getElementById('tab-' + name).classList.add('active');
   if (name === 'channels') loadChannels();
   if (name === 'signals') loadSignals();
-  if (name === 'live') loadLiveSignals();
+  if (name === 'live') { loadLiveSignals(); loadTrackedTraders(); }
   if (name === 'track') loadTrackRecord();
   if (name === 'strategy') { refreshBackfill(); if (!window._btLoaded) { window._btLoaded=true; runBacktest(); } }
 }
@@ -1273,11 +1275,10 @@ async function liveStop() {
 async function loadSmartMoney(force) {
   const box = document.getElementById('smResult');
   const btn = document.getElementById('smBtn');
-  const authors = document.getElementById('smAuthors').value.trim();
   btn.disabled = true; box.innerHTML = '<div style="color:var(--dim);">Тяну сделки из Пульса...</div>';
   try {
+    // Список трейдеров берётся на бэкенде из БД (сохранённый), authors не передаём
     const qs = new URLSearchParams();
-    if (authors) qs.set('authors', authors);
     if (force) qs.set('force', 'true');
     const d = await (await fetch(`${API}/api/smart-money?${qs}`)).json();
     if (!d.deal_count) {
@@ -1312,6 +1313,61 @@ async function loadSmartMoney(force) {
   } catch(e) {
     box.innerHTML = `<div style="color:var(--red);">Ошибка: ${e.message}</div>`;
   } finally { btn.disabled = false; }
+}
+
+// ── Отслеживаемые трейдеры («умные деньги»): список хранится в БД ─────────────
+async function loadTrackedTraders() {
+  const box = document.getElementById('smTraders');
+  if (!box) return;
+  try {
+    const d = await (await fetch(`${API}/api/smart-money/traders`)).json();
+    const traders = d.traders || [];
+    if (!traders.length) {
+      box.innerHTML = '<span style="color:var(--dim);font-size:11px;">Пока никто не отслеживается. Добавь ник трейдера из Пульса выше.</span>';
+      return;
+    }
+    box.innerHTML = traders.map(t => {
+      const badge = t.source === 'manual' ? '' : ' <span style="color:var(--dim);">(базовый)</span>';
+      return `<span style="display:inline-flex;align-items:center;gap:6px;background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:3px 6px 3px 10px;font-size:11px;">
+        <b>${t.nickname}</b>${badge}
+        <button title="Убрать из отслеживания" onclick="removeTrader('${t.nickname}')" style="background:none;border:none;color:var(--red);cursor:pointer;font-size:13px;line-height:1;padding:0 2px;">✕</button>
+      </span>`;
+    }).join('');
+  } catch(e) {
+    box.innerHTML = `<span style="color:var(--red);font-size:11px;">Не удалось загрузить список: ${e.message}</span>`;
+  }
+}
+
+async function addTrader() {
+  const input = document.getElementById('smAuthors');
+  const btn = document.getElementById('smAddBtn');
+  const nickname = (input.value || '').trim();
+  if (!nickname) return;
+  btn.disabled = true; btn.textContent = '...';
+  try {
+    const r = await fetch(`${API}/api/smart-money/traders`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({nickname})
+    });
+    const d = await r.json();
+    if (d.success) {
+      input.value = '';
+      await loadTrackedTraders();
+      loadSmartMoney(true);   // сразу подтянуть сделки с учётом нового трейдера
+    } else {
+      alert(d.detail || 'Не удалось добавить трейдера');
+    }
+  } catch(e) { alert('Ошибка: ' + e.message); }
+  finally { btn.disabled = false; btn.textContent = '＋ Добавить'; }
+}
+
+async function removeTrader(nickname) {
+  if (!confirm(`Убрать трейдера ${nickname} из отслеживания?`)) return;
+  try {
+    await fetch(`${API}/api/smart-money/traders/${encodeURIComponent(nickname)}`, {method:'DELETE'});
+    await loadTrackedTraders();
+    loadSmartMoney(true);
+  } catch(e) { alert('Ошибка: ' + e.message); }
 }
 
 
