@@ -23,30 +23,48 @@ logger = logging.getLogger(__name__)
 
 def _build_proxy():
     """
-    Разобрать TELEGRAM_PROXY (socks5://[user:pass@]host:port) в формат Telethon.
-    Возвращает кортеж для PySocks или None. При отсутствии PySocks — предупреждение.
+    Разобрать TELEGRAM_PROXY в параметры Telethon.
+    Возвращает (proxy, connection_cls):
+      • SOCKS5/SOCKS4/HTTP:  socks5://[user:pass@]host:port  → (PySocks-tuple, None)
+      • MTProto (для Telegram в РФ): mtproto://<secret>@host:port → ((host,port,secret), ConnCls)
+    При проблемах — (None, None).
     """
     if not TELEGRAM_PROXY:
-        return None
+        return None, None
+    from urllib.parse import urlparse
     try:
-        from urllib.parse import urlparse
         u = urlparse(TELEGRAM_PROXY)
-        import socks  # PySocks
         scheme = (u.scheme or "socks5").lower()
+
+        # MTProto-прокси — Telegram-специфичный, обычно надёжнее в РФ
+        if scheme in ("mtproto", "mtproxy"):
+            secret = u.username or ""
+            if not (u.hostname and u.port and secret):
+                logger.warning("TELEGRAM_PROXY (mtproto) должен быть вида mtproto://<secret>@host:port")
+                return None, None
+            try:
+                from telethon.network import ConnectionTcpMTProxyRandomizedIntermediate as Conn
+            except Exception as e:
+                logger.warning(f"MTProxy недоступен в этой версии Telethon: {e}")
+                return None, None
+            return (u.hostname, u.port, secret), Conn
+
+        # SOCKS5/SOCKS4/HTTP через PySocks
+        import socks  # PySocks
         ptype = {"socks5": socks.SOCKS5, "socks4": socks.SOCKS4,
                  "http": socks.HTTP}.get(scheme, socks.SOCKS5)
         if not u.hostname or not u.port:
             logger.warning(f"TELEGRAM_PROXY задан некорректно: {TELEGRAM_PROXY!r}")
-            return None
+            return None, None
         if u.username and u.password:
-            return (ptype, u.hostname, u.port, True, u.username, u.password)
-        return (ptype, u.hostname, u.port)
+            return (ptype, u.hostname, u.port, True, u.username, u.password), None
+        return (ptype, u.hostname, u.port), None
     except ImportError:
         logger.warning("TELEGRAM_PROXY задан, но не установлен PySocks (pip install PySocks) — игнорирую прокси")
-        return None
+        return None, None
     except Exception as e:
         logger.warning(f"Не удалось разобрать TELEGRAM_PROXY: {e}")
-        return None
+        return None, None
 
 
 @dataclass
@@ -92,7 +110,7 @@ class TelegramCollector:
 
         # Общие параметры устойчивости соединения (авто-реконнект, повторы,
         # опциональный прокси) — снижают «то подключается, то нет».
-        proxy = _build_proxy()
+        proxy, conn_cls = _build_proxy()
         common = dict(
             connection_retries=TELEGRAM_CONNECTION_RETRIES,
             retry_delay=2,
@@ -102,6 +120,8 @@ class TelegramCollector:
         )
         if proxy:
             common["proxy"] = proxy
+            if conn_cls:
+                common["connection"] = conn_cls
             logger.info("🌐 Telegram через прокси (TELEGRAM_PROXY задан)")
 
         if TELEGRAM_STRING_SESSION:
