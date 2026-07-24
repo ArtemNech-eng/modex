@@ -81,10 +81,29 @@ class TelegramCollector:
             me = await self.client.get_me()
             logger.info(f"✅ Авторизован как {me.first_name} (@{me.username})")
         else:
-            # Локальный режим — файловая сессия
-            self.client = TelegramClient(TELEGRAM_SESSION, TELEGRAM_API_ID, TELEGRAM_API_HASH)
-            await self.client.start(phone=TELEGRAM_PHONE)
-            logger.info("🔑 Используем файловую сессию (локальный режим)")
+            # Файловая сессия. Кладём файл на ПОСТОЯННЫЙ том (data/), чтобы он не
+            # терялся при редеплое; иначе каждый раз требовалась бы новая авторизация.
+            import os
+            import sys
+            session_path = TELEGRAM_SESSION
+            if not os.path.dirname(session_path):
+                os.makedirs("data", exist_ok=True)
+                session_path = os.path.join("data", session_path)
+
+            self.client = TelegramClient(session_path, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+            await self.client.connect()
+            if not await self.client.is_user_authorized():
+                # В контейнере нет интерактивного ввода кода из SMS — не зависаем,
+                # а даём чёткую инструкцию. Надёжный способ для деплоя — строковая сессия.
+                if not sys.stdin or not sys.stdin.isatty():
+                    raise RuntimeError(
+                        "Telegram не авторизован, а интерактивный ввод недоступен (контейнер). "
+                        "Сгенерируй строковую сессию локально: `python scripts/auth_telegram.py`, "
+                        "и добавь TELEGRAM_STRING_SESSION в переменные окружения — это убирает "
+                        "проблему «то подключается, то нет»."
+                    )
+                await self.client.start(phone=TELEGRAM_PHONE)
+            logger.info(f"🔑 Файловая сессия: {session_path}.session (на постоянном томе)")
         logger.info("✅ Подключено к Telegram")
         self._running = True
 
