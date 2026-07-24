@@ -436,6 +436,32 @@ def _classify_flow(trades: list[dict]) -> dict:
     avg_price = (round(sum(_price(t.get("price")) * _q(t) for t in trades) / den, 2)
                  if den else None)
 
+    # Footprint: объём по РЕАЛЬНОЙ цене сделок + сплит buy/sell — «какая цена
+    # впитала объём и кто был агрессором». Группируем по фактической цене (шаг
+    # цены = уровень), поэтому биннинг не нужен.
+    fp_map: dict[float, list] = {}
+    for t in trades:
+        q = _q(t)
+        if q <= 0:
+            continue
+        price = round(_price(t.get("price")), 6)
+        cell = fp_map.setdefault(price, [0, 0, 0])  # [buy, sell, total]
+        cell[2] += q
+        d = t.get("direction")
+        if d == "TRADE_DIRECTION_BUY":
+            cell[0] += q
+        elif d == "TRADE_DIRECTION_SELL":
+            cell[1] += q
+    footprint = []
+    for price, (bv, sv, tot) in sorted(fp_map.items(),
+                                       key=lambda kv: kv[1][2], reverse=True)[:3]:
+        classified = bv + sv
+        footprint.append({
+            "price": price,
+            "vol": tot,
+            "buy_pct": round(bv / classified * 100, 1) if classified else 50.0,
+        })
+
     return {
         "total_trades": n,
         "buy_pct":      buy_pct,
@@ -450,4 +476,5 @@ def _classify_flow(trades: list[dict]) -> dict:
         "buy_pct_direction": buy_pct_dir,   # оценка по полю Tinkoff
         "buy_pct_tick":      buy_pct_tick,  # оценка по tick-rule
         "direction_counts":  dir_counts,    # сырое распределение поля direction
+        "footprint":         footprint,     # топ цен по впитанному объёму + buy%
     }

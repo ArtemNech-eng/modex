@@ -519,6 +519,25 @@ def _format_orderbook_read(ticker: str, obs: list[dict], trs: list[dict]) -> str
             note = " ⚠️ экстремум на ретейл-фиде — доверять осторожно"
         lines.append(f"  Поток сделок: {flow.get('order_flow', '—')} (buy {buy_pct}%){note}")
 
+    # Footprint: какая цена впитала объём (из реальных сделок) + сплит buy/sell
+    fp = flow.get("footprint") or []
+    if fp:
+        parts = [f"{x['price']} ({x['vol']} лот, {x['buy_pct']}% buy)" for x in fp[:3]]
+        lines.append("  📍 Объём по сделкам (какая цена впитала): " + " · ".join(parts))
+
+    # Динамика по снимкам — последовательность срезов сильнее одиночного (виден
+    # спуфинг и тренд). Эволюция давления стакана и потока за последние снимки.
+    seq_r = [_pl(o).get("bid_ask_ratio") for o in list(reversed(obs))[-5:]
+             if _pl(o).get("bid_ask_ratio") is not None]
+    if len(seq_r) >= 3:
+        lines.append("  Динамика стакана (bid/ask по снимкам): "
+                     + " → ".join(str(x) for x in seq_r))
+    seq_f = [_pl(t).get("buy_pct") for t in list(reversed(trs))[-5:]
+             if _pl(t).get("buy_pct") is not None]
+    if len(seq_f) >= 3:
+        lines.append("  Динамика потока (buy% по снимкам): "
+                     + " → ".join(str(x) for x in seq_f))
+
     # Абсорбция — расхождение стакан↔поток (сильный интрадей-сигнал)
     if ratio is not None and buy_pct is not None:
         if ratio < 0.7 and buy_pct >= 60:
@@ -549,7 +568,7 @@ async def build_orderbook_context(ticker: str, snapshots: int = 6) -> str:
         obs = await db.recent_events(ticker=ticker, source="tinkoff",
                                      kind="orderbook", since_minutes=60, limit=snapshots)
         trs = await db.recent_events(ticker=ticker, source="tinkoff",
-                                     kind="trades", since_minutes=60, limit=3)
+                                     kind="trades", since_minutes=60, limit=6)
     except Exception:
         return ""
     return _format_orderbook_read(ticker, obs, trs)
