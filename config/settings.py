@@ -47,6 +47,14 @@ TELEGRAM_CHANNELS = [
 # ─── Tinkoff Invest API ────────────────────────────────────────────────────────
 # Получить: Т-Инвестиции → Настройки → API токен → Создать (только чтение)
 TINKOFF_TOKEN = os.getenv("TINKOFF_TOKEN", "")
+
+# ─── «Умные деньги»: отслеживаемые трейдеры Пульса ────────────────────────────
+# Ники трейдеров, чьи РЕАЛЬНЫЕ сделки (покупки/продажи) используем как сигнал.
+# Задаётся через PULSE_TRACKED_AUTHORS в .env (список через запятую).
+PULSE_TRACKED_AUTHORS = [
+    a.strip() for a in os.getenv("PULSE_TRACKED_AUTHORS", "Rostislavzzz").split(",") if a.strip()
+]
+
 # Модели (в порядке приоритета):
 # 1. blanchefort/rubert-base-cased-sentiment — точная, 512MB
 # 2. cointegrated/rubert-tiny-sentiment-balanced — быстрая, 45MB ✅ рекомендую для старта

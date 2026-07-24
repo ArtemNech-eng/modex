@@ -1003,6 +1003,44 @@ async def get_live_signals(limit: int = 200):
     }
 
 
+# ─── «Умные деньги»: реальные сделки отслеживаемых трейдеров Пульса ────────────
+
+_smart_money_cache: dict = {"ts": 0.0, "snapshot": None}
+
+
+async def _smart_money_snapshot(authors: Optional[list[str]] = None, ttl: int = 300) -> dict:
+    """Свод сделок трейдеров с кешем (TTL), чтобы не долбить Пульс на каждый запрос."""
+    import time
+    from src.collector.pulse_author_collector import PulseAuthorTracker
+    from config.settings import PULSE_TRACKED_AUTHORS
+
+    authors = authors or PULSE_TRACKED_AUTHORS
+    key = ",".join(sorted(authors))
+    now = time.time()
+    cached = _smart_money_cache.get("snapshot")
+    if (cached and _smart_money_cache.get("key") == key
+            and now - _smart_money_cache["ts"] < ttl):
+        return cached
+
+    tracker = PulseAuthorTracker(authors)
+    snap = await tracker.snapshot()
+    _smart_money_cache.update({"ts": now, "snapshot": snap, "key": key})
+    return snap
+
+
+@app.get("/api/smart-money", summary="Реальные сделки отслеживаемых трейдеров Пульса")
+async def get_smart_money(authors: Optional[str] = None, force: bool = False):
+    """
+    Сделки (покупки/продажи) отслеживаемых трейдеров + нетто-поток по тикерам.
+    authors — список ников через запятую (по умолчанию из настроек).
+    force=true — обновить, минуя кеш.
+    ⚠️ Ходит в Пульс. Из некоторых сетей Пульс отдаёт 403 — тогда список будет пуст.
+    """
+    author_list = [a.strip() for a in authors.split(",") if a.strip()] if authors else None
+    snap = await _smart_money_snapshot(author_list, ttl=0 if force else 300)
+    return snap
+
+
 # ─── WebSocket (реалтайм) ─────────────────────────────────────────────────────
 
 @app.websocket("/ws")

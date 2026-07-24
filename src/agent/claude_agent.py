@@ -253,6 +253,7 @@ class ClaudeAgent:
         fundamental_context: Optional[str] = None,
         memory_context: Optional[str] = None,
         multiframe_context: Optional[str] = None,
+        smart_money_context: Optional[str] = None,
         momentum: Optional[float] = None,
         momentum_label: Optional[str] = None,
         source_diversity: Optional[float] = None,
@@ -302,6 +303,7 @@ class ClaudeAgent:
 {_block(multiframe_context)}
 {_block(price_context)}
 {_block(tinkoff_context)}
+{_block(smart_money_context)}
 {_block(historical_context)}
 {_block(memory_context)}
 📊 ТЕКУЩЕЕ НАСТРОЕНИЕ ТОЛПЫ (Telegram + Пульс):

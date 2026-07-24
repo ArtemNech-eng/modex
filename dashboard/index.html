@@ -313,6 +313,22 @@ header {
     <!-- Сводка форвард-точности -->
     <div id="liveTrackSummary" style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;"></div>
 
+    <!-- Умные деньги: реальные сделки трейдеров -->
+    <div class="card" style="border:1px solid #d2992244;">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+        <div class="card-title" style="color:var(--yellow);">💼 Сделки отслеживаемых трейдеров («умные деньги»)</div>
+        <div style="display:flex;gap:6px;align-items:center;">
+          <input class="ch-input" id="smAuthors" placeholder="Ники через запятую" value="Rostislavzzz" style="width:220px;">
+          <button class="btn btn-ghost" onclick="loadSmartMoney(true)" id="smBtn">↻ Обновить</button>
+        </div>
+      </div>
+      <div style="font-size:11px;color:var(--dim);margin:4px 0 8px;">
+        Реальные покупки/продажи трейдеров из Пульса — сильнее, чем их посты. Идёт в контекст Claude как отдельный сигнал.
+        Помните: сделку видно с задержкой, размер позиции и плечо не видны. Не инвестрекомендация.
+      </div>
+      <div id="smResult" style="font-size:12px;"><div style="color:var(--dim);">Нажми «↻ Обновить», чтобы подтянуть сделки.</div></div>
+    </div>
+
     <!-- Открытые сигналы -->
     <div class="card">
       <div class="card-title" style="margin-bottom:8px;">🟢 Открытые сигналы (ждут проверки по факту) <span id="liveOpenMeta" style="color:var(--dim);font-weight:400;font-size:11px;"></span></div>
@@ -1253,6 +1269,49 @@ async function liveStop() {
     if (livePoll) { clearInterval(livePoll); livePoll = null; }
     await loadLiveSignals();
   } catch(e) { document.getElementById('liveStatus').innerHTML = `<span style="color:var(--red);">Ошибка: ${e.message}</span>`; }
+}
+async function loadSmartMoney(force) {
+  const box = document.getElementById('smResult');
+  const btn = document.getElementById('smBtn');
+  const authors = document.getElementById('smAuthors').value.trim();
+  btn.disabled = true; box.innerHTML = '<div style="color:var(--dim);">Тяну сделки из Пульса...</div>';
+  try {
+    const qs = new URLSearchParams();
+    if (authors) qs.set('authors', authors);
+    if (force) qs.set('force', 'true');
+    const d = await (await fetch(`${API}/api/smart-money?${qs}`)).json();
+    if (!d.deal_count) {
+      let msg = `<div style="color:var(--dim);">Сделок не получено (${(d.authors||[]).join(', ')}).`;
+      if (d.sample) msg += ` Пульс ответил, но формат не распознан — пришли мне поле <code>sample</code> из ответа, поправлю парсер.`;
+      else msg += ` Возможно, у трейдера закрыты сделки, или из этой сети Пульс недоступен (403).`;
+      box.innerHTML = msg + '</div>';
+      return;
+    }
+    // Нетто по тикерам
+    const nets = (d.by_ticker||[]).map(r => {
+      const col = r.net>0?'var(--green)':r.net<0?'var(--red)':'var(--dim)';
+      const arrow = r.net>0?'▲':r.net<0?'▼':'•';
+      return `<span style="display:inline-block;background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:3px 9px;margin:2px;font-size:11px;">
+        <b>${r.ticker}</b> <span style="color:${col};">${arrow} ${r.bias}</span>
+        <span style="color:var(--dim);">(куп ${r.buys}/прод ${r.sells})</span></span>`;
+    }).join('');
+    // Последние сделки
+    const rows = (d.deals||[]).slice(0,20).map(x => {
+      const col = x.action==='buy'?'var(--green)':'var(--red)';
+      const act = x.action==='buy'?'КУПИЛ':'ПРОДАЛ';
+      return `<div style="display:grid;grid-template-columns:110px 60px 70px 1fr;gap:6px;padding:3px 4px;border-bottom:1px solid var(--border);align-items:center;">
+        <span style="color:var(--dim);">${x.author}</span>
+        <b>${x.ticker}</b>
+        <span style="color:${col};font-weight:600;">${act}</span>
+        <span style="color:var(--dim);font-size:11px;">${x.price!=null?('по '+x.price):''}${x.quantity!=null?(' × '+x.quantity):''} ${x.timestamp?('· '+_fmtTime(x.timestamp)):''}</span>
+      </div>`;
+    }).join('');
+    box.innerHTML =
+      `<div style="margin-bottom:8px;">${nets||''}</div>` +
+      `<div style="font-weight:600;margin-bottom:4px;">Последние сделки (${d.deal_count}):</div>${rows}`;
+  } catch(e) {
+    box.innerHTML = `<div style="color:var(--red);">Ошибка: ${e.message}</div>`;
+  } finally { btn.disabled = false; }
 }
 
 

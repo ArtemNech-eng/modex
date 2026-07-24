@@ -133,6 +133,16 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         # Tinkoff: стакан + поток сделок + объём
         tinkoff_snap = await _tinkoff.get_full_snapshot(ticker)
 
+        # «Умные деньги»: реальные сделки отслеживаемых трейдеров Пульса
+        smart_money_ctx = None
+        try:
+            from src.api import main as _api
+            sm_snap = await _api._smart_money_snapshot()
+            from src.collector.pulse_author_collector import PulseAuthorTracker
+            smart_money_ctx = PulseAuthorTracker([]).context_for(ticker, sm_snap)
+        except Exception as e:
+            logger.debug(f"smart-money context failed for {ticker}: {e}")
+
         # Генерируем график и получаем визуальный анализ Claude
         chart_analysis = None
         try:
@@ -175,6 +185,7 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
             fundamental_context=fund_ctx.get("summary") if fund_ctx else None,
             memory_context=memory_ctx or None,
             multiframe_context=multiframe_ctx or None,
+            smart_money_context=smart_money_ctx,
             momentum=sentiment_block.get("momentum") if sentiment_block else None,
             momentum_label=sentiment_block.get("momentum_label") if sentiment_block else None,
             source_diversity=sentiment_block.get("source_diversity") if sentiment_block else None,
