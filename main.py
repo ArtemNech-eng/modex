@@ -90,7 +90,7 @@ async def process_message(msg, analyzer: SentimentAnalyzer):
             "source": "telegram", "kind": "message", "ticker": ticker,
             "channel": msg.channel, "text": msg.text,
             "label": sentiment.label, "score": sentiment.score,
-            "signal": sentiment.signal, "ts": msg.timestamp,
+            "signal": sentiment.signal,
         })
 
     stats["messages_processed"] += 1
@@ -226,7 +226,7 @@ async def pulse_pipeline():
                     "source": "pulse", "kind": "message", "ticker": ticker,
                     "channel": getattr(post, "author", "") or "pulse", "text": post.text,
                     "label": sentiment.label, "score": sentiment.score,
-                    "signal": sentiment.signal, "ts": post.timestamp,
+                    "signal": sentiment.signal,
                 })
             stats["messages_processed"] += 1
         except Exception as e:
@@ -239,11 +239,19 @@ async def rss_pipeline():
     await rss.start()
     logger.info("📰 RSS pipeline запущен!")
 
+    seen_news: set = set()
     async for item in rss.listen():
         try:
             tickers = extract_tickers(item.full_text)
             if not tickers:
                 continue
+            # дедуп одинаковых новостей (одна и та же статья не должна дублироваться)
+            key = f"{item.source}|{(item.full_text or '')[:120]}"
+            if key in seen_news:
+                continue
+            seen_news.add(key)
+            if len(seen_news) > 5000:
+                seen_news.clear()
             sentiment = keyword_sentiment(item.full_text)
             # Новости взвешиваем по источнику
             weighted_signal = sentiment.signal * item.weight
@@ -261,7 +269,8 @@ async def rss_pipeline():
                     "source": "rss", "kind": "news", "ticker": ticker,
                     "channel": item.source, "text": item.full_text[:500],
                     "label": sentiment.label, "score": sentiment.score,
-                    "signal": max(-1, min(1, weighted_signal)), "ts": item.timestamp,
+                    "signal": max(-1, min(1, weighted_signal)),
+                    "payload": {"published": item.timestamp.isoformat() if hasattr(item.timestamp, 'isoformat') else str(item.timestamp)},
                 })
             stats["messages_processed"] += 1
         except Exception as e:

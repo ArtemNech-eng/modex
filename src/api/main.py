@@ -472,6 +472,11 @@ async def get_screen(limit: int = 25):
     from src.agent import screen as screener
     ranked = await screener.screen_all(aggregator)
     return {"screened": len(ranked), "results": ranked[:limit]}
+
+
+@app.get("/api/geopolitics", summary="Геополитический фон рынка")
+async def get_geopolitics():
+    """Текущий геополитический фон (влияет на весь рынок РФ)."""
     return geo.MONITOR.snapshot()
 
 
