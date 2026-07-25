@@ -301,19 +301,30 @@ def _msk_date(dt: datetime):
     return dt.astimezone(timezone(timedelta(hours=3))).date()
 
 
+def _session_over(sig_date, now: datetime) -> bool:
+    """Сессия МСК-дня сигнала уже закрыта? (наступил след. день ИЛИ ≥23:50 МСК)."""
+    now_msk = now.astimezone(timezone(timedelta(hours=3)))
+    return (sig_date < now_msk.date()) or (
+        sig_date == now_msk.date() and (now_msk.hour * 60 + now_msk.minute) >= (23 * 60 + 50))
+
+
 async def intraday_outcome(ticker: str, start_iso: str, direction: str,
                            entry: float, stop: float, target: float,
                            now_utc: Optional[datetime] = None) -> Optional[dict]:
     """
-    Пройти ПУТЬ цены от времени сигнала до ТЕКУЩЕГО момента (в пределах того же
-    МСК-дня) и определить исход интрадей-сделки. Оценивается на КАЖДОМ тике:
-      • "target"  — цель достигнута → фиксируем СРАЗУ (R ≈ план);
-      • "stop"    — выбито по фикс-стопу −1% → фиксируем СРАЗУ (R = −1);
-      • "session" — ни цель, ни стоп, но сессия УЖЕ закрылась (того же дня,
-                    ≥23:50 МСК или наступил след. день) → выход по закрытию;
-      • "pending" — сессия ещё идёт, уровни не задеты → сигнал в игре, НЕ оцениваем.
-    Касание — по intrabar high/low; если бар задел И стоп, И цель — консервативно
-    считаем СТОП. Возвращает dict или None (нет данных → откат на бэкстоп по close).
+    МНОГОНОГОЕ ведение интрадей-сделки по ПУТИ цены (в рамках фикс-риска 1%, без
+    расширения начального риска). Оценивается на КАЖДОМ тике; исходы:
+      • "stop"      — выбито по начальному стопу −1R (до частичной фиксации);
+      • "breakeven" — стоп ушёл в безубыток (+BE_TRIGGER_R достигнут), затем выбит ~0R;
+      • "target"    — достигнута цель T1: банкуем PARTIAL_FRAC, остаток трейлим;
+      • "session"   — ни цель, ни стоп; сессия закрылась → выход остатка по close;
+      • "pending"   — сделка ещё в игре (частично может быть закрыта) → НЕ финализируем.
+
+    Управление (параметры MGMT_* в settings): при +BE_TRIGGER_R стоп→вход; на T1
+    фиксируем PARTIAL_FRAC и остаток ведём чандельер-трейлом (peak − TRAIL_ATR×ATR,
+    не ниже BE) до конца сессии. Итоговый R — ВЗВЕШЕННЫЙ по ногам выхода.
+    Касание — по intrabar high/low; в одном баре стоп имеет приоритет над целью.
+    Возвращает dict или None (нет данных → бэкстоп по close в вызывающем коде).
     """
     if not (entry and stop and target) or direction not in ("up", "down"):
         return None
@@ -329,56 +340,117 @@ async def intraday_outcome(ticker: str, start_iso: str, direction: str,
     sig_date = _msk_date(start)
 
     # Свечи ПОСЛЕ сигнала, в пределах того же МСК-дня (вся сессия: main+evening).
-    # Данные историчны (≤ now), поэтому путь = сессия до текущего момента.
-    path = []
-    for i, ts in enumerate(dates):
-        dt = _parse_dt(ts)
-        if dt is None or dt < start:
-            continue
-        if _msk_date(dt) != sig_date:
-            continue
-        path.append(i)
+    path = [i for i, ts in enumerate(dates)
+            if (dt := _parse_dt(ts)) is not None and dt >= start and _msk_date(dt) == sig_date]
 
-    hit = None
+    R_unit = abs(entry - stop)          # 1R = |вход − стоп| = 1% входа
+    if R_unit <= 0:
+        return None
+    long = direction == "up"
+
+    def r_of(p):                        # реализованный R цены выхода (со знаком)
+        return (p - entry) / R_unit if long else (entry - p) / R_unit
+
+    # Параметры управления (с безопасными дефолтами)
+    from config import settings as S
+    enabled = getattr(S, "MGMT_ENABLED", True)
+    be_trig = getattr(S, "MGMT_BE_TRIGGER_R", 1.0)
+    part_frac = getattr(S, "MGMT_PARTIAL_FRAC", 0.5) if enabled else 1.0  # выкл → выход всей на T1
+    trail_k = getattr(S, "MGMT_TRAIL_ATR", 1.5)
+    use_trail = enabled and part_frac < 1.0
+    atr = iv.intraday_atr(highs, lows, closes) or R_unit
+
+    # Состояние ведения
+    rem = 1.0
+    cur_stop = stop           # начинаем с фикс-стопа −1R
+    be_done = False
+    partial_done = False
+    legs: list = []           # (frac, r, price, reason)
+    peak = entry              # лучший в нашу сторону экстремум (для трейла)
+    mfe_r = 0.0               # max favorable excursion, R
+    resolved = False
+    outcome = None
+
     for i in path:
         hi = highs[i] if i < len(highs) else closes[i]
         lo = lows[i] if i < len(lows) else closes[i]
-        if direction == "up":
-            hit_stop, hit_tgt = lo <= stop, hi >= target
-        else:
-            hit_stop, hit_tgt = hi >= stop, lo <= target
-        if hit_stop:                      # стоп имеет приоритет (в т.ч. если задело оба)
-            hit = ("stop", stop); break
-        if hit_tgt:
-            hit = ("target", target); break
+        fav = hi if long else lo          # экстремум в нашу сторону в этом баре
+        adv = lo if long else hi          # экстремум против нас
+        mfe_r = max(mfe_r, r_of(fav))
 
-    if hit is not None:
-        outcome, realized_price = hit          # цель/стоп — фиксируем немедленно
-    else:
-        # Уровни не задеты → смотрим, закрылась ли сессия того же дня.
-        now_msk = now.astimezone(timezone(timedelta(hours=3)))
-        session_over = (sig_date < now_msk.date()) or (
-            sig_date == now_msk.date() and (now_msk.hour * 60 + now_msk.minute) >= (23 * 60 + 50))
-        if not session_over:
-            return {"outcome": "pending", "bars": len(path)}
+        # 1) Неблагоприятно: стоп/трейл (тест по стопу, выставленному ПРОШЛЫМИ барами)
+        stop_hit = (adv <= cur_stop) if long else (adv >= cur_stop)
+        if stop_hit:
+            if not partial_done and abs(cur_stop - stop) < 1e-9:
+                outcome = "stop"           # начальный −1R
+            elif not partial_done and abs(cur_stop - entry) <= 1e-9:
+                outcome = "breakeven"      # BE-стоп до частичной фиксации, ~0R
+            else:
+                outcome = "target"         # T1 уже сняли, остаток вышел по трейлу
+            legs.append((rem, r_of(cur_stop), cur_stop, "stop" if outcome != "target" else "trail"))
+            rem = 0.0
+            resolved = True
+            break
+
+        # 2) Цель T1 (частичная фиксация) — только если ещё не фиксировали
+        tgt_hit = (hi >= target) if long else (lo <= target)
+        if not partial_done and tgt_hit:
+            legs.append((part_frac, r_of(target), target, "target"))
+            rem -= part_frac
+            partial_done = True
+            cur_stop = max(cur_stop, entry) if long else min(cur_stop, entry)  # остаток → BE
+            if rem <= 1e-9:                # выходим всей позицией (part_frac=1.0 / выкл mgmt)
+                rem = 0.0
+                resolved = True
+                outcome = "target"
+                break
+            peak = max(peak, hi) if long else min(peak, lo)
+            if use_trail:                 # инициализируем трейл остатка
+                trail = (peak - trail_k * atr) if long else (peak + trail_k * atr)
+                cur_stop = (max(cur_stop, trail) if long else min(cur_stop, trail))
+            continue
+
+        # 3) Триггер безубытка (+BE_TRIGGER_R) — до частичной фиксации
+        if enabled and not be_done and not partial_done:
+            reached = (hi >= entry + be_trig * R_unit) if long else (lo <= entry - be_trig * R_unit)
+            if reached:
+                be_done = True
+                cur_stop = max(cur_stop, entry) if long else min(cur_stop, entry)
+
+        # 4) Обновляем пик и подтягиваем трейл остатка (для СЛЕДУЮЩЕГО бара)
+        peak = max(peak, hi) if long else min(peak, lo)
+        if partial_done and use_trail:
+            trail = (peak - trail_k * atr) if long else (peak + trail_k * atr)
+            trail = max(trail, entry) if long else min(trail, entry)   # не ниже BE
+            cur_stop = max(cur_stop, trail) if long else min(cur_stop, trail)
+
+    if not resolved:
+        # Не выбито и цель (полностью) не отработала. Финализируем ТОЛЬКО если сессия
+        # закрылась; иначе сделка ещё в игре (возможно, частично снята) → pending.
+        if not _session_over(sig_date, now):
+            return {"outcome": "pending", "bars": len(path),
+                    "mfe_r": round(mfe_r, 3), "partial": partial_done}
         if not path:
-            return None                        # сессия закрыта, но данных нет → бэкстоп
-        outcome, realized_price = "session", closes[path[-1]]  # закрытие сессии
+            return None                    # сессия закрыта, но данных нет → бэкстоп
+        last_close = closes[path[-1]]
+        legs.append((rem, r_of(last_close), last_close, "session"))
+        outcome = "target" if partial_done else "session"
+        rem = 0.0
 
-    realized_return = (realized_price / entry - 1) * 100  # сырое изменение цены, %
-    risk = abs(entry - stop)
-    if risk <= 0:
-        realized_r = None
-    elif direction == "up":
-        realized_r = (realized_price - entry) / risk
-    else:
-        realized_r = (entry - realized_price) / risk
+    # Агрегируем ноги: итоговый R взвешенный, цена выхода — средневзвешенная.
+    final_r = sum(frac * r for frac, r, _p, _w in legs)
+    wsum = sum(frac for frac, _r, _p, _w in legs) or 1.0
+    avg_exit = sum(frac * p for frac, _r, p, _w in legs) / wsum
+    realized_return = (avg_exit / entry - 1) * 100
 
     return {
         "outcome": outcome,
-        "realized_price": round(realized_price, 4),
+        "realized_price": round(avg_exit, 4),
         "realized_return": round(realized_return, 3),
-        "realized_r": round(realized_r, 3) if realized_r is not None else None,
+        "realized_r": round(final_r, 3),
+        "mfe_r": round(mfe_r, 3),
+        "legs": [{"frac": round(f, 3), "r": round(r, 3), "price": round(p, 4), "reason": w}
+                 for f, r, p, w in legs],
         "bars": len(path),
         "source": data.get("_source"),
     }

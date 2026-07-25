@@ -118,6 +118,15 @@ FILTER_CONFLUENCE_COUNTERTREND = int(os.getenv("FILTER_CONFLUENCE_COUNTERTREND",
 FILTER_CONFLUENCE_AGAINST_HTF = int(os.getenv("FILTER_CONFLUENCE_AGAINST_HTF", "5"))    # №4: против HTF / сливающий режим
 FILTER_REGIME_MIN_TRADES = int(os.getenv("FILTER_REGIME_MIN_TRADES", "20"))    # №4: выборка для гейта по режиму
 
+# ─── Управление сделкой №3 (безубыток + частичная фиксация + трейл) ────────────
+# Ведём позицию МНОГОНОГО в рамках фикс-риска 1% (начальный риск НЕ расширяем):
+# при +BE_TRIGGER_R → стоп в безубыток; на цели фиксируем PARTIAL_FRAC; остаток
+# трейлим (peak − TRAIL_ATR×ATR, не ниже BE) до конца сессии. Итоговый R взвешенный.
+MGMT_ENABLED = os.getenv("MGMT_ENABLED", "true").lower() == "true"
+MGMT_BE_TRIGGER_R = float(os.getenv("MGMT_BE_TRIGGER_R", "1.0"))   # при скольки R двигаем стоп в безубыток
+MGMT_PARTIAL_FRAC = float(os.getenv("MGMT_PARTIAL_FRAC", "0.5"))   # доля позиции, фиксируемая на цели T1
+MGMT_TRAIL_ATR = float(os.getenv("MGMT_TRAIL_ATR", "1.5"))         # чандельер-трейл остатка, ×ATR
+
 # Авто-старт live-движка при запуске приложения: сканирование → сигналы по
 # плейбуку → оценка созревших прогнозов → обучение. Без него «мозг» простаивает
 # до ручного /api/live-signals/start и гаснет при каждом редеплое.

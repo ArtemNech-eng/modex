@@ -126,9 +126,11 @@ class Prediction(Base):
     realized_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     realized_return: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     correct: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
-    # Интрадей-исход по пути цены до конца сессии: target|stop|session (Фаза B)
+    # Интрадей-исход по пути цены: target|stop|breakeven|session (Фаза B + №3)
     outcome: Mapped[Optional[str]] = mapped_column(String(12), nullable=True)
-    realized_r: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # факт. R (риск = 1% от входа)
+    realized_r: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # ВЗВЕШЕННЫЙ факт. R (риск = 1% от входа)
+    mfe_r: Mapped[Optional[float]] = mapped_column(Float, nullable=True)       # макс. ход в нашу сторону, R (MFE)
+    legs_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)      # ноги выхода [{frac,r,price,reason}] (JSON)
     evaluated_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -176,6 +178,8 @@ class Prediction(Base):
             "outcome": self.outcome,
             "realized_r": (round(self.realized_r, 3)
                            if self.realized_r is not None else None),
+            "mfe_r": (round(self.mfe_r, 3) if self.mfe_r is not None else None),
+            "legs": (json.loads(self.legs_json) if self.legs_json else None),
             "correct": self.correct,
             "evaluated_at": self.evaluated_at.isoformat() if self.evaluated_at else None,
             "post_mortem": self.post_mortem,
@@ -317,6 +321,9 @@ _PREDICTION_ADDED_COLUMNS = {
     # Фаза B — исход по пути цены:
     "outcome": "TEXT",
     "realized_r": "DOUBLE PRECISION",
+    # №3 — управление сделкой:
+    "mfe_r": "DOUBLE PRECISION",
+    "legs_json": "TEXT",
 }
 
 
@@ -643,6 +650,7 @@ async def has_open_signal(ticker: str) -> bool:
 async def evaluate_prediction(
     pred_id: int, realized_price: float, realized_return: float, correct: bool,
     outcome: Optional[str] = None, realized_r: Optional[float] = None,
+    mfe_r: Optional[float] = None, legs: Optional[list] = None,
 ) -> None:
     async with async_session() as session:
         pred = await session.get(Prediction, pred_id)
@@ -655,6 +663,13 @@ async def evaluate_prediction(
             pred.outcome = outcome
         if realized_r is not None:
             pred.realized_r = realized_r
+        if mfe_r is not None:
+            pred.mfe_r = mfe_r
+        if legs is not None:
+            try:
+                pred.legs_json = json.dumps(legs, ensure_ascii=False)
+            except Exception:
+                pred.legs_json = None
         pred.evaluated_at = datetime.now(timezone.utc)
         await session.commit()
 
@@ -1061,7 +1076,8 @@ async def regime_stats() -> dict:
             continue  # «наблюдать»/flat — не сделки, в статистику не берём
         reg = p.regime or "unknown"
         g = groups.setdefault(reg, {"correct": 0, "total": 0, "returns": [], "rs": [],
-                                    "confl": [], "target": 0, "stop": 0, "session": 0})
+                                    "confl": [], "mfes": [],
+                                    "target": 0, "stop": 0, "breakeven": 0, "session": 0})
         g["total"] += 1
         if p.correct:
             g["correct"] += 1
@@ -1072,9 +1088,11 @@ async def regime_stats() -> dict:
             p.direction, p.entry, p.stop, p.realized_price)
         if r is not None:
             g["rs"].append(r)
+        if p.mfe_r is not None:
+            g["mfes"].append(p.mfe_r)
         if p.confluence_score is not None:
             g["confl"].append(p.confluence_score)
-        if p.outcome in ("target", "stop", "session"):
+        if p.outcome in ("target", "stop", "breakeven", "session"):
             g[p.outcome] += 1
 
     def _avg(xs):
@@ -1089,8 +1107,10 @@ async def regime_stats() -> dict:
             "win_rate": round(g["correct"] / n * 100, 1) if n else None,
             "avg_return": _avg(g["returns"]),
             "avg_r": _avg(g["rs"]),
+            "avg_mfe_r": _avg(g["mfes"]),
             "avg_confluence": _avg(g["confl"]),
-            "outcomes": {"target": g["target"], "stop": g["stop"], "session": g["session"]},
+            "outcomes": {"target": g["target"], "stop": g["stop"],
+                         "breakeven": g["breakeven"], "session": g["session"]},
         })
     by_regime.sort(key=lambda x: x["trades"], reverse=True)
     return {"by_regime": by_regime,

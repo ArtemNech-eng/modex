@@ -391,7 +391,8 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
                 "invalidation": claude_result.get("invalidation"),
                 "atr": intraday_ctx.get("atr") if intraday_ctx else None,
                 "entry_rule": claude_result.get("setup") or "",
-                "exit_rule": "Стоп −1%; цель по плану; флэт к закрытию сессии.",
+                "exit_rule": ("Стоп −1%; при +1R → в безубыток; на цели фиксируем 50%, "
+                              "остаток трейлим (1.5×ATR) до закрытия сессии."),
             }
             reg = claude_result.get("regime")
             if reg and reg != "unclear":
@@ -642,10 +643,11 @@ async def evaluate_due_predictions() -> dict:
         correct = bool(rr is not None and rr > 0)  # прибыльна в R → «верна»
         await db.evaluate_prediction(
             p.id, oc["realized_price"], oc["realized_return"], correct,
-            outcome=oc["outcome"], realized_r=rr)
+            outcome=oc["outcome"], realized_r=rr,
+            mfe_r=oc.get("mfe_r"), legs=oc.get("legs"))
         logger.info(
             f"📏 {p.ticker} {p.direction}: исход={oc['outcome']} "
-            f"R={rr} ({oc['realized_return']:+.2f}%)")
+            f"R={rr} (MFE {oc.get('mfe_r')}R, {oc['realized_return']:+.2f}%)")
         evaluated += 1
 
     # ── 2) Легаси/не-Claude прогнозы — по горизонту, оценка по цене (бэкстоп) ──
