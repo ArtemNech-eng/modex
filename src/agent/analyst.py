@@ -191,27 +191,31 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         except Exception as e:
             logger.debug(f"smart-money context failed for {ticker}: {e}")
 
-        # Генерируем график и получаем визуальный анализ Claude
+        # Визуальный разбор графика (Claude Vision) — это ВТОРОЙ вызов Claude на
+        # тикер + дорогой input-image, поэтому по умолчанию ВЫКЛЮЧЕН (экономия).
+        # Включается флагом CHART_ANALYSIS_ENABLED. Структурных данных и так вагон.
         chart_analysis = None
         try:
-            candles = await ta.fetch_candles(ticker, days=120)
-            chart_b64 = await generate_chart_b64(
-                ticker=ticker,
-                closes=candles.get("close", []),
-                highs=candles.get("high", []),
-                lows=candles.get("low", []),
-                opens=candles.get("open", []),
-                dates=candles.get("dates", []),
-                days=120,
-            )
-            if chart_b64:
-                chart_analysis = await _claude.analyze_chart(
+            from config.settings import CHART_ANALYSIS_ENABLED
+            if CHART_ANALYSIS_ENABLED:
+                candles = await ta.fetch_candles(ticker, days=120)
+                chart_b64 = await generate_chart_b64(
                     ticker=ticker,
-                    image_b64=chart_b64,
-                    sentiment_index=sentiment_block["sentiment_index"] if sentiment_block else None,
-                    extra_context=price_ctx,
+                    closes=candles.get("close", []),
+                    highs=candles.get("high", []),
+                    lows=candles.get("low", []),
+                    opens=candles.get("open", []),
+                    dates=candles.get("dates", []),
+                    days=120,
                 )
-                logger.info(f"📊 Claude chart → {ticker}: {chart_analysis.get('chart_signal')}")
+                if chart_b64:
+                    chart_analysis = await _claude.analyze_chart(
+                        ticker=ticker,
+                        image_b64=chart_b64,
+                        sentiment_index=sentiment_block["sentiment_index"] if sentiment_block else None,
+                        extra_context=price_ctx,
+                    )
+                    logger.info(f"📊 Claude chart → {ticker}: {chart_analysis.get('chart_signal')}")
         except Exception as e:
             logger.warning(f"Chart analysis failed for {ticker}: {e}")
 

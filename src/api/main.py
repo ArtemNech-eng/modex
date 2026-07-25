@@ -1106,7 +1106,27 @@ def _now_iso() -> str:
 
 
 async def _live_scan_once() -> dict:
-    """Один цикл: триаж (словари+ML) → Claude подтверждает интересное → журнал."""
+    """
+    Один цикл. Оценка созревших прогнозов — БЕСПЛАТНАЯ (без Claude), гоняем ВСЕГДА
+    (замыкает обучение). Сканирование + подтверждение Claude — ТОЛЬКО в торговую
+    сессию (main/evening): вне сессии торговать нечего → Claude не зовём (экономия).
+    """
+    ev = await analyst.evaluate_due_predictions()
+    _live_status["last_eval"] = _now_iso()
+    _live_status["evaluated_total"] += ev.get("evaluated", 0)
+
+    from datetime import timedelta as _td
+    from src.analysis import intraday as _iv
+    _msk = datetime.now(timezone.utc).astimezone(timezone(_td(hours=3)))
+    _phase = _iv.session_phase(_msk.hour * 60 + _msk.minute)
+    if _phase not in ("main", "evening"):
+        _live_status["last_scan"] = _now_iso()
+        _live_status["scanned"] = 0
+        _live_status["saved"] = 0
+        _live_status["skipped"] = f"вне сессии ({_phase}) — Claude не звали"
+        return {"saved": 0, "evaluated": ev.get("evaluated", 0), "skipped": _phase}
+
+    _live_status["skipped"] = None
     from config.settings import SCAN_MIN_INTEREST, SCAN_MAX_CLAUDE
     triage = await scanner.scan_interesting(
         aggregator, tickers=_live_status["tickers"], save=True,
@@ -1116,9 +1136,6 @@ async def _live_scan_once() -> dict:
     _live_status["scanned"] = triage.get("screened", 0)
     _live_status["interesting"] = triage.get("interesting", [])
     _live_status["saved"] = saved
-    ev = await analyst.evaluate_due_predictions()
-    _live_status["last_eval"] = _now_iso()
-    _live_status["evaluated_total"] += ev.get("evaluated", 0)
     return {"saved": saved, "evaluated": ev.get("evaluated", 0)}
 
 
