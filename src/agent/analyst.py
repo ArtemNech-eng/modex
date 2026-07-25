@@ -13,7 +13,7 @@ MOODEX — AI-агент (аналитик)
 """
 import os
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from src.analysis import technical as ta
@@ -215,6 +215,12 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         except Exception as e:
             logger.warning(f"Chart analysis failed for {ticker}: {e}")
 
+        # Разбор графика (Claude Vision) — ВХОД для Claude, а не отдельный голос:
+        chart_ctx = None
+        if chart_analysis and chart_analysis.get("chart_signal"):
+            chart_ctx = (f"📈 РАЗБОР ГРАФИКА (Vision): {chart_analysis.get('chart_signal')} "
+                         f"(уверенность {chart_analysis.get('chart_confidence')}%)")
+
         claude_result = await _claude.synthesize_ticker(
             ticker=ticker,
             company=company,
@@ -237,6 +243,7 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
             lessons_context=lessons_ctx or None,
             intraday_context=(intraday_ctx or {}).get("summary") if intraday_ctx else None,
             knowledge_context=knowledge_ctx or None,
+            chart_context=chart_ctx,
             momentum=sentiment_block.get("momentum") if sentiment_block else None,
             momentum_label=sentiment_block.get("momentum_label") if sentiment_block else None,
             source_diversity=sentiment_block.get("source_diversity") if sentiment_block else None,
@@ -244,33 +251,15 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
             signal_confidence=sentiment_block.get("confidence") if sentiment_block else None,
         )
 
-        # Переводим сигнал Claude в направление
-        # Совмещаем текстовый анализ + визуальный анализ графика
+        # Claude по плейбуку — ЕДИНСТВЕННЫЙ, кто решает направление и уверенность
+        # (график он уже увидел как вход через chart_context / Vision, отдельного
+        # голосования больше нет).
         signal_map = {"bullish": "up", "bearish": "down", "neutral": "flat"}
-        text_signal  = signal_map.get(claude_result.get("signal", "neutral"), "flat")
-        text_conf    = claude_result.get("confidence", 0) / 100
-
-        if chart_analysis:
-            chart_signal = signal_map.get(chart_analysis.get("chart_signal", "neutral"), "flat")
-            chart_conf   = chart_analysis.get("chart_confidence", 0) / 100
-            # Взвешенное голосование текст vs график. По умолчанию текст 60% /
-            # график 40%: текстовый вывод опирается на МНОГО входов (макро,
-            # фундаментал, техника в числах, настроение, стакан, «умные деньги»,
-            # память), а разбор графика — это один визуальный сигнал, поэтому вес
-            # ниже. Это эвристика, не подобранная по бэктесту — вес вынесен в
-            # CHART_VOTE_WEIGHT, чтобы его можно было настраивать/со временем
-            # сделать обучаемым.
-            chart_w = float(os.getenv("CHART_VOTE_WEIGHT", "0.4"))
-            chart_w = min(max(chart_w, 0.0), 1.0)
-            text_w  = 1.0 - chart_w
-            score = text_w  * ({"up": 1, "flat": 0, "down": -1}[text_signal]  * text_conf) + \
-                    chart_w * ({"up": 1, "flat": 0, "down": -1}[chart_signal] * chart_conf)
-            direction  = "up" if score > 0.1 else "down" if score < -0.1 else "flat"
-            confidence = round(abs(score), 3)
-        else:
-            direction  = text_signal
-            confidence = round(text_conf, 3)
+        direction  = signal_map.get(claude_result.get("signal", "neutral"), "flat")
+        confidence = round((claude_result.get("confidence", 0) or 0) / 100, 3)
         narrative  = claude_result.get("summary", "")
+        # Метрики согласованы С РЕШЕНИЕМ CLAUDE (а не из fallback-модели):
+        combined   = confidence if direction == "up" else (-confidence if direction == "down" else 0.0)
 
         logger.info(f"🤖 Claude → {ticker}: {direction} (уверенность {confidence})")
 
@@ -280,69 +269,58 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
 
     recommendation = _recommendation(direction, confidence)
 
-    # Корректируем рекомендацию по точке входа (технический анализ)
-    entry_status = None
-    if tech and tech.trade_plan:
-        entry_status = tech.trade_plan.get("entry_status")
-    if entry_status:
-        bias = "лонг" if direction == "up" else "шорт" if direction == "down" else "нейтрально"
-        if entry_status in ("late", "invalid"):
-            recommendation = "⚪ Наблюдать — точка входа упущена"
-        elif entry_status in ("wait", "above", "below"):
-            recommendation = f"⏳ Ждать входа ({bias})"
+    # ── План сделки — ИЗ РЕШЕНИЯ CLAUDE (инвалидация-first) ──────────────────────
+    # Вход/стоп/цель берём у Claude, а не у rule-движков. Интрадей/техника уже
+    # ушли Claude как ВХОДНЫЕ данные в промпт и направление больше не назначают.
+    def _num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
 
-    # Интрадей-гвард: согласуем интрадей-сетап со старшим (дневным) трендом.
-    # Контртренд к сильному дневному тренду и слабый R/R уходят в «наблюдение»
-    # (а не в ложный «вход»). Если сетап реально ведёт вход — показываем именно
-    # интрадей-план и согласованные метрики, чтобы карточка не противоречила себе.
-    intraday_trade_plan = None
-    if intraday_ctx:
-        if intraday_ctx.get("observe"):
-            recommendation = f"⚪ Наблюдать — интрадей: {intraday_ctx.get('note') or 'высокая волатильность'}"
-            if intraday_ctx.get("setup") == "news_observe":
-                direction = "flat"
-        elif intraday_ctx.get("plan"):
-            plan = intraday_ctx["plan"]
-            itf_dir = "up" if plan["signal"] == "long" else "down"
-            rr = plan.get("risk_reward") or 0
-            daily_dir = ("up" if tech and tech.regime == "uptrend"
-                         else "down" if tech and tech.regime == "downtrend" else None)
-            strong_daily = bool(tech and (tech.adx or 0) >= 25 and daily_dir)
-            is_news = intraday_ctx.get("setup") == "news_resolution"
-            counter_trend = strong_daily and daily_dir != itf_dir and not is_news
-            weak_rr = bool(rr) and rr < 1.0
+    claude_trade_plan = None
+    if claude_result and direction != "flat":
+        c_entry, c_stop = _num(claude_result.get("entry")), _num(claude_result.get("stop"))
+        c_target, c_rr = _num(claude_result.get("target")), _num(claude_result.get("rr"))
+        if c_entry and c_stop:
+            if c_rr is None and c_target is not None and c_entry != c_stop:
+                c_rr = round(abs(c_target - c_entry) / abs(c_entry - c_stop), 2)
+            claude_trade_plan = {
+                "direction": "long" if direction == "up" else "short",
+                "entry_low": c_entry, "entry_high": c_entry,
+                "price": intraday_ctx.get("price") if intraday_ctx else (tech.price if tech else None),
+                "stop_loss": c_stop,
+                "take_profit_1": c_target, "take_profit_2": None,
+                "risk_reward": c_rr, "current_rr": c_rr,
+                "entry_status": "enter",
+                "entry_note": claude_result.get("setup") or "",
+                "size": claude_result.get("size"),
+                "invalidation": claude_result.get("invalidation"),
+                "atr": intraday_ctx.get("atr") if intraday_ctx else None,
+                "entry_rule": claude_result.get("setup") or "",
+                "exit_rule": "Тайм-стоп к закрытию сессии; сопровождение по VWAP.",
+            }
+            reg = claude_result.get("regime")
+            if reg and reg != "unclear":
+                recommendation = f"{recommendation} · режим: {reg}"
 
-            if counter_trend or weak_rr:
-                bias = "лонг" if itf_dir == "up" else "шорт"
-                why = ("против сильного дневного тренда "
-                       f"(дн. {'вверх' if daily_dir=='up' else 'вниз'}, ADX {tech.adx})"
-                       if counter_trend else f"слабый R/R {rr}")
-                recommendation = f"⚪ Наблюдать — интрадей-{bias} {why}"
-                direction = "flat"
-                intraday_ctx = {**intraday_ctx, "observe": True, "signal": "observe"}
-            else:
-                direction = itf_dir
-                bias = "лонг" if direction == "up" else "шорт"
-                recommendation = f"🎯 Интрадей-вход ({bias}) — {intraday_ctx.get('note')}"
-                # уверенность из R/R сетапа; метрики согласуем с направлением,
-                # чтобы заголовок, P(рост) и score не противоречили друг другу
-                conf_i = max(0.3, min(0.7, rr / 3.0)) if rr else 0.4
-                confidence = round(conf_i, 3)
-                combined = conf_i if direction == "up" else -conf_i
-                # показываем ИМЕННО интрадей-план (а не дневной)
-                intraday_trade_plan = {
-                    "direction": "long" if direction == "up" else "short",
-                    "entry_low": plan.get("entry"), "entry_high": plan.get("entry"),
-                    "price": intraday_ctx.get("price"),
-                    "stop_loss": plan.get("stop_loss"),
-                    "take_profit_1": plan.get("take_profit"), "take_profit_2": None,
-                    "risk_reward": plan.get("risk_reward"), "current_rr": plan.get("risk_reward"),
-                    "entry_status": "enter",
-                    "entry_note": f"Интрадей: {intraday_ctx.get('note')}",
-                    "support": None, "resistance": None, "atr": intraday_ctx.get("atr"),
-                    "entry_rule": intraday_ctx.get("note") or "",
-                    "exit_rule": "Тайм-стоп к закрытию сессии; сопровождение по VWAP.",
-                }
+    # ── Гвард безопасности: ТОЛЬКО жёсткое вето (направление НЕ назначает) ───────
+    # Claude решает; гвард лишь запрещает НОВЫЙ вход, когда небезопасно: рынок
+    # закрыт / пауза / пре-аукцион или последние минуты сессии (флэт к закрытию).
+    try:
+        from src.analysis import intraday as _iv
+        _msk = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=3)))
+        _mod = _msk.hour * 60 + _msk.minute
+        _phase = _iv.session_phase(_mod)
+        _near_close = _iv.is_last_minutes(_mod, buffer_min=15)
+    except Exception:
+        _phase, _near_close = "main", False
+    if direction != "flat" and (_phase in ("closed", "break", "pre") or _near_close):
+        _why = ("рынок закрыт / пауза" if _phase in ("closed", "break", "pre")
+                else "конец сессии — флэт к закрытию")
+        direction, confidence, combined = "flat", 0.0, 0.0
+        claude_trade_plan = None
+        recommendation = f"⚪ Наблюдать — {_why}"
 
     # ── 6. Обоснование ──────────────────────────────────────────────────────
     reasons: list[str] = []
@@ -424,10 +402,9 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # Если вход ведёт интрадей-сетап — показываем его план как основной
-    # (иначе на карточке дневной план противоречил бы интрадей-заголовку).
-    if intraday_trade_plan:
-        result["trade_plan"] = intraday_trade_plan
+    # План сделки на карточке — ИЗ РЕШЕНИЯ CLAUDE (если это вход, не «наблюдать»).
+    if claude_trade_plan:
+        result["trade_plan"] = claude_trade_plan
 
     # ── 7. Сохраняем прогноз в БД (память агента) ───────────────────────────
     if save:
@@ -446,7 +423,9 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
                 "rsi": technical_block.get("rsi") if technical_block else None,
                 "technical_score": technical_score,
                 "strategy": tech.strategy if tech else None,
-                "entry_status": entry_status,
+                "regime_claude": (claude_result or {}).get("regime") if claude_result else None,
+                "confluence_score": (claude_result or {}).get("confluence_score") if claude_result else None,
+                "setup": (claude_result or {}).get("setup") if claude_result else None,
                 "geo_score": geo_score,
                 "smart_money": smart_money_ctx,
                 "chart_signal": (chart_analysis or {}).get("chart_signal") if chart_analysis else None,
