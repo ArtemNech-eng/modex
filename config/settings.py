@@ -107,6 +107,17 @@ SCAN_MAX_CLAUDE = int(os.getenv("SCAN_MAX_CLAUDE", "2"))            # макс. 
 # input-image. По умолчанию ВЫКЛ ради экономии; структурных данных и так достаточно.
 CHART_ANALYSIS_ENABLED = os.getenv("CHART_ANALYSIS_ENABLED", "false").lower() == "true"
 
+# ─── Вето-слой КАЧЕСТВА интрадей-сигналов (№1 окно / №2 анти-чейз / №4 режим+HTF) ─
+# Не трогает стоп 1% и решение Claude — только ОТКЛОНЯЕТ слабые входы (→ «наблюдать»,
+# не сохраняем). Всё числами, без доп. вызовов Claude. Пороги легко тюнить из .env.
+FILTER_NO_ENTRY_FIRST_MIN = int(os.getenv("FILTER_NO_ENTRY_FIRST_MIN", "15"))  # №1: мин после открытия без входов
+FILTER_REQUIRE_ORB = os.getenv("FILTER_REQUIRE_ORB", "true").lower() == "true"  # №1: требовать сформированный ORB
+FILTER_ENTRY_MAX_ATR = float(os.getenv("FILTER_ENTRY_MAX_ATR", "0.5"))         # №2: макс. расстояние входа до уровня, ×ATR
+FILTER_CONFLUENCE_MIN = int(os.getenv("FILTER_CONFLUENCE_MIN", "3"))            # №4: базовый порог конфлюенса
+FILTER_CONFLUENCE_COUNTERTREND = int(os.getenv("FILTER_CONFLUENCE_COUNTERTREND", "4"))  # №4: фейд диапазона (range)
+FILTER_CONFLUENCE_AGAINST_HTF = int(os.getenv("FILTER_CONFLUENCE_AGAINST_HTF", "5"))    # №4: против HTF / сливающий режим
+FILTER_REGIME_MIN_TRADES = int(os.getenv("FILTER_REGIME_MIN_TRADES", "20"))    # №4: выборка для гейта по режиму
+
 # Авто-старт live-движка при запуске приложения: сканирование → сигналы по
 # плейбуку → оценка созревших прогнозов → обучение. Без него «мозг» простаивает
 # до ручного /api/live-signals/start и гаснет при каждом редеплое.

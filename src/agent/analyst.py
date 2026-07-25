@@ -50,6 +50,74 @@ def _recommendation(direction: str, confidence: float) -> str:
     return "Держать / нейтрально ⚪"
 
 
+def _quality_veto(direction: str, claude_result: dict, intraday_ctx,
+                  c_entry, mod_msk: int, regime_stats: dict):
+    """
+    Вето-слой КАЧЕСТВА интрадей-сигнала (усиления №1/№2/№4). Возвращает причину
+    отклонения (str) или None. НИЧЕГО не создаёт и НЕ трогает стоп 1% и решение
+    Claude — только отсекает слабые входы (сигнал → «наблюдать», не сохраняется).
+
+      №1 ОКНО      — не входим в первые N мин сессии (шум) и без сформированного ORB;
+      №2 АНТИ-ЧЕЙЗ — вход обязан быть у структуры (≤ K×ATR до уровня), не «в поле»;
+      №4 РЕЖИМ+HTF — планка конфлюенса выше против тренда/HTF и для сливающих режимов.
+    """
+    from config import settings as S
+
+    levels = (intraday_ctx or {}).get("levels") or {}
+
+    # ── №1 ОКНО ТОРГОВЛИ ──────────────────────────────────────────────────────
+    open_main = 10 * 60  # 10:00 МСК — открытие основной сессии
+    first_min = getattr(S, "FILTER_NO_ENTRY_FIRST_MIN", 15)
+    if open_main <= mod_msk < open_main + first_min:
+        return f"первые {first_min} мин сессии — шум открытия, ждём"
+    if getattr(S, "FILTER_REQUIRE_ORB", True) and levels.get("or_high") is None:
+        return "диапазон открытия (ORB) ещё не сформирован"
+
+    # ── №2 АНТИ-ЧЕЙЗ: вход у уровня, не догоняем ──────────────────────────────
+    atr = (intraday_ctx or {}).get("atr")
+    if c_entry and atr and atr > 0:
+        ref = [levels.get(k) for k in
+               ("vwap", "or_high", "or_low", "session_high", "session_low",
+                "spike_high", "spike_low")]
+        ref = [x for x in ref if x]
+        if ref:
+            nearest = min(abs(c_entry - x) for x in ref)
+            max_atr = getattr(S, "FILTER_ENTRY_MAX_ATR", 0.5)
+            if nearest > max_atr * atr:
+                return (f"вход далеко от уровня ({nearest / atr:.1f}×ATR > "
+                        f"{max_atr}×ATR) — это чейз, ждём откат")
+
+    # ── №4 РЕЖИМ + HTF + КОНФЛЮЕНС ────────────────────────────────────────────
+    try:
+        conf = int(claude_result.get("confluence_score") or 0)
+    except (TypeError, ValueError):
+        conf = 0
+    htf = (claude_result.get("htf_bias") or "neutral").lower()
+    regime = (claude_result.get("regime") or "unclear").lower()
+    against_htf = ((htf == "long" and direction == "down") or
+                   (htf == "short" and direction == "up"))
+
+    required = getattr(S, "FILTER_CONFLUENCE_MIN", 3)
+    if regime == "range":                       # фейд границ = контр-тренд
+        required = max(required, getattr(S, "FILTER_CONFLUENCE_COUNTERTREND", 4))
+    if against_htf:                             # против старшего фона
+        required = max(required, getattr(S, "FILTER_CONFLUENCE_AGAINST_HTF", 5))
+
+    # Гейт по статистике режима: если режим на выборке сливает — планку вверх.
+    min_trades = getattr(S, "FILTER_REGIME_MIN_TRADES", 20)
+    for row in (regime_stats or {}).get("by_regime", []):
+        if row.get("regime") == regime and (row.get("trades") or 0) >= min_trades:
+            avg_r = row.get("avg_r")
+            if avg_r is not None and avg_r < 0:
+                required = max(required, getattr(S, "FILTER_CONFLUENCE_AGAINST_HTF", 5))
+            break
+
+    if conf < required:
+        return f"конфлюенс {conf} < порога {required} (режим {regime}/HTF {htf})"
+
+    return None
+
+
 async def _load_weights() -> list[float]:
     raw = await db.get_setting(pred.WEIGHTS_KEY)
     return pred.weights_from_json(raw) if raw else pred.DEFAULT_WEIGHTS
@@ -329,9 +397,11 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
             if reg and reg != "unclear":
                 recommendation = f"{recommendation} · режим: {reg}"
 
-    # ── Гвард безопасности: ТОЛЬКО жёсткое вето (направление НЕ назначает) ───────
-    # Claude решает; гвард лишь запрещает НОВЫЙ вход, когда небезопасно: рынок
-    # закрыт / пауза / пре-аукцион или последние минуты сессии (флэт к закрытию).
+    # ── Гвард безопасности + вето-слой КАЧЕСТВА ─────────────────────────────────
+    # Claude решает; этот слой лишь ОТКЛОНЯЕТ вход (→ «наблюдать», не сохраняем).
+    # Он НИЧЕГО не создаёт и НЕ трогает стоп 1% — только отсекает небезопасные
+    # (рынок закрыт/конец сессии) и СЛАБЫЕ (№1 окно / №2 чейз / №4 режим+HTF) входы.
+    result_veto_reason = None
     try:
         from src.analysis import intraday as _iv
         _msk = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=3)))
@@ -339,13 +409,29 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         _phase = _iv.session_phase(_mod)
         _near_close = _iv.is_last_minutes(_mod, buffer_min=15)
     except Exception:
-        _phase, _near_close = "main", False
+        _mod, _phase, _near_close = 12 * 60, "main", False
+    # (безопасность) рынок закрыт / пауза / пре-аукцион / конец сессии
     if direction != "flat" and (_phase in ("closed", "break", "pre") or _near_close):
         _why = ("рынок закрыт / пауза" if _phase in ("closed", "break", "pre")
                 else "конец сессии — флэт к закрытию")
         direction, confidence, combined = "flat", 0.0, 0.0
         claude_trade_plan = None
         recommendation = f"⚪ Наблюдать — {_why}"
+        result_veto_reason = _why
+    # (качество №1/№2/№4) отсекаем слабые входы — сигнал остаётся ТОЛЬКО у Claude,
+    # фильтр может лишь убрать его, не создать.
+    if direction != "flat" and claude_result:
+        try:
+            _reg_stats = await db.regime_stats()
+        except Exception:
+            _reg_stats = {"by_regime": []}
+        _veto = _quality_veto(direction, claude_result, intraday_ctx, c_entry, _mod, _reg_stats)
+        if _veto:
+            direction, confidence, combined = "flat", 0.0, 0.0
+            claude_trade_plan = None
+            recommendation = f"⚪ Наблюдать — фильтр: {_veto}"
+            result_veto_reason = _veto
+            logger.info(f"🛑 {ticker}: сигнал отклонён фильтром качества — {_veto}")
 
     # ── 6. Обоснование ──────────────────────────────────────────────────────
     reasons: list[str] = []
@@ -421,6 +507,7 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         } if intraday_ctx else None,
         "narrative": narrative,
         "reasons": reasons,
+        "veto_reason": result_veto_reason,
         "model_weights": [round(w, 3) for w in weights],
         "decision_by": "claude" if claude_result else "fallback_model",
         "disclaimer": DISCLAIMER,
