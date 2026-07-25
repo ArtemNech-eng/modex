@@ -110,8 +110,14 @@ CHART_ANALYSIS_ENABLED = os.getenv("CHART_ANALYSIS_ENABLED", "false").lower() ==
 # Авто-старт live-движка при запуске приложения: сканирование → сигналы по
 # плейбуку → оценка созревших прогнозов → обучение. Без него «мозг» простаивает
 # до ручного /api/live-signals/start и гаснет при каждом редеплое.
-LIVE_SIGNALS_AUTOSTART = os.getenv("LIVE_SIGNALS_AUTOSTART", "true").lower() == "true"
-LIVE_SIGNALS_INTERVAL_MIN = int(os.getenv("LIVE_SIGNALS_INTERVAL_MIN", "60"))  # период цикла, мин (min 5)
+# Сканер (Claude-сигналы) — по умолчанию РУЧНОЙ: включаешь, когда садишься торговать,
+# выключаешь при выходе (Claude не зовётся → расход 0). Кнопки: /api/live-signals/start|stop.
+LIVE_SIGNALS_AUTOSTART = os.getenv("LIVE_SIGNALS_AUTOSTART", "false").lower() == "true"
+LIVE_SIGNALS_INTERVAL_MIN = int(os.getenv("LIVE_SIGNALS_INTERVAL_MIN", "60"))  # период сканера, мин (min 5)
+# Learning-цикл (оценка прогнозов, БЕЗ Claude) — работает ВСЕГДА, даже при выкл.
+# сканере: самообучение (точность / R / regime-stats) не прерывается.
+LEARNING_AUTOSTART = os.getenv("LEARNING_AUTOSTART", "true").lower() == "true"
+LEARNING_INTERVAL_MIN = int(os.getenv("LEARNING_INTERVAL_MIN", "30"))  # период оценки, мин (min 5)
 
 # Демо-данные (фейковые сообщения) на старте — только для локальной проверки без
 # источников. В проде держать выключенным, иначе «Рынок» показывает выдумку.

@@ -116,23 +116,32 @@ async def startup():
         _fill_demo_data()
         logger.info("🧪 DEMO_MODE: агрегатор наполнен демо-данными")
 
-    # Авто-старт live-движка: сканирование → сигналы по плейбуку → оценка
-    # созревших прогнозов → обучение. Иначе «мозг» простаивает до ручного старта
-    # и гаснет при редеплое. Идемпотентно (повторно не стартуем). БД уже готова.
+    # Контур ОБУЧЕНИЯ (оценка прогнозов, БЕЗ Claude) — стартует ВСЕГДА и работает
+    # независимо от сканера: самообучение (точность / R / regime-stats) не прерывается,
+    # даже когда сканер выключен. БД уже готова.
+    try:
+        from config.settings import LEARNING_AUTOSTART, LEARNING_INTERVAL_MIN
+        if LEARNING_AUTOSTART and not _learning_status.get("running"):
+            _learning_status.update({"enabled": True,
+                                     "interval_min": max(5, LEARNING_INTERVAL_MIN),
+                                     "error": None})
+            asyncio.create_task(_learning_loop())
+            logger.info("🟢 Контур обучения (оценка прогнозов) авто-запущен")
+    except Exception as e:
+        logger.warning(f"learning autostart: {e}")
+
+    # СКАНЕР (Claude-сигналы) — по умолчанию РУЧНОЙ: включаешь, когда садишься
+    # торговать, выключаешь при выходе. Автозапуск только если LIVE_SIGNALS_AUTOSTART=true.
     try:
         from config.settings import LIVE_SIGNALS_AUTOSTART, LIVE_SIGNALS_INTERVAL_MIN
         if LIVE_SIGNALS_AUTOSTART and not _live_status.get("running"):
             _interval = max(5, LIVE_SIGNALS_INTERVAL_MIN)
-            _live_status.update({
-                "enabled": True,
-                "interval_min": _interval,
-                "tickers": None,
-                "error": None,
-            })
+            _live_status.update({"enabled": True, "interval_min": _interval,
+                                 "tickers": None, "error": None})
             asyncio.create_task(_live_loop())
-            logger.info(f"🟢 Live-движок авто-запущен (интервал {_interval} мин)")
+            logger.info(f"🟢 Сканер (Claude) авто-запущен (интервал {_interval} мин)")
     except Exception as e:
-        logger.warning(f"Не удалось авто-запустить live-движок: {e}")
+        logger.warning(f"scanner autostart: {e}")
 
     logger.info("✅ MOODEX API готов")
 
@@ -1100,6 +1109,17 @@ _live_status: dict = {
     "error": None,
 }
 
+# Отдельный always-on контур ОБУЧЕНИЯ (оценка прогнозов без Claude). Работает
+# независимо от сканера — самообучение продолжается, даже когда сканер выключен.
+_learning_status: dict = {
+    "enabled": False,
+    "running": False,
+    "interval_min": 30,
+    "last_eval": None,
+    "evaluated_total": 0,
+    "error": None,
+}
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -1107,14 +1127,10 @@ def _now_iso() -> str:
 
 async def _live_scan_once() -> dict:
     """
-    Один цикл. Оценка созревших прогнозов — БЕСПЛАТНАЯ (без Claude), гоняем ВСЕГДА
-    (замыкает обучение). Сканирование + подтверждение Claude — ТОЛЬКО в торговую
-    сессию (main/evening): вне сессии торговать нечего → Claude не зовём (экономия).
+    Один цикл СКАНЕРА (ручной вкл/выкл). ТОЛЬКО сканирование + подтверждение Claude,
+    и ТОЛЬКО в торговую сессию (main/evening). Оценку прогнозов делает отдельный
+    always-on learning-контур (_learning_loop) — он работает и при выключенном сканере.
     """
-    ev = await analyst.evaluate_due_predictions()
-    _live_status["last_eval"] = _now_iso()
-    _live_status["evaluated_total"] += ev.get("evaluated", 0)
-
     from datetime import timedelta as _td
     from src.analysis import intraday as _iv
     _msk = datetime.now(timezone.utc).astimezone(timezone(_td(hours=3)))
@@ -1124,7 +1140,7 @@ async def _live_scan_once() -> dict:
         _live_status["scanned"] = 0
         _live_status["saved"] = 0
         _live_status["skipped"] = f"вне сессии ({_phase}) — Claude не звали"
-        return {"saved": 0, "evaluated": ev.get("evaluated", 0), "skipped": _phase}
+        return {"saved": 0, "skipped": _phase}
 
     _live_status["skipped"] = None
     from config.settings import SCAN_MIN_INTEREST, SCAN_MAX_CLAUDE
@@ -1136,7 +1152,7 @@ async def _live_scan_once() -> dict:
     _live_status["scanned"] = triage.get("screened", 0)
     _live_status["interesting"] = triage.get("interesting", [])
     _live_status["saved"] = saved
-    return {"saved": saved, "evaluated": ev.get("evaluated", 0)}
+    return {"saved": saved}
 
 
 async def _live_loop():
@@ -1159,6 +1175,37 @@ async def _live_loop():
     finally:
         _live_status["running"] = False
         _live_status["next_scan"] = None
+
+
+async def _learning_once() -> dict:
+    """
+    Ядро самообучения БЕЗ Claude: оценить созревшие прогнозы по фактической цене.
+    Обновляет точность, реализованный R и regime-stats. Работает всегда — и когда
+    сканер выключен — поэтому обучение не прерывается.
+    """
+    ev = await analyst.evaluate_due_predictions()
+    _learning_status["last_eval"] = _now_iso()
+    _learning_status["evaluated_total"] += ev.get("evaluated", 0)
+    return ev
+
+
+async def _learning_loop():
+    _learning_status["running"] = True
+    try:
+        while _learning_status["enabled"]:
+            try:
+                await _learning_once()
+                _learning_status["error"] = None
+            except Exception as e:
+                _learning_status["error"] = str(e)
+                logger.warning(f"learning-цикл: {e}")
+            interval = max(5, _learning_status["interval_min"]) * 60
+            slept = 0
+            while _learning_status["enabled"] and slept < interval:
+                await asyncio.sleep(2)
+                slept += 2
+    finally:
+        _learning_status["running"] = False
 
 
 @app.post("/api/live-signals/start", summary="Запустить авто-генерацию live-сигналов")
@@ -1184,6 +1231,13 @@ async def live_start(interval_min: int = 60, tickers: Optional[str] = None):
 async def live_stop():
     _live_status["enabled"] = False
     return {"status": "stopping", **_live_status}
+
+
+@app.get("/api/learning", summary="Статус контура обучения (always-on)")
+async def get_learning_status():
+    """Оценка прогнозов идёт независимо от сканера — самообучение не прерывается,
+    даже когда сканер выключен (Claude не тратится)."""
+    return _learning_status
 
 
 @app.post("/api/live-signals/scan-now", summary="Сгенерировать сигналы один раз сейчас")
