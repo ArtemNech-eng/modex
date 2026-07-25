@@ -103,6 +103,12 @@ INTRADAY_OPENING_RANGE_BARS = int(os.getenv("INTRADAY_OPENING_RANGE_BARS", "6"))
 SCAN_MIN_INTEREST = float(os.getenv("SCAN_MIN_INTEREST", "0.5"))   # порог «интересности» [0..1]
 SCAN_MAX_CLAUDE = int(os.getenv("SCAN_MAX_CLAUDE", "6"))            # макс. вызовов Claude за цикл
 
+# Авто-старт live-движка при запуске приложения: сканирование → сигналы по
+# плейбуку → оценка созревших прогнозов → обучение. Без него «мозг» простаивает
+# до ручного /api/live-signals/start и гаснет при каждом редеплое.
+LIVE_SIGNALS_AUTOSTART = os.getenv("LIVE_SIGNALS_AUTOSTART", "true").lower() == "true"
+LIVE_SIGNALS_INTERVAL_MIN = int(os.getenv("LIVE_SIGNALS_INTERVAL_MIN", "60"))  # период цикла, мин (min 5)
+
 # Демо-данные (фейковые сообщения) на старте — только для локальной проверки без
 # источников. В проде держать выключенным, иначе «Рынок» показывает выдумку.
 DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() == "true"

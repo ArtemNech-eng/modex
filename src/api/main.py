@@ -115,6 +115,25 @@ async def startup():
     if DEMO_MODE:
         _fill_demo_data()
         logger.info("🧪 DEMO_MODE: агрегатор наполнен демо-данными")
+
+    # Авто-старт live-движка: сканирование → сигналы по плейбуку → оценка
+    # созревших прогнозов → обучение. Иначе «мозг» простаивает до ручного старта
+    # и гаснет при редеплое. Идемпотентно (повторно не стартуем). БД уже готова.
+    try:
+        from config.settings import LIVE_SIGNALS_AUTOSTART, LIVE_SIGNALS_INTERVAL_MIN
+        if LIVE_SIGNALS_AUTOSTART and not _live_status.get("running"):
+            _interval = max(5, LIVE_SIGNALS_INTERVAL_MIN)
+            _live_status.update({
+                "enabled": True,
+                "interval_min": _interval,
+                "tickers": None,
+                "error": None,
+            })
+            asyncio.create_task(_live_loop())
+            logger.info(f"🟢 Live-движок авто-запущен (интервал {_interval} мин)")
+    except Exception as e:
+        logger.warning(f"Не удалось авто-запустить live-движок: {e}")
+
     logger.info("✅ MOODEX API готов")
 
 
