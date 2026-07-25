@@ -259,17 +259,26 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
             signal_confidence=sentiment_block.get("confidence") if sentiment_block else None,
         )
 
-        # Claude по плейбуку — ЕДИНСТВЕННЫЙ, кто решает направление и уверенность
-        # (график он уже увидел как вход через chart_context / Vision, отдельного
-        # голосования больше нет).
+        # Claude по плейбуку решает, ТОЛЬКО если реально ответил (claude_result["ok"]).
+        # Если Claude недоступен (пустой баланс/ошибка) — честно переключаемся на
+        # резервную логистическую модель, а не выдаём «глухой neutral» под видом Claude.
         signal_map = {"bullish": "up", "bearish": "down", "neutral": "flat"}
-        direction  = signal_map.get(claude_result.get("signal", "neutral"), "flat")
-        confidence = round((claude_result.get("confidence", 0) or 0) / 100, 3)
-        narrative  = claude_result.get("summary", "")
-        # Метрики согласованы С РЕШЕНИЕМ CLAUDE (а не из fallback-модели):
-        combined   = confidence if direction == "up" else (-confidence if direction == "down" else 0.0)
-
-        logger.info(f"🤖 Claude → {ticker}: {direction} (уверенность {confidence})")
+        if claude_result and claude_result.get("ok"):
+            direction  = signal_map.get(claude_result.get("signal", "neutral"), "flat")
+            confidence = round((claude_result.get("confidence", 0) or 0) / 100, 3)
+            narrative  = claude_result.get("summary", "")
+            # Метрики согласованы С РЕШЕНИЕМ CLAUDE:
+            combined   = confidence if direction == "up" else (-confidence if direction == "down" else 0.0)
+            logger.info(f"🤖 Claude → {ticker}: {direction} (уверенность {confidence})")
+        else:
+            # Claude недоступен → резервная модель (настроение + техника + гео).
+            # combined уже посчитан выше (fusion + 0.3·geo) — это и есть fallback-сигнал.
+            claude_result = None
+            direction  = fallback_direction
+            confidence = round(fallback_confidence, 3)
+            narrative  = ("Claude недоступен — решение резервной логистической модели "
+                          "(настроение + техника + геополитика).")
+            logger.warning(f"⚠️ Claude недоступен для {ticker}: fallback → {direction} ({confidence})")
 
     except Exception as e:
         logger.warning(f"Claude недоступен для {ticker}, используем fallback-модель: {e}")

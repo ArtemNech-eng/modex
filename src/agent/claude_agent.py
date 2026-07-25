@@ -372,6 +372,7 @@ class ClaudeAgent:
                 data = json.loads(result[start:end])
                 data["ticker"]      = ticker
                 data["analyzed_at"] = datetime.now(timezone.utc).isoformat()
+                data["ok"]          = True   # Claude реально ответил (для честной деградации)
                 return data
         except Exception as e:
             logger.warning(f"Claude synthesis failed for {ticker}: {e}")
@@ -380,6 +381,7 @@ class ClaudeAgent:
             "ticker":         ticker,
             "signal":         "neutral",
             "confidence":     0,
+            "ok":             False,   # Claude недоступен/не распарсили → честный флаг
             "summary":        "Анализ недоступен",
             "key_insight":    "Ошибка запроса к Claude",
             "risk":           "Нет данных",
@@ -456,6 +458,7 @@ class ClaudeAgent:
             "ticker":         ticker,
             "signal":         "neutral",
             "confidence":     0,
+            "ok":             False,   # Claude недоступен/не распарсили → честный флаг
             "summary":        "Анализ недоступен",
             "key_insight":    "Ошибка запроса к Claude",
             "risk":           "Нет данных",
@@ -528,6 +531,7 @@ class ClaudeAgent:
             "ticker":         ticker,
             "signal":         "neutral",
             "confidence":     0,
+            "ok":             False,   # Claude недоступен/не распарсили → честный флаг
             "summary":        "Анализ недоступен",
             "key_insight":    "Ошибка запроса к Claude",
             "risk":           "Нет данных",
