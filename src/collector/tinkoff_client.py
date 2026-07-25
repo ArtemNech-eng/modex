@@ -119,6 +119,23 @@ class TinkoffClient:
                 return figi
         return None
 
+    async def resolve_live(self, ticker: str) -> Optional[dict]:
+        """
+        ЖИВОЙ резолв через FindInstrument, ИГНОРИРУЯ статический кэш — чтобы честно
+        проверить, торгуется ли символ СЕЙЧАС (ловит переименования/делистинги:
+        напр. YNDX→YDEX). Работает при закрытом рынке. None → символ не найден.
+        """
+        ticker = ticker.upper()
+        data = await self._post(
+            "tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument",
+            {"query": ticker, "instrumentKind": "INSTRUMENT_TYPE_SHARE", "apiTradeAvailableFlag": True},
+        )
+        for inst in (data or {}).get("instruments", []):
+            if inst.get("ticker", "").upper() == ticker:
+                return {"ticker": inst.get("ticker"), "figi": inst.get("figi"),
+                        "name": inst.get("name"), "trade_available": inst.get("apiTradeAvailableFlag")}
+        return None
+
     async def get_candles(self, ticker: str, days: int = 365) -> Optional[dict]:
         """Дневные свечи с точным объёмом."""
         figi = await self.get_figi(ticker)

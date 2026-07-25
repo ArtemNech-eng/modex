@@ -107,6 +107,12 @@ SCAN_MAX_CLAUDE = int(os.getenv("SCAN_MAX_CLAUDE", "2"))            # макс. 
 # input-image. По умолчанию ВЫКЛ ради экономии; структурных данных и так достаточно.
 CHART_ANALYSIS_ENABLED = os.getenv("CHART_ANALYSIS_ENABLED", "false").lower() == "true"
 
+# ─── База знаний: снимки стакана/потока Tinkoff (market_snapshot_pipeline) ─────
+# Сколько тикеров держать «под стаканом». 0 = ВЕСЬ список MOEX_TICKERS (все бумаги).
+# Раньше было жёстко [:8]. Мёртвые/переименованные тикеры авто-усыпляются (см. main.py).
+SNAPSHOT_MAX = int(os.getenv("SNAPSHOT_MAX", "0"))              # 0 = все тикеры
+SNAPSHOT_PACING_SEC = float(os.getenv("SNAPSHOT_PACING_SEC", "0.4"))  # пауза между тикерами (лимиты Tinkoff)
+
 # ─── Вето-слой КАЧЕСТВА интрадей-сигналов (№1 окно / №2 анти-чейз / №4 режим+HTF) ─
 # Не трогает стоп 1% и решение Claude — только ОТКЛОНЯЕТ слабые входы (→ «наблюдать»,
 # не сохраняем). Всё числами, без доп. вызовов Claude. Пороги легко тюнить из .env.

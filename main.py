@@ -310,9 +310,13 @@ async def market_snapshot_pipeline():
     Tinkoff (стакан/поток/цена) + реальные сделки трейдеров Пульса.
     Всё пишется в market_events с меткой времени (реалтайм + история для Claude).
     """
-    from config.settings import TINKOFF_TOKEN, MOEX_TICKERS
+    from config.settings import TINKOFF_TOKEN, MOEX_TICKERS, SNAPSHOT_MAX, SNAPSHOT_PACING_SEC
+    from src.analysis.intraday import session_phase
     await db.setup_db()
-    watch = list(MOEX_TICKERS.keys())[:8]
+    all_tickers = list(MOEX_TICKERS.keys())
+    watch = all_tickers if SNAPSHOT_MAX <= 0 else all_tickers[:SNAPSHOT_MAX]
+    logger.info(f"🧠 База знаний: стакан по {len(watch)} тикерам (SNAPSHOT_MAX={SNAPSHOT_MAX or 'все'})")
+    miss: dict = {}   # тикер → подряд циклов В СЕССИЮ без данных (усыпление мёртвых/переименованных)
     tk = None
     if TINKOFF_TOKEN:
         from src.collector.tinkoff_client import TinkoffClient
@@ -327,9 +331,16 @@ async def market_snapshot_pipeline():
         cycle += 1
         written = {"orderbook": 0, "quote": 0, "trades": 0, "deal": 0}
         first_err = None
+        # Фаза сессии: в торговые часы опрашиваем часто, вне — редко (данные не меняются).
+        _mm = datetime.now(timezone.utc) + timedelta(hours=3)
+        open_now = session_phase(_mm.hour * 60 + _mm.minute) in ("main", "evening")
         try:
             if tk:
                 for t in watch:
+                    # Мёртвый/переименованный тикер (нет данных ≥3 циклов в сессию) —
+                    # опрашиваем редко (раз в 20 циклов), не жжём API впустую.
+                    if miss.get(t, 0) >= 3 and cycle % 20 != 0:
+                        continue
                     ts = datetime.now(timezone.utc)
                     # Лёгкие последовательные вызовы (без тяжёлых 365-дневных
                     # свечей и без пачки concurrent-запросов) — не упираемся в
@@ -390,7 +401,11 @@ async def market_snapshot_pipeline():
                                  f"поток: {tr.get('order_flow') if tr else '—'}",
                             timestamp=ts,
                         )
-                    await asyncio.sleep(0.4)   # бережём лимиты Tinkoff
+                    # Усыпление мёртвых тикеров: счётчик промахов ведём ТОЛЬКО в сессию
+                    # (вне сессии пусто у всех — это норма, не повод усыплять).
+                    if open_now:
+                        miss[t] = 0 if (ob or tr) else miss.get(t, 0) + 1
+                    await asyncio.sleep(SNAPSHOT_PACING_SEC)   # бережём лимиты Tinkoff
 
             # Сделки трейдеров Пульса — реже (Пульс часто блокируется в РФ),
             # чтобы не долбить заблокированный эндпоинт каждый цикл
@@ -429,7 +444,9 @@ async def market_snapshot_pipeline():
                 await db.prune_session_footprint(keep_days=3)
         except Exception as e:
             logger.debug(f"market snapshot: {e}")
-        await asyncio.sleep(90)
+        # В сессию — частые снимки (90с); вне сессии — редкие (300с): экономим API,
+        # т.к. стакан/поток вне торгов не меняются.
+        await asyncio.sleep(90 if open_now else 300)
 
 
 async def run():

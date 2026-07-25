@@ -419,6 +419,34 @@ async def health_sources():
     return out
 
 
+@app.get("/api/health/figi", summary="Диагностика: какие тикеры реально торгуются (FIGI)")
+async def health_figi():
+    """
+    ЖИВОЙ резолв каждого тикера MOEX_TICKERS через FindInstrument (в обход
+    статического кэша) — ловит переименования/делистинги (YNDX→YDEX, POLY/DSKY
+    и т.п.). Работает при закрытом рынке. Показывает, по каким символам стакан
+    в принципе НЕ соберётся, пока не поправим их в MOEX_TICKERS.
+    """
+    from config.settings import TINKOFF_TOKEN, MOEX_TICKERS
+    if not TINKOFF_TOKEN:
+        return {"error": "TINKOFF_TOKEN не задан"}
+    from src.collector.tinkoff_client import TinkoffClient
+    tk = TinkoffClient()
+    live, dead = {}, []
+    for t in MOEX_TICKERS:
+        try:
+            info = await tk.resolve_live(t)
+        except Exception:
+            info = None
+        if info and info.get("figi"):
+            live[t] = {"figi": info["figi"], "name": info.get("name")}
+        else:
+            dead.append(t)
+        await asyncio.sleep(0.1)
+    return {"total": len(MOEX_TICKERS), "live": len(live), "dead_count": len(dead),
+            "dead_tickers": dead, "live_map": live}
+
+
 @app.get("/api/knowledge/{ticker}", summary="Срез базы знаний по тикеру (для Claude)")
 async def get_knowledge(ticker: str, minutes: int = 240):
     """
