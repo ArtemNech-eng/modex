@@ -18,8 +18,8 @@ PULSE_API = "https://www.tinkoff.ru/api/invest-gw/social/v1/post/instrument"
 
 # Топ тикеры для мониторинга в Пульсе
 PULSE_TICKERS = [
-    "SBER", "GAZP", "LKOH", "YNDX", "NVTK", "ROSN", "TATN",
-    "GMKN", "TCSG", "VTBR", "MGNT", "AFLT", "OZON", "PLZL",
+    "SBER", "GAZP", "LKOH", "YDEX", "NVTK", "ROSN", "TATN",
+    "GMKN", "T", "VTBR", "MGNT", "AFLT", "OZON", "PLZL",
     "CHMF", "NLMK", "MAGN", "POSI", "SMLT", "VKCO",
 ]
 
