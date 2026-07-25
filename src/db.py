@@ -114,6 +114,14 @@ class Prediction(Base):
     direction: Mapped[str] = mapped_column(String(8), default="flat")  # up/down/flat
     price_at: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
+    # Решение по плейбуку Claude (Фаза B — измерение эффективности по режимам)
+    regime: Mapped[Optional[str]] = mapped_column(String(24), nullable=True)   # trend/range/squeeze_breakout/news_spike/unclear
+    confluence_score: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    entry: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    stop: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    target: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    rr_planned: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
     # Результат (заполняется позже)
     realized_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     realized_return: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
@@ -142,6 +150,9 @@ class Prediction(Base):
             "confidence": round(self.confidence, 3),
             "direction": self.direction,
             "price_at": self.price_at,
+            "regime": self.regime,
+            "confluence_score": self.confluence_score,
+            "rr_planned": self.rr_planned,
             "realized_price": self.realized_price,
             "realized_return": (
                 round(self.realized_return, 3)
@@ -278,6 +289,13 @@ _PREDICTION_ADDED_COLUMNS = {
     "lesson": "TEXT",
     "pm_tags": "TEXT",
     "pm_at": "TIMESTAMP",
+    # Фаза B — плейбук-поля для измерения по режимам:
+    "regime": "TEXT",
+    "confluence_score": "INTEGER",
+    "entry": "DOUBLE PRECISION",
+    "stop": "DOUBLE PRECISION",
+    "target": "DOUBLE PRECISION",
+    "rr_planned": "DOUBLE PRECISION",
 }
 
 
@@ -498,6 +516,11 @@ async def add_prediction(data: dict) -> int:
             context_json = json.dumps(context, ensure_ascii=False)
         except Exception:
             context_json = None
+    try:
+        _cs = data.get("confluence_score")
+        _cs = int(_cs) if _cs is not None else None
+    except (TypeError, ValueError):
+        _cs = None
     async with async_session() as session:
         pred = Prediction(
             ticker=data["ticker"],
@@ -509,6 +532,12 @@ async def add_prediction(data: dict) -> int:
             confidence=data.get("confidence", 0.0),
             direction=data.get("direction", "flat"),
             price_at=data.get("price_at"),
+            regime=data.get("regime"),
+            confluence_score=_cs,
+            entry=data.get("entry"),
+            stop=data.get("stop"),
+            target=data.get("target"),
+            rr_planned=data.get("rr_planned"),
             context_json=context_json,
         )
         session.add(pred)
@@ -920,3 +949,72 @@ async def prune_session_footprint(keep_days: int = 3) -> int:
             delete(SessionFootprint).where(SessionFootprint.date < cutoff))
         await session.commit()
         return result.rowcount or 0
+
+
+# ─── Эффективность по режимам (Фаза B — цикл измерения) ───────────────────────
+
+def _r_multiple(direction: str, entry: Optional[float], stop: Optional[float],
+                realized_price: Optional[float]) -> Optional[float]:
+    """
+    Реализованный R-мультипл = движение цены в единицах риска (|entry − stop|).
+    Направленно: для лонга — (realized − entry)/risk, для шорта — (entry − realized)/risk.
+    None, если нет уровней или риск нулевой. Чистая функция — тестируется.
+    """
+    if entry is None or stop is None or realized_price is None:
+        return None
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None
+    if direction == "up":
+        return round((realized_price - entry) / risk, 3)
+    if direction == "down":
+        return round((entry - realized_price) / risk, 3)
+    return None
+
+
+async def regime_stats() -> dict:
+    """
+    Винрейт, средняя доходность, средний R и средний конфлюенс В РАЗРЕЗЕ РЕЖИМА
+    дня — по ОЦЕНЁННЫМ направленным прогнозам. Это и есть измерение плейбука:
+    видно, какие режимы реально дают эйдж, а какие сливают.
+    """
+    async with async_session() as session:
+        result = await session.execute(
+            select(Prediction).where(Prediction.correct.is_not(None)))
+        preds = result.scalars().all()
+
+    groups: dict[str, dict] = {}
+    for p in preds:
+        if p.direction not in ("up", "down"):
+            continue  # «наблюдать»/flat — не сделки, в статистику не берём
+        reg = p.regime or "unknown"
+        g = groups.setdefault(reg, {"correct": 0, "total": 0,
+                                    "returns": [], "rs": [], "confl": []})
+        g["total"] += 1
+        if p.correct:
+            g["correct"] += 1
+        if p.realized_return is not None:
+            g["returns"].append(p.realized_return)
+        r = _r_multiple(p.direction, p.entry, p.stop, p.realized_price)
+        if r is not None:
+            g["rs"].append(r)
+        if p.confluence_score is not None:
+            g["confl"].append(p.confluence_score)
+
+    def _avg(xs):
+        return round(sum(xs) / len(xs), 2) if xs else None
+
+    by_regime = []
+    for reg, g in groups.items():
+        n = g["total"]
+        by_regime.append({
+            "regime": reg,
+            "trades": n,
+            "win_rate": round(g["correct"] / n * 100, 1) if n else None,
+            "avg_return": _avg(g["returns"]),
+            "avg_r": _avg(g["rs"]),
+            "avg_confluence": _avg(g["confl"]),
+        })
+    by_regime.sort(key=lambda x: x["trades"], reverse=True)
+    return {"by_regime": by_regime,
+            "total_trades": sum(x["trades"] for x in by_regime)}

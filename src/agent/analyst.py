@@ -456,6 +456,12 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
                 "confidence": confidence,
                 "direction": direction,
                 "price_at": tech.price if tech else None,
+                "regime": (claude_result or {}).get("regime") if claude_result else None,
+                "confluence_score": (claude_result or {}).get("confluence_score") if claude_result else None,
+                "entry": _num((claude_result or {}).get("entry")) if claude_result else None,
+                "stop": _num((claude_result or {}).get("stop")) if claude_result else None,
+                "target": _num((claude_result or {}).get("target")) if claude_result else None,
+                "rr_planned": _num((claude_result or {}).get("rr")) if claude_result else None,
                 "context": context_snapshot,
             })
             result["prediction_id"] = pred_id

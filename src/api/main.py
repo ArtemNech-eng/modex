@@ -975,6 +975,16 @@ def _avg(vals: list) -> Optional[float]:
     return round(sum(vals) / len(vals), 2) if vals else None
 
 
+@app.get("/api/regime-stats", summary="Эффективность по режимам (Фаза B)")
+async def get_regime_stats():
+    """
+    Винрейт, средняя доходность, средний R и средний конфлюенс — В РАЗРЕЗЕ РЕЖИМА
+    дня (trend/range/squeeze_breakout/news_spike). Измерение плейбука: какие режимы
+    реально дают эйдж. Наполняется по мере оценки прогнозов.
+    """
+    return await db.regime_stats()
+
+
 @app.get("/api/track-record", summary="Трек-рекорд агента (флагман)")
 async def get_track_record(limit: int = 500):
     """
