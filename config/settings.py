@@ -113,7 +113,7 @@ CHART_ANALYSIS_ENABLED = os.getenv("CHART_ANALYSIS_ENABLED", "false").lower() ==
 # Сканер (Claude-сигналы) — по умолчанию РУЧНОЙ: включаешь, когда садишься торговать,
 # выключаешь при выходе (Claude не зовётся → расход 0). Кнопки: /api/live-signals/start|stop.
 LIVE_SIGNALS_AUTOSTART = os.getenv("LIVE_SIGNALS_AUTOSTART", "false").lower() == "true"
-LIVE_SIGNALS_INTERVAL_MIN = int(os.getenv("LIVE_SIGNALS_INTERVAL_MIN", "60"))  # период сканера, мин (min 5)
+LIVE_SIGNALS_INTERVAL_MIN = int(os.getenv("LIVE_SIGNALS_INTERVAL_MIN", "15"))  # период сканера, мин (min 5) — Claude сканит каждые 15 мин
 # Learning-цикл (оценка прогнозов, БЕЗ Claude) — работает ВСЕГДА, даже при выкл.
 # сканере: самообучение (точность / R / regime-stats) не прерывается.
 LEARNING_AUTOSTART = os.getenv("LEARNING_AUTOSTART", "true").lower() == "true"

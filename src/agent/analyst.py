@@ -259,9 +259,9 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
             signal_confidence=sentiment_block.get("confidence") if sentiment_block else None,
         )
 
-        # Claude по плейбуку решает, ТОЛЬКО если реально ответил (claude_result["ok"]).
-        # Если Claude недоступен (пустой баланс/ошибка) — честно переключаемся на
-        # резервную логистическую модель, а не выдаём «глухой neutral» под видом Claude.
+        # Сигналы формирует ТОЛЬКО Claude по плейбуку и ТОЛЬКО если реально ответил
+        # (claude_result["ok"]). Если Claude недоступен (пустой баланс/ошибка) —
+        # СИГНАЛА НЕТ: резервную модель не используем, в обучение ничего не пишем.
         signal_map = {"bullish": "up", "bearish": "down", "neutral": "flat"}
         if claude_result and claude_result.get("ok"):
             direction  = signal_map.get(claude_result.get("signal", "neutral"), "flat")
@@ -271,18 +271,18 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
             combined   = confidence if direction == "up" else (-confidence if direction == "down" else 0.0)
             logger.info(f"🤖 Claude → {ticker}: {direction} (уверенность {confidence})")
         else:
-            # Claude недоступен → резервная модель (настроение + техника + гео).
-            # combined уже посчитан выше (fusion + 0.3·geo) — это и есть fallback-сигнал.
+            # Claude недоступен → СИГНАЛА НЕТ. Сигналы формирует ТОЛЬКО Claude:
+            # резервную модель не используем, в обучение ничего не сохраняем.
             claude_result = None
-            direction  = fallback_direction
-            confidence = round(fallback_confidence, 3)
-            narrative  = ("Claude недоступен — решение резервной логистической модели "
-                          "(настроение + техника + геополитика).")
-            logger.warning(f"⚠️ Claude недоступен для {ticker}: fallback → {direction} ({confidence})")
+            direction, confidence, combined = "flat", 0.0, 0.0
+            narrative = "Claude недоступен — сигнала нет (сигналы формирует только Claude)."
+            logger.warning(f"⚠️ Claude недоступен для {ticker}: сигнала нет")
 
     except Exception as e:
-        logger.warning(f"Claude недоступен для {ticker}, используем fallback-модель: {e}")
+        logger.warning(f"Ошибка анализа {ticker} — сигнала нет: {e}")
         claude_result = None
+        direction, confidence, combined = "flat", 0.0, 0.0
+        narrative = "Ошибка анализа — сигнала нет."
 
     recommendation = _recommendation(direction, confidence)
 
@@ -295,13 +295,21 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         except (TypeError, ValueError):
             return None
 
+    STOP_PCT = 0.01   # стоп ФИКСИРОВАННЫЙ: 1% от входа (ставим сами)
+    c_entry = c_stop = c_target = c_rr = None
     claude_trade_plan = None
     if claude_result and direction != "flat":
-        c_entry, c_stop = _num(claude_result.get("entry")), _num(claude_result.get("stop"))
-        c_target, c_rr = _num(claude_result.get("target")), _num(claude_result.get("rr"))
-        if c_entry and c_stop:
-            if c_rr is None and c_target is not None and c_entry != c_stop:
-                c_rr = round(abs(c_target - c_entry) / abs(c_entry - c_stop), 2)
+        # Вход — от Claude (лимитка), иначе текущая цена. Стоп — фиксированный 1%.
+        # Цель — от Claude из уровней. R:R считаем от 1%-риска.
+        c_entry = (_num(claude_result.get("entry"))
+                   or (intraday_ctx.get("price") if intraday_ctx else None)
+                   or (tech.price if tech else None))
+        c_target = _num(claude_result.get("target"))
+        if c_entry:
+            c_stop = (round(c_entry * (1 - STOP_PCT), 4) if direction == "up"
+                      else round(c_entry * (1 + STOP_PCT), 4))
+            if c_target is not None:
+                c_rr = round(abs(c_target - c_entry) / (STOP_PCT * c_entry), 2)
             claude_trade_plan = {
                 "direction": "long" if direction == "up" else "short",
                 "entry_low": c_entry, "entry_high": c_entry,
@@ -310,12 +318,12 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
                 "take_profit_1": c_target, "take_profit_2": None,
                 "risk_reward": c_rr, "current_rr": c_rr,
                 "entry_status": "enter",
-                "entry_note": claude_result.get("setup") or "",
+                "entry_note": (claude_result.get("setup") or "") + " · стоп 1%",
                 "size": claude_result.get("size"),
                 "invalidation": claude_result.get("invalidation"),
                 "atr": intraday_ctx.get("atr") if intraday_ctx else None,
                 "entry_rule": claude_result.get("setup") or "",
-                "exit_rule": "Тайм-стоп к закрытию сессии; сопровождение по VWAP.",
+                "exit_rule": "Стоп −1%; цель по плану; флэт к закрытию сессии.",
             }
             reg = claude_result.get("regime")
             if reg and reg != "unclear":
@@ -423,15 +431,30 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
     if claude_trade_plan:
         result["trade_plan"] = claude_trade_plan
 
-    # ── 7. Сохраняем прогноз в БД (память агента) ───────────────────────────
-    if save:
+    # ── 7. Сохраняем прогноз — ТОЛЬКО направленные сигналы Claude (up/down) ──
+    # «Наблюдать» / нет-сигнала / не-Claude в обучение НЕ идут: учимся только на
+    # реальных сигналах Claude. И не плодим второй сигнал по тикеру, пока
+    # открытый не отработал (target/stop/session) — тогда тикер снова свободен.
+    is_claude_signal = bool(claude_result) and direction in ("up", "down")
+    already_open = False
+    if save and is_claude_signal:
+        try:
+            already_open = await db.has_open_signal(ticker)
+        except Exception:
+            already_open = False
+        if already_open:
+            logger.info(f"⏸️ {ticker}: уже есть открытый сигнал — новый не сохраняем")
+            result["skipped_open_signal"] = True
+    if save and is_claude_signal and not already_open:
         try:
             # Снимок ключевых драйверов на момент прогноза — основа для будущего
             # разбора ошибок (post-mortem): по нему станет ясно, на чём стоял сигнал.
             context_snapshot = {
                 "direction": direction,
                 "confidence": confidence,
-                "decision_by": "claude" if claude_result else "fallback_model",
+                "signal_time_msk": (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M МСК"),
+                "decision_by": "claude",  # сохраняем ТОЛЬКО сигналы Claude
+                "stop_pct": STOP_PCT,     # стоп фиксированный (1%)
                 "sentiment_index": sentiment_block["sentiment_index"] if sentiment_block else None,
                 "sentiment_label": sentiment_block.get("label") if sentiment_block else None,
                 "sentiment_signal": sentiment_signal,
@@ -455,14 +478,23 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
                 "intraday_phase": intraday_ctx.get("phase") if intraday_ctx else None,
                 "intraday_delayed": intraday_ctx.get("delayed") if intraday_ctx else None,
             }
-            # В интрадей-режиме горизонт прогноза короткий (часы), а не сутки —
-            # это меняет и момент оценки результата (внутри сессии).
+            # Горизонт интрадей-сигнала — КОНЕЦ текущей сессии (флэт к закрытию), а
+            # ОЦЕНИВАЕМ на СЛЕДУЮЩИЙ день: делаем прогноз «созревающим» к утру след.
+            # дня (08:00 МСК), когда путь всей сессии уже закрыт и исход виден.
             try:
-                from config.settings import INTRADAY_MODE, INTRADAY_HORIZON_HOURS
-                default_h = INTRADAY_HORIZON_HOURS if INTRADAY_MODE else 24
+                from config.settings import INTRADAY_MODE
             except Exception:
-                default_h = 24
-            horizon_h = int(os.getenv("PREDICTION_HORIZON_HOURS", str(default_h)))
+                INTRADAY_MODE = False
+            env_h = os.getenv("PREDICTION_HORIZON_HOURS")
+            if env_h:
+                horizon_h = int(env_h)
+            elif INTRADAY_MODE:
+                msk_now = datetime.now(timezone.utc) + timedelta(hours=3)
+                due_msk = (msk_now + timedelta(days=1)).replace(
+                    hour=8, minute=0, second=0, microsecond=0)
+                horizon_h = max(1, int((due_msk - msk_now).total_seconds() // 3600) + 1)
+            else:
+                horizon_h = 24
             pred_id = await db.add_prediction({
                 "ticker": ticker,
                 "horizon_hours": horizon_h,
@@ -475,10 +507,10 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
                 "price_at": tech.price if tech else None,
                 "regime": (claude_result or {}).get("regime") if claude_result else None,
                 "confluence_score": (claude_result or {}).get("confluence_score") if claude_result else None,
-                "entry": _num((claude_result or {}).get("entry")) if claude_result else None,
-                "stop": _num((claude_result or {}).get("stop")) if claude_result else None,
-                "target": _num((claude_result or {}).get("target")) if claude_result else None,
-                "rr_planned": _num((claude_result or {}).get("rr")) if claude_result else None,
+                "entry": c_entry,        # вход (лимитка Claude / текущая цена)
+                "stop": c_stop,          # стоп ФИКСИРОВАННЫЙ −1% от входа
+                "target": c_target,      # цель Claude из уровней
+                "rr_planned": c_rr,      # R:R от 1%-риска
                 "context": context_snapshot,
             })
             result["prediction_id"] = pred_id
@@ -491,15 +523,50 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
 # ─── Обучение на результатах ──────────────────────────────────────────────────
 
 async def evaluate_due_predictions() -> dict:
-    """Оценить прогнозы с истёкшим горизонтом по фактической цене MOEX."""
-    due = await db.get_due_predictions()
+    """
+    Оценка сигналов. (1) Открытые интрадей Claude-сигналы — на КАЖДОМ тике: исход
+    target/stop фиксируем сразу при касании, session — по закрытию сессии, иначе
+    оставляем открытым (pending). (2) Легаси/не-Claude — по истечении горизонта.
+    """
     evaluated = 0
+
+    # ── 1) ОТКРЫТЫЕ интрадей Claude-сигналы — оцениваем НА КАЖДОМ ТИКЕ ─────────
+    # target/stop фиксируем СРАЗУ при касании (не ждём горизонт/след. день);
+    # session — по закрытию сессии того же дня; pending — сигнал ещё в игре.
+    try:
+        from src.agent import intraday_analyst as ia
+        open_intra = await db.get_open_intraday_predictions()
+    except Exception as e:
+        logger.debug(f"open intraday fetch: {e}")
+        open_intra = []
+    for p in open_intra:
+        if not p.created_at:
+            continue
+        try:
+            oc = await ia.intraday_outcome(
+                p.ticker, p.created_at.isoformat(), p.direction,
+                float(p.entry), float(p.stop), float(p.target))
+        except Exception as e:
+            logger.debug(f"intraday_outcome {p.ticker}: {e}")
+            oc = None
+        if not oc or oc.get("outcome") in (None, "pending"):
+            continue  # ещё в игре / нет данных — оставляем открытым
+        rr = oc.get("realized_r")
+        correct = bool(rr is not None and rr > 0)  # прибыльна в R → «верна»
+        await db.evaluate_prediction(
+            p.id, oc["realized_price"], oc["realized_return"], correct,
+            outcome=oc["outcome"], realized_r=rr)
+        logger.info(
+            f"📏 {p.ticker} {p.direction}: исход={oc['outcome']} "
+            f"R={rr} ({oc['realized_return']:+.2f}%)")
+        evaluated += 1
+
+    # ── 2) Легаси/не-Claude прогнозы — по горизонту, оценка по цене (бэкстоп) ──
+    due = await db.get_due_predictions()
     for p in due:
         if not p.price_at:
             continue
         realized_price = None
-        # Интрадей-прогнозы (короткий горизонт) оцениваем по интрадей-цене на
-        # момент created_at + horizon; иначе/при отсутствии данных — дневной close.
         try:
             from config.settings import INTRADAY_MODE
             if INTRADAY_MODE and p.horizon_hours and p.horizon_hours < 24 and p.created_at:

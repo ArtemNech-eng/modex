@@ -136,9 +136,20 @@ async def scan_interesting(aggregator, tickers=None, save: bool = True,
        полный analyst.analyze (с Claude), результат в кеш сигналов + журнал.
     """
     from src.agent import analyst, screen
+    from src import db
 
     screened = await screen.screen_all(aggregator, tickers=tickers)
-    interesting = [s for s in screened if s["interest"] >= min_interest][:max_claude]
+    # Пропускаем тикеры с УЖЕ открытым сигналом — не зовём по ним Claude и не плодим
+    # дубли. Освободится тикер только когда сигнал отработает (target/stop/session).
+    try:
+        open_tickers = await db.get_open_signal_tickers()
+    except Exception:
+        open_tickers = set()
+    candidates = [s for s in screened
+                  if s["interest"] >= min_interest and s["ticker"] not in open_tickers]
+    interesting = candidates[:max_claude]
+    skipped_open = sorted({s["ticker"] for s in screened
+                           if s["interest"] >= min_interest and s["ticker"] in open_tickers})
 
     confirmed = 0
     for s in interesting:
@@ -152,13 +163,14 @@ async def scan_interesting(aggregator, tickers=None, save: bool = True,
     logger.info(
         f"🔎 Триаж: просканировано {len(screened)}, интересных "
         f"{len([s for s in screened if s['interest'] >= min_interest])}, "
-        f"подтверждено Claude {confirmed}"
+        f"пропущено (открыт сигнал) {len(skipped_open)}, подтверждено Claude {confirmed}"
     )
     return {
         "screened": len(screened),
         "interesting": [{"ticker": s["ticker"], "interest": s["interest"],
                          "direction": s["direction"], "reasons": s["reasons"]}
-                        for s in screened if s["interest"] >= min_interest],
+                        for s in candidates],
+        "skipped_open": skipped_open,
         "claude_confirmed": confirmed,
         "top": screened[:10],
     }

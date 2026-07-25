@@ -126,6 +126,9 @@ class Prediction(Base):
     realized_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     realized_return: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     correct: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    # Интрадей-исход по пути цены до конца сессии: target|stop|session (Фаза B)
+    outcome: Mapped[Optional[str]] = mapped_column(String(12), nullable=True)
+    realized_r: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # факт. R (риск = 1% от входа)
     evaluated_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -138,10 +141,19 @@ class Prediction(Base):
     pm_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     def to_dict(self) -> dict:
+        # МСК-время сигнала из снимка контекста — чтобы было видно в списке.
+        _sig_msk = None
+        if self.context_json:
+            try:
+                import json as _json
+                _sig_msk = _json.loads(self.context_json).get("signal_time_msk")
+            except Exception:
+                _sig_msk = None
         return {
             "id": self.id,
             "ticker": self.ticker,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+            "signal_time_msk": _sig_msk,
             "horizon_hours": self.horizon_hours,
             "sentiment_index": self.sentiment_index,
             "sentiment_signal": self.sentiment_signal,
@@ -153,11 +165,17 @@ class Prediction(Base):
             "regime": self.regime,
             "confluence_score": self.confluence_score,
             "rr_planned": self.rr_planned,
+            "entry": self.entry,
+            "stop": self.stop,
+            "target": self.target,
             "realized_price": self.realized_price,
             "realized_return": (
                 round(self.realized_return, 3)
                 if self.realized_return is not None else None
             ),
+            "outcome": self.outcome,
+            "realized_r": (round(self.realized_r, 3)
+                           if self.realized_r is not None else None),
             "correct": self.correct,
             "evaluated_at": self.evaluated_at.isoformat() if self.evaluated_at else None,
             "post_mortem": self.post_mortem,
@@ -296,6 +314,9 @@ _PREDICTION_ADDED_COLUMNS = {
     "stop": "DOUBLE PRECISION",
     "target": "DOUBLE PRECISION",
     "rr_planned": "DOUBLE PRECISION",
+    # Фаза B — исход по пути цены:
+    "outcome": "TEXT",
+    "realized_r": "DOUBLE PRECISION",
 }
 
 
@@ -573,8 +594,55 @@ async def get_due_predictions() -> list[Prediction]:
         return due
 
 
+async def get_open_intraday_predictions() -> list[Prediction]:
+    """
+    Открытые (ещё не оценённые) интрадей Claude-сигналы: есть entry/stop/target и
+    направление up/down, результат ещё не проставлен. Оцениваются НА КАЖДОМ тике
+    learning-цикла — исход target/stop фиксируем СРАЗУ при касании, не дожидаясь
+    горизонта или следующего дня.
+    """
+    async with async_session() as session:
+        result = await session.execute(
+            select(Prediction)
+            .where(Prediction.correct.is_(None))
+            .where(Prediction.direction.in_(("up", "down")))
+            .where(Prediction.entry.is_not(None))
+            .where(Prediction.stop.is_not(None))
+            .where(Prediction.target.is_not(None))
+        )
+        return list(result.scalars().all())
+
+
+async def get_open_signal_tickers() -> set[str]:
+    """
+    Тикеры с ОТКРЫТЫМ (неоценённым) направленным сигналом. Пока сигнал не отработал
+    (target/stop/session), новый по тому же тикеру не создаём — не плодим дубли.
+    """
+    async with async_session() as session:
+        result = await session.execute(
+            select(Prediction.ticker)
+            .where(Prediction.correct.is_(None))
+            .where(Prediction.direction.in_(("up", "down")))
+        )
+        return {t for (t,) in result.all() if t}
+
+
+async def has_open_signal(ticker: str) -> bool:
+    """Есть ли открытый (неоценённый) направленный сигнал по тикеру."""
+    async with async_session() as session:
+        result = await session.execute(
+            select(Prediction.id)
+            .where(Prediction.correct.is_(None))
+            .where(Prediction.direction.in_(("up", "down")))
+            .where(Prediction.ticker == ticker.upper())
+            .limit(1)
+        )
+        return result.first() is not None
+
+
 async def evaluate_prediction(
-    pred_id: int, realized_price: float, realized_return: float, correct: bool
+    pred_id: int, realized_price: float, realized_return: float, correct: bool,
+    outcome: Optional[str] = None, realized_r: Optional[float] = None,
 ) -> None:
     async with async_session() as session:
         pred = await session.get(Prediction, pred_id)
@@ -583,6 +651,10 @@ async def evaluate_prediction(
         pred.realized_price = realized_price
         pred.realized_return = realized_return
         pred.correct = correct
+        if outcome is not None:
+            pred.outcome = outcome
+        if realized_r is not None:
+            pred.realized_r = realized_r
         pred.evaluated_at = datetime.now(timezone.utc)
         await session.commit()
 
@@ -988,18 +1060,22 @@ async def regime_stats() -> dict:
         if p.direction not in ("up", "down"):
             continue  # «наблюдать»/flat — не сделки, в статистику не берём
         reg = p.regime or "unknown"
-        g = groups.setdefault(reg, {"correct": 0, "total": 0,
-                                    "returns": [], "rs": [], "confl": []})
+        g = groups.setdefault(reg, {"correct": 0, "total": 0, "returns": [], "rs": [],
+                                    "confl": [], "target": 0, "stop": 0, "session": 0})
         g["total"] += 1
         if p.correct:
             g["correct"] += 1
         if p.realized_return is not None:
             g["returns"].append(p.realized_return)
-        r = _r_multiple(p.direction, p.entry, p.stop, p.realized_price)
+        # R: предпочитаем факт. путь до цели/стопа (realized_r); иначе оценка по close.
+        r = p.realized_r if p.realized_r is not None else _r_multiple(
+            p.direction, p.entry, p.stop, p.realized_price)
         if r is not None:
             g["rs"].append(r)
         if p.confluence_score is not None:
             g["confl"].append(p.confluence_score)
+        if p.outcome in ("target", "stop", "session"):
+            g[p.outcome] += 1
 
     def _avg(xs):
         return round(sum(xs) / len(xs), 2) if xs else None
@@ -1014,6 +1090,7 @@ async def regime_stats() -> dict:
             "avg_return": _avg(g["returns"]),
             "avg_r": _avg(g["rs"]),
             "avg_confluence": _avg(g["confl"]),
+            "outcomes": {"target": g["target"], "stop": g["stop"], "session": g["session"]},
         })
     by_regime.sort(key=lambda x: x["trades"], reverse=True)
     return {"by_regime": by_regime,

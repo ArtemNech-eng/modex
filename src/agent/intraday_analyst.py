@@ -285,3 +285,100 @@ async def realized_price_after(ticker: str, start_iso: str, hours: float) -> Opt
     if best_i is None:
         return None
     return data["close"][best_i]
+
+
+def _parse_dt(iso):
+    try:
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _msk_date(dt: datetime):
+    return dt.astimezone(timezone(timedelta(hours=3))).date()
+
+
+async def intraday_outcome(ticker: str, start_iso: str, direction: str,
+                           entry: float, stop: float, target: float,
+                           now_utc: Optional[datetime] = None) -> Optional[dict]:
+    """
+    Пройти ПУТЬ цены от времени сигнала до ТЕКУЩЕГО момента (в пределах того же
+    МСК-дня) и определить исход интрадей-сделки. Оценивается на КАЖДОМ тике:
+      • "target"  — цель достигнута → фиксируем СРАЗУ (R ≈ план);
+      • "stop"    — выбито по фикс-стопу −1% → фиксируем СРАЗУ (R = −1);
+      • "session" — ни цель, ни стоп, но сессия УЖЕ закрылась (того же дня,
+                    ≥23:50 МСК или наступил след. день) → выход по закрытию;
+      • "pending" — сессия ещё идёт, уровни не задеты → сигнал в игре, НЕ оцениваем.
+    Касание — по intrabar high/low; если бар задел И стоп, И цель — консервативно
+    считаем СТОП. Возвращает dict или None (нет данных → откат на бэкстоп по close).
+    """
+    if not (entry and stop and target) or direction not in ("up", "down"):
+        return None
+    start = _parse_dt(start_iso)
+    if start is None:
+        return None
+    now = now_utc or datetime.now(timezone.utc)
+    data = await fetch_intraday(ticker, tf_min=5, hours=48)
+    if not data or not data.get("close"):
+        return None
+    dates = data.get("dates", [])
+    highs, lows, closes = data.get("high", []), data.get("low", []), data.get("close", [])
+    sig_date = _msk_date(start)
+
+    # Свечи ПОСЛЕ сигнала, в пределах того же МСК-дня (вся сессия: main+evening).
+    # Данные историчны (≤ now), поэтому путь = сессия до текущего момента.
+    path = []
+    for i, ts in enumerate(dates):
+        dt = _parse_dt(ts)
+        if dt is None or dt < start:
+            continue
+        if _msk_date(dt) != sig_date:
+            continue
+        path.append(i)
+
+    hit = None
+    for i in path:
+        hi = highs[i] if i < len(highs) else closes[i]
+        lo = lows[i] if i < len(lows) else closes[i]
+        if direction == "up":
+            hit_stop, hit_tgt = lo <= stop, hi >= target
+        else:
+            hit_stop, hit_tgt = hi >= stop, lo <= target
+        if hit_stop:                      # стоп имеет приоритет (в т.ч. если задело оба)
+            hit = ("stop", stop); break
+        if hit_tgt:
+            hit = ("target", target); break
+
+    if hit is not None:
+        outcome, realized_price = hit          # цель/стоп — фиксируем немедленно
+    else:
+        # Уровни не задеты → смотрим, закрылась ли сессия того же дня.
+        now_msk = now.astimezone(timezone(timedelta(hours=3)))
+        session_over = (sig_date < now_msk.date()) or (
+            sig_date == now_msk.date() and (now_msk.hour * 60 + now_msk.minute) >= (23 * 60 + 50))
+        if not session_over:
+            return {"outcome": "pending", "bars": len(path)}
+        if not path:
+            return None                        # сессия закрыта, но данных нет → бэкстоп
+        outcome, realized_price = "session", closes[path[-1]]  # закрытие сессии
+
+    realized_return = (realized_price / entry - 1) * 100  # сырое изменение цены, %
+    risk = abs(entry - stop)
+    if risk <= 0:
+        realized_r = None
+    elif direction == "up":
+        realized_r = (realized_price - entry) / risk
+    else:
+        realized_r = (entry - realized_price) / risk
+
+    return {
+        "outcome": outcome,
+        "realized_price": round(realized_price, 4),
+        "realized_return": round(realized_return, 3),
+        "realized_r": round(realized_r, 3) if realized_r is not None else None,
+        "bars": len(path),
+        "source": data.get("_source"),
+    }

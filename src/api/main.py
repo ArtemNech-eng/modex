@@ -1098,7 +1098,7 @@ async def trigger_post_mortem(limit: int = 25):
 _live_status: dict = {
     "enabled": False,          # включён ли авто-цикл
     "running": False,          # крутится ли фоновая задача
-    "interval_min": 60,        # период сканирования, мин
+    "interval_min": 15,        # период сканирования, мин (Claude каждые 15 мин)
     "tickers": None,           # None = все тикеры
     "last_scan": None,
     "last_eval": None,
@@ -1151,6 +1151,7 @@ async def _live_scan_once() -> dict:
     _live_status["last_scan"] = _now_iso()
     _live_status["scanned"] = triage.get("screened", 0)
     _live_status["interesting"] = triage.get("interesting", [])
+    _live_status["skipped_open"] = triage.get("skipped_open", [])
     _live_status["saved"] = saved
     return {"saved": saved}
 
@@ -1209,7 +1210,7 @@ async def _learning_loop():
 
 
 @app.post("/api/live-signals/start", summary="Запустить авто-генерацию live-сигналов")
-async def live_start(interval_min: int = 60, tickers: Optional[str] = None):
+async def live_start(interval_min: int = 15, tickers: Optional[str] = None):
     """
     Включает фоновый цикл: каждые interval_min минут система генерирует сигналы,
     фиксирует их в БД и оценивает созревшие. tickers — список через запятую
