@@ -547,3 +547,79 @@ async def analyze_ticker(ticker: str, days: int = 120) -> Optional[TechnicalAnal
         logger.info(f"MOEX ISS: мало свечей для {ticker} ({len(closes)})")
         return None
     return compute_from_series(ticker.upper(), closes, highs, lows)
+
+
+# ─── Структура графика: свинги, S/R-пивоты, тренд, RSI-дивергенция ────────────
+# Чистые функции (без сети) — усиливают ЧИСЛОВОЙ график Claude без доп. вызовов LLM.
+
+def swing_points(highs: list[float], lows: list[float],
+                 left: int = 2, right: int = 2) -> tuple[list, list]:
+    """
+    Свинг-хай/лоу (фракталы): бар i — свинг-хай, если его high не ниже `left` баров
+    слева и `right` справа и строго выше хотя бы одной границы окна; симметрично для
+    свинг-лоу. Возвращает (swing_highs, swing_lows) — списки (index, price) по возр. индекса.
+    """
+    n = min(len(highs), len(lows))
+    sh: list = []
+    sl: list = []
+    for i in range(left, n - right):
+        h = highs[i]
+        if (all(h >= highs[i - j] for j in range(1, left + 1)) and
+                all(h >= highs[i + j] for j in range(1, right + 1)) and
+                h > min(highs[i - left], highs[i + right])):
+            sh.append((i, h))
+        lo = lows[i]
+        if (all(lo <= lows[i - j] for j in range(1, left + 1)) and
+                all(lo <= lows[i + j] for j in range(1, right + 1)) and
+                lo < max(lows[i - left], lows[i + right])):
+            sl.append((i, lo))
+    return sh, sl
+
+
+def nearest_sr(price: float, swing_highs: list, swing_lows: list, k: int = 2) -> dict:
+    """Ближайшие уровни от цены: сопротивления (свинг-хаи выше, по возрастанию) и
+    поддержки (свинг-лоу ниже, по убыванию). До k уровней с каждой стороны."""
+    res = sorted(p for _, p in swing_highs if p > price)[:k]
+    sup = sorted((p for _, p in swing_lows if p < price), reverse=True)[:k]
+    return {"resistance": res, "support": sup}
+
+
+def trend_structure(swing_highs: list, swing_lows: list) -> str:
+    """Структура тренда по последним свингам: восходящая (HH+HL), нисходящая (LH+LL),
+    иначе range/переход. Нужны минимум по 2 свинга с каждой стороны."""
+    hs = [p for _, p in swing_highs]
+    ls = [p for _, p in swing_lows]
+    if len(hs) < 2 or len(ls) < 2:
+        return "недостаточно свингов"
+    hh, hl = hs[-1] > hs[-2], ls[-1] > ls[-2]
+    lh, ll = hs[-1] < hs[-2], ls[-1] < ls[-2]
+    if hh and hl:
+        return "восходящая (HH/HL)"
+    if lh and ll:
+        return "нисходящая (LH/LL)"
+    return "range / переход"
+
+
+def rsi_divergence(closes: list[float], swing_highs: list, swing_lows: list,
+                   period: int = 14) -> Optional[str]:
+    """
+    RSI-дивергенция по последним двум свингам:
+      • медвежья — цена сделала более высокий свинг-хай, а RSI на нём ниже;
+      • бычья — цена сделала более низкий свинг-лоу, а RSI на нём выше.
+    RSI берём «как на момент бара» (rsi по closes[:i+1]).
+    """
+    def _rsi_at(i: int) -> Optional[float]:
+        return rsi(closes[:i + 1], period)
+
+    out = []
+    if len(swing_highs) >= 2:
+        (i1, p1), (i2, p2) = swing_highs[-2], swing_highs[-1]
+        r1, r2 = _rsi_at(i1), _rsi_at(i2)
+        if r1 is not None and r2 is not None and p2 > p1 and r2 < r1:
+            out.append("медвежья (цена ↑, RSI ↓)")
+    if len(swing_lows) >= 2:
+        (i1, p1), (i2, p2) = swing_lows[-2], swing_lows[-1]
+        r1, r2 = _rsi_at(i1), _rsi_at(i2)
+        if r1 is not None and r2 is not None and p2 < p1 and r2 > r1:
+            out.append("бычья (цена ↓, RSI ↑)")
+    return "; ".join(out) if out else None

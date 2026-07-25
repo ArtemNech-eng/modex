@@ -663,6 +663,41 @@ async def build_levels_context(ticker: str) -> str:
     return "\n".join(lines) if have else ""
 
 
+async def build_structure_context(ticker: str) -> str:
+    """
+    Структура дневного графика для Claude — числами, без картинки и доп. вызовов LLM:
+    свинг-уровни S/R (пивоты), структура тренда (HH/HL / LH/LL), слом структуры,
+    RSI-дивергенция. Ближайшие уровни — ориентиры для входа/стопа/цели.
+    """
+    ticker = ticker.upper()
+    try:
+        c = await ta.fetch_candles(ticker, days=120)
+    except Exception:
+        return ""
+    H, L, C = c.get("high", []), c.get("low", []), c.get("close", [])
+    if len(C) < 30:
+        return ""
+    price = C[-1]
+    sh, sl = ta.swing_points(H, L)
+    sr = ta.nearest_sr(price, sh, sl)
+    struct = ta.trend_structure(sh, sl)
+    div = ta.rsi_divergence(C, sh, sl)
+
+    lines = [f"📉 СТРУКТУРА ГРАФИКА {ticker} (дневной, цена {round(price, 2)}):"]
+    lines.append(f"  Структура тренда: {struct}")
+    if sr["resistance"]:
+        lines.append("  Сопротивления (свинги): " + ", ".join(f"{r:.2f}" for r in sr["resistance"]))
+    if sr["support"]:
+        lines.append("  Поддержки (свинги): " + ", ".join(f"{s:.2f}" for s in sr["support"]))
+    if sh and price > sh[-1][1]:
+        lines.append(f"  ⚡ Слом структуры вверх: цена выше последнего свинг-хая {sh[-1][1]:.2f}")
+    elif sl and price < sl[-1][1]:
+        lines.append(f"  ⚡ Слом структуры вниз: цена ниже последнего свинг-лоя {sl[-1][1]:.2f}")
+    if div:
+        lines.append(f"  RSI-дивергенция: {div}")
+    return "\n".join(lines) if len(lines) > 2 else ""
+
+
 async def build_lessons_context(ticker: str) -> str:
     """
     Уроки из разобранных ошибок (post-mortem): что уже приводило к провалам
