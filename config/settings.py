@@ -113,6 +113,12 @@ CHART_ANALYSIS_ENABLED = os.getenv("CHART_ANALYSIS_ENABLED", "false").lower() ==
 SNAPSHOT_MAX = int(os.getenv("SNAPSHOT_MAX", "0"))              # 0 = все тикеры
 SNAPSHOT_PACING_SEC = float(os.getenv("SNAPSHOT_PACING_SEC", "0.4"))  # пауза между тикерами (лимиты Tinkoff)
 
+# ─── Приём сделок трейдеров (скрейпер агента → POST /api/ingest/deals) ─────────
+# Токен для защиты ingest-эндпоинта. Пусто = приём открыт (внутренний хобби-режим);
+# задай INGEST_TOKEN в окружении, чтобы принимать только свои заливки.
+INGEST_TOKEN = os.getenv("INGEST_TOKEN", "")
+INGEST_DEALS_WINDOW_H = int(os.getenv("INGEST_DEALS_WINDOW_H", "72"))  # окно показа сделок на дашборде, ч
+
 # ─── Вето-слой КАЧЕСТВА интрадей-сигналов (№1 окно / №2 анти-чейз / №4 режим+HTF) ─
 # Не трогает стоп 1% и решение Claude — только ОТКЛОНЯЕТ слабые входы (→ «наблюдать»,
 # не сохраняем). Всё числами, без доп. вызовов Claude. Пороги легко тюнить из .env.

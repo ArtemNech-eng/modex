@@ -920,6 +920,97 @@ async def recent_events(ticker: Optional[str] = None, source: Optional[str] = No
         return [e.to_dict() for e in result.scalars().all()]
 
 
+async def save_trader_deals(deals: list[dict]) -> dict:
+    """
+    Сохранить сделки трейдеров (скрейп агента) в market_events (source=pulse_deal,
+    kind=deal). Дедуп по сигнатуре против последних ~14 дней. Нормализует action
+    к buy/sell и тикер (upper, без $). Возвращает {received, stored}.
+    """
+    if not deals:
+        return {"received": 0, "stored": 0}
+    existing: set = set()
+    try:
+        recent = await recent_events(source="pulse_deal", since_minutes=14 * 24 * 60, limit=1000)
+        for e in recent:
+            pl = e.get("payload") or {}
+            if isinstance(pl, dict) and pl.get("sig"):
+                existing.add(pl["sig"])
+    except Exception:
+        pass
+
+    def _act(v):
+        s = str(v or "").strip().lower()
+        if s in ("buy", "b", "купил", "покупка", "покупка лонг", "лонг"):
+            return "buy"
+        if s in ("sell", "s", "продал", "продажа", "шорт"):
+            return "sell"
+        if "куп" in s or "buy" in s:
+            return "buy"
+        if "прод" in s or "sell" in s:
+            return "sell"
+        return None
+
+    to_add = []
+    for d in deals:
+        author = (d.get("author") or "").strip()
+        ticker = (d.get("ticker") or "").strip().upper().lstrip("$")
+        action = _act(d.get("action"))
+        if not (author and ticker and action):
+            continue
+        ts_raw = d.get("timestamp") or d.get("ts")
+        sig = "|".join([author, ticker, action, str(ts_raw or ""), str(d.get("price") or "")])
+        if sig in existing:
+            continue
+        existing.add(sig)
+        ev_ts = None
+        if ts_raw:
+            try:
+                ev_ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+            except Exception:
+                ev_ts = None
+        to_add.append({
+            "source": "pulse_deal", "kind": "deal", "ticker": ticker, "channel": author,
+            "ts": ev_ts,
+            "text": f"{author} {action} {ticker}"
+                    + (f" @ {d.get('price')}" if d.get('price') is not None else ""),
+            "payload": {"action": action, "price": d.get("price"),
+                        "quantity": d.get("quantity"), "note": d.get("note"), "sig": sig},
+        })
+    stored = await add_events(to_add) if to_add else 0
+    return {"received": len(deals), "stored": stored}
+
+
+async def recent_trader_deals(hours: int = 72, limit: int = 200) -> dict:
+    """
+    Свод залитых сделок трейдеров для дашборда — форма /api/smart-money:
+    {deals:[{author,ticker,action,price,quantity,timestamp}], by_ticker:[...],
+     deal_count, updated_at, source}.
+    """
+    evs = await recent_events(source="pulse_deal", since_minutes=hours * 60, limit=limit)
+    deals, agg = [], {}
+    for e in evs:
+        pl = e.get("payload") or {}
+        if not isinstance(pl, dict):
+            pl = {}
+        action = pl.get("action")
+        if action not in ("buy", "sell"):
+            continue
+        t = e.get("ticker")
+        deals.append({"author": e.get("channel"), "ticker": t, "action": action,
+                      "price": pl.get("price"), "quantity": pl.get("quantity"),
+                      "timestamp": e.get("ts")})
+        a = agg.setdefault(t, {"buys": 0, "sells": 0})
+        a["buys" if action == "buy" else "sells"] += 1
+    by_ticker = []
+    for t, a in agg.items():
+        net = a["buys"] - a["sells"]
+        by_ticker.append({"ticker": t, "buys": a["buys"], "sells": a["sells"], "net": net,
+                          "bias": "покупки" if net > 0 else "продажи" if net < 0 else "нейтр"})
+    by_ticker.sort(key=lambda x: abs(x["net"]), reverse=True)
+    return {"deals": deals, "by_ticker": by_ticker, "deal_count": len(deals),
+            "updated_at": datetime.now(timezone.utc).isoformat(), "source": "ingested"}
+
+
 async def event_source_stats(since_minutes: int = 60) -> dict:
     """Сколько событий по каждому источнику за последние N минут (панель источников)."""
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)

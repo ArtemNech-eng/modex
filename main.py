@@ -407,28 +407,10 @@ async def market_snapshot_pipeline():
                         miss[t] = 0 if (ob or tr) else miss.get(t, 0) + 1
                     await asyncio.sleep(SNAPSHOT_PACING_SEC)   # бережём лимиты Tinkoff
 
-            # Сделки трейдеров Пульса — реже (Пульс часто блокируется в РФ),
-            # чтобы не долбить заблокированный эндпоинт каждый цикл
-            if cycle % 4 == 1:
-                try:
-                    from src.api.main import _smart_money_snapshot
-                    snap = await _smart_money_snapshot(ttl=0)
-                    for d in (snap.get("deals") or [])[:80]:
-                        sig = f"{d.get('author')}|{d.get('ticker')}|{d.get('action')}|{d.get('timestamp')}|{d.get('price')}"
-                        if sig in seen_deals:
-                            continue
-                        seen_deals.add(sig)
-                        await db.add_event({
-                            "source": "pulse_deal", "kind": "deal", "ticker": d.get("ticker"),
-                            "channel": d.get("author"), "payload": d,
-                            "text": f"{d.get('author')} {d.get('action')} {d.get('ticker')}"
-                                    f"{(' @ ' + str(d.get('price'))) if d.get('price') else ''}",
-                        })
-                        written["deal"] += 1
-                    if len(seen_deals) > 5000:
-                        seen_deals.clear()
-                except Exception as e:
-                    logger.debug(f"pulse deals snapshot: {e}")
+            # Сделки трейдеров Пульса больше НЕ собираем здесь: публичный веб-API
+            # Пульса закрыт анти-ботом. Сделки заливает агент-скрейпер (браузер)
+            # через POST /api/ingest/deals → market_events(source=pulse_deal) →
+            # панель Smart Money + Claude. См. _smart_money_snapshot (читает из БД).
 
             # Лог результата цикла — видно, наполняется ли база из Tinkoff/Пульса
             if tk and written["orderbook"] == 0 and first_err:

@@ -8,7 +8,7 @@ import json
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, BackgroundTasks
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, BackgroundTasks, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -1391,26 +1391,17 @@ _smart_money_cache: dict = {"ts": 0.0, "snapshot": None}
 
 
 async def _smart_money_snapshot(authors: Optional[list[str]] = None, ttl: int = 300) -> dict:
-    """Свод сделок трейдеров с кешем (TTL), чтобы не долбить Пульс на каждый запрос."""
-    import time
-    from src.collector.pulse_author_collector import PulseAuthorTracker
-    from config.settings import PULSE_TRACKED_AUTHORS
-
+    """
+    Свод сделок трейдеров ИЗ БАЗЫ (залиты агентом-скрейпером через /api/ingest/deals).
+    Публичный веб-API Пульса закрыт анти-ботом, поэтому живой скрейп отсюда убран —
+    сделки поступают из browser-скрейпа агента. Форма ответа прежняя (для дашборда).
+    """
+    from config.settings import PULSE_TRACKED_AUTHORS, INGEST_DEALS_WINDOW_H
     if not authors:
-        # Приоритет — список из БД (добавленные через дашборд, переживают
-        # перезагрузку и редеплой). Если БД пуста — откат на список из .env.
         db_nicks = await db.get_tracked_trader_nicks()
         authors = db_nicks or PULSE_TRACKED_AUTHORS
-    key = ",".join(sorted(authors))
-    now = time.time()
-    cached = _smart_money_cache.get("snapshot")
-    if (cached and _smart_money_cache.get("key") == key
-            and now - _smart_money_cache["ts"] < ttl):
-        return cached
-
-    tracker = PulseAuthorTracker(authors)
-    snap = await tracker.snapshot()
-    _smart_money_cache.update({"ts": now, "snapshot": snap, "key": key})
+    snap = await db.recent_trader_deals(hours=INGEST_DEALS_WINDOW_H, limit=200)
+    snap["authors"] = authors
     return snap
 
 
@@ -1425,6 +1416,26 @@ async def get_smart_money(authors: Optional[str] = None, force: bool = False):
     author_list = [a.strip() for a in authors.split(",") if a.strip()] if authors else None
     snap = await _smart_money_snapshot(author_list, ttl=0 if force else 300)
     return snap
+
+
+@app.post("/api/ingest/deals", summary="Приём сделок трейдеров (скрейпер агента)")
+async def ingest_deals(payload: dict = Body(...)):
+    """
+    Заливка сделок трейдеров, собранных агентом через браузер (Пульс-веб закрыт
+    анти-ботом). Тело: {token?, deals:[{author,ticker,action,price,quantity,ts,note}]}.
+    Пишет в market_events(source=pulse_deal) с дедупом → панель Smart Money + Claude.
+    Если INGEST_TOKEN задан в окружении — требуется совпадение token.
+    """
+    from config.settings import INGEST_TOKEN
+    if INGEST_TOKEN and payload.get("token") != INGEST_TOKEN:
+        raise HTTPException(status_code=401, detail="Неверный или отсутствует token")
+    deals = payload.get("deals")
+    if not isinstance(deals, list):
+        raise HTTPException(status_code=400, detail="Поле deals должно быть списком")
+    res = await db.save_trader_deals(deals)
+    _smart_money_cache.update({"ts": 0.0, "snapshot": None, "key": None})
+    logger.info(f"📥 Ingest сделок: получено {res['received']}, сохранено {res['stored']}")
+    return {"ok": True, **res}
 
 
 # ─── Управление отслеживаемыми трейдерами (сохраняются в БД) ──────────────────
