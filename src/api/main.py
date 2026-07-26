@@ -447,6 +447,65 @@ async def health_figi():
             "dead_tickers": dead, "live_map": live}
 
 
+@app.get("/api/health/pulse", summary="Диагностика Пульса: пробить анти-бот через curl_cffi")
+async def health_pulse(ticker: str = "SBER"):
+    """
+    Тестирует, реально ли достать ленту Пульса из ПРОДА (RF-хост, стабильная сеть)
+    разными стратегиями curl_cffi (impersonate chrome). Читает — не пишет. По
+    результату решаем: переписывать ли коллекторы на curl_cffi или нужен headless.
+    """
+    try:
+        from curl_cffi import requests as cr
+    except Exception as e:
+        return {"error": f"curl_cffi недоступен: {e}"}
+
+    def _hdrs(host, app=False):
+        h = {"Accept": "application/json", "Accept-Language": "ru-RU,ru;q=0.9",
+             "Origin": f"https://www.{host}", "Referer": f"https://www.{host}/invest/social/"}
+        if app:
+            h.update({"x-app-name": "invest", "x-app-version": "1.0.0", "x-request-id": "moodex-diag"})
+        return h
+
+    def _api(host):
+        return (f"https://www.{host}/api/invest-gw/social/v1/post/instrument"
+                f"?ticker={ticker}&limit=3")
+
+    results = []
+
+    def _run(label, fn):
+        import time as _t
+        t0 = _t.time()
+        try:
+            r = fn()
+            ms = int((_t.time() - t0) * 1000)
+            info = {"strategy": label, "http": r.status_code, "ms": ms}
+            try:
+                d = r.json(); p = d.get("payload") or {}
+                it = p.get("items")
+                info.update({"status": d.get("status"),
+                             "msg": (p.get("message") if isinstance(p, dict) else None),
+                             "items": len(it) if isinstance(it, list) else None})
+            except Exception:
+                info["body"] = r.text[:120]
+            results.append(info)
+        except Exception as e:
+            results.append({"strategy": label, "error": str(e)[:140]})
+
+    for host in ("tbank.ru", "tinkoff.ru"):
+        _run(f"{host}|chrome", lambda h=host: cr.get(_api(h), headers=_hdrs(h), impersonate="chrome", timeout=15))
+        _run(f"{host}|chrome+apphdrs", lambda h=host: cr.get(_api(h), headers=_hdrs(h, app=True), impersonate="chrome", timeout=15))
+
+        def _primed(h=host):
+            s = cr.Session(impersonate="chrome")
+            s.get(f"https://www.{h}/invest/social/", timeout=15)   # прогрев куки
+            return s.get(_api(h), headers=_hdrs(h, app=True), timeout=15)
+        _run(f"{host}|primed", _primed)
+
+    ok = [r for r in results if r.get("items")]
+    return {"ticker": ticker, "any_success": bool(ok),
+            "winning_strategies": [r["strategy"] for r in ok], "results": results}
+
+
 @app.get("/api/knowledge/{ticker}", summary="Срез базы знаний по тикеру (для Claude)")
 async def get_knowledge(ticker: str, minutes: int = 240):
     """
