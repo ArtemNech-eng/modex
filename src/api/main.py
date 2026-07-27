@@ -454,18 +454,32 @@ async def health_ai():
     (статус-код + тело), чтобы точно понять причину «Claude недоступен»: неверный ключ
     (401/403), нет модели (404), пустой баланс (402), не тот URL и т.п. Ключ не раскрываем.
     """
-    import os as _os
+    import os as _os, time as _t
     from src.agent.claude_agent import ClaudeAgent, _PROVIDER, _BASE_URL, _MODEL
     key = _os.getenv("ANTHROPIC_API_KEY", "")
     info = {"provider": _PROVIDER, "base_url": _BASE_URL, "model": _MODEL,
             "key_set": bool(key), "key_len": len(key)}
+    ag = ClaudeAgent()
+    # 1) МАЛЫЙ запрос
+    t0 = _t.time()
     try:
-        txt = await ClaudeAgent()._ask("Ты тест.", "Ответь одним словом: ok", max_tokens=5)
-        info["ok"] = True
-        info["reply"] = (txt or "")[:80]
+        txt = await ag._ask("Ты тест.", "Ответь одним словом: ok", max_tokens=5)
+        info["small"] = {"ok": True, "ms": int((_t.time() - t0) * 1000), "reply": (txt or "")[:60]}
     except Exception as e:
-        info["ok"] = False
-        info["error"] = str(e)[:400]
+        info["small"] = {"ok": False, "ms": int((_t.time() - t0) * 1000), "error": str(e)[:300]}
+    # 2) БОЛЬШОЙ запрос (воспроизводим синтез: крупный промпт + 1300 токенов)
+    big_sys = ("Ты профессиональный интрадей-трейдер MOEX. Действуй строго по плейбуку. " * 120)
+    big_usr = ("Контекст рынка: " + ("стакан bid/ask, VWAP, ORB, footprint, поток, "
+               "настроение чатов, геополитика, память, уроки. " * 300)
+               + "\nВерни решение СТРОГО валидным JSON: {\"signal\":\"neutral\",\"confidence\":0}.")
+    t0 = _t.time()
+    try:
+        txt = await ag._ask(big_sys, big_usr, max_tokens=1300)
+        info["big"] = {"ok": True, "ms": int((_t.time() - t0) * 1000),
+                       "in_chars": len(big_sys) + len(big_usr), "reply": (txt or "")[:120]}
+    except Exception as e:
+        info["big"] = {"ok": False, "ms": int((_t.time() - t0) * 1000),
+                       "in_chars": len(big_sys) + len(big_usr), "error": str(e)[:400]}
     return info
 
 
