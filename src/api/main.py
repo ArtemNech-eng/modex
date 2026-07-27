@@ -447,6 +447,28 @@ async def health_figi():
             "dead_tickers": dead, "live_map": live}
 
 
+@app.get("/api/health/ai", summary="Диагностика Claude/AI-провайдера (сырой ответ)")
+async def health_ai():
+    """
+    Делает ОДИН минимальный запрос к AI-провайдеру и возвращает СЫРОЙ результат/ошибку
+    (статус-код + тело), чтобы точно понять причину «Claude недоступен»: неверный ключ
+    (401/403), нет модели (404), пустой баланс (402), не тот URL и т.п. Ключ не раскрываем.
+    """
+    import os as _os
+    from src.agent.claude_agent import ClaudeAgent, _PROVIDER, _BASE_URL, _MODEL
+    key = _os.getenv("ANTHROPIC_API_KEY", "")
+    info = {"provider": _PROVIDER, "base_url": _BASE_URL, "model": _MODEL,
+            "key_set": bool(key), "key_len": len(key)}
+    try:
+        txt = await ClaudeAgent()._ask("Ты тест.", "Ответь одним словом: ok", max_tokens=5)
+        info["ok"] = True
+        info["reply"] = (txt or "")[:80]
+    except Exception as e:
+        info["ok"] = False
+        info["error"] = str(e)[:400]
+    return info
+
+
 @app.get("/api/health/pulse", summary="Диагностика Пульса: пробить анти-бот через curl_cffi")
 async def health_pulse(ticker: str = "SBER"):
     """
