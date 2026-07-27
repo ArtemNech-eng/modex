@@ -112,6 +112,13 @@ CHART_ANALYSIS_ENABLED = os.getenv("CHART_ANALYSIS_ENABLED", "false").lower() ==
 # Раньше было жёстко [:8]. Мёртвые/переименованные тикеры авто-усыпляются (см. main.py).
 SNAPSHOT_MAX = int(os.getenv("SNAPSHOT_MAX", "0"))              # 0 = все тикеры
 SNAPSHOT_PACING_SEC = float(os.getenv("SNAPSHOT_PACING_SEC", "0.4"))  # пауза между тикерами (лимиты Tinkoff)
+# core+rotating: ЯДРО (ликвидные) опрашиваем КАЖДЫЙ цикл; ХВОСТ — по кругу срезами,
+# чтобы не упираться в лимиты Tinkoff и чтобы ликвидные бумаги никогда не «залипали».
+SNAPSHOT_CORE = [t.strip().upper() for t in os.getenv(
+    "SNAPSHOT_CORE",
+    "SBER,GAZP,LKOH,GMKN,NVTK,ROSN,YDEX,TATN,MTSS,MGNT,ALRS,PLZL,VTBR,CHMF,"
+    "NLMK,MAGN,SNGS,SNGSP,MOEX,T,OZON,SIBN,TRNFP,PHOR,X5,POSI").split(",") if t.strip()]
+SNAPSHOT_TAIL_PER_CYCLE = int(os.getenv("SNAPSHOT_TAIL_PER_CYCLE", "6"))  # тикеров хвоста за цикл
 
 # ─── Приём сделок трейдеров (скрейпер агента → POST /api/ingest/deals) ─────────
 # Токен для защиты ingest-эндпоинта. Пусто = приём открыт (внутренний хобби-режим);

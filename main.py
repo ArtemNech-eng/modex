@@ -310,13 +310,20 @@ async def market_snapshot_pipeline():
     Tinkoff (стакан/поток/цена) + реальные сделки трейдеров Пульса.
     Всё пишется в market_events с меткой времени (реалтайм + история для Claude).
     """
-    from config.settings import TINKOFF_TOKEN, MOEX_TICKERS, SNAPSHOT_MAX, SNAPSHOT_PACING_SEC
+    from config.settings import (TINKOFF_TOKEN, MOEX_TICKERS, SNAPSHOT_MAX,
+                                  SNAPSHOT_PACING_SEC, SNAPSHOT_CORE, SNAPSHOT_TAIL_PER_CYCLE)
     from src.analysis.intraday import session_phase
     await db.setup_db()
     all_tickers = list(MOEX_TICKERS.keys())
     watch = all_tickers if SNAPSHOT_MAX <= 0 else all_tickers[:SNAPSHOT_MAX]
-    logger.info(f"🧠 База знаний: стакан по {len(watch)} тикерам (SNAPSHOT_MAX={SNAPSHOT_MAX or 'все'})")
-    miss: dict = {}   # тикер → подряд циклов В СЕССИЮ без данных (усыпление мёртвых/переименованных)
+    # core+rotating: ядро (ликвидные) — каждый цикл; хвост — по кругу срезами.
+    # Это ограничивает нагрузку на Tinkoff за цикл → нет троттлинга и «залипания».
+    core_set = set(SNAPSHOT_CORE)
+    core = [t for t in watch if t in core_set]
+    tail = [t for t in watch if t not in core_set]
+    tail_ptr = 0
+    logger.info(f"🧠 База знаний: стакан core+rotating — ядро {len(core)}/цикл, "
+                f"хвост {len(tail)} по {SNAPSHOT_TAIL_PER_CYCLE}/цикл (всего {len(watch)})")
     tk = None
     if TINKOFF_TOKEN:
         from src.collector.tinkoff_client import TinkoffClient
@@ -334,13 +341,17 @@ async def market_snapshot_pipeline():
         # Фаза сессии: в торговые часы опрашиваем часто, вне — редко (данные не меняются).
         _mm = datetime.now(timezone.utc) + timedelta(hours=3)
         open_now = session_phase(_mm.hour * 60 + _mm.minute) in ("main", "evening")
+        # Тикеры этого цикла: всё ЯДРО + срез ХВОСТА по кругу (ограничиваем нагрузку).
+        if tail and SNAPSHOT_TAIL_PER_CYCLE > 0:
+            n = min(SNAPSHOT_TAIL_PER_CYCLE, len(tail))
+            slice_ = [tail[(tail_ptr + i) % len(tail)] for i in range(n)]
+            tail_ptr = (tail_ptr + n) % len(tail)
+        else:
+            slice_ = tail
+        cycle_watch = core + slice_
         try:
             if tk:
-                for t in watch:
-                    # Мёртвый/переименованный тикер (нет данных ≥3 циклов в сессию) —
-                    # опрашиваем редко (раз в 20 циклов), не жжём API впустую.
-                    if miss.get(t, 0) >= 3 and cycle % 20 != 0:
-                        continue
+                for t in cycle_watch:
                     ts = datetime.now(timezone.utc)
                     # Лёгкие последовательные вызовы (без тяжёлых 365-дневных
                     # свечей и без пачки concurrent-запросов) — не упираемся в
@@ -401,10 +412,6 @@ async def market_snapshot_pipeline():
                                  f"поток: {tr.get('order_flow') if tr else '—'}",
                             timestamp=ts,
                         )
-                    # Усыпление мёртвых тикеров: счётчик промахов ведём ТОЛЬКО в сессию
-                    # (вне сессии пусто у всех — это норма, не повод усыплять).
-                    if open_now:
-                        miss[t] = 0 if (ob or tr) else miss.get(t, 0) + 1
                     await asyncio.sleep(SNAPSHOT_PACING_SEC)   # бережём лимиты Tinkoff
 
             # Сделки трейдеров Пульса больше НЕ собираем здесь: публичный веб-API
