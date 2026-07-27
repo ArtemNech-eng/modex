@@ -467,19 +467,29 @@ async def health_ai():
         info["small"] = {"ok": True, "ms": int((_t.time() - t0) * 1000), "reply": (txt or "")[:60]}
     except Exception as e:
         info["small"] = {"ok": False, "ms": int((_t.time() - t0) * 1000), "error": str(e)[:300]}
-    # 2) БОЛЬШОЙ запрос (воспроизводим синтез: крупный промпт + 1300 токенов)
-    big_sys = ("Ты профессиональный интрадей-трейдер MOEX. Действуй строго по плейбуку. " * 120)
-    big_usr = ("Контекст рынка: " + ("стакан bid/ask, VWAP, ORB, footprint, поток, "
-               "настроение чатов, геополитика, память, уроки. " * 300)
-               + "\nВерни решение СТРОГО валидным JSON: {\"signal\":\"neutral\",\"confidence\":0}.")
-    t0 = _t.time()
-    try:
-        txt = await ag._ask(big_sys, big_usr, max_tokens=1300)
-        info["big"] = {"ok": True, "ms": int((_t.time() - t0) * 1000),
-                       "in_chars": len(big_sys) + len(big_usr), "reply": (txt or "")[:120]}
-    except Exception as e:
-        info["big"] = {"ok": False, "ms": int((_t.time() - t0) * 1000),
-                       "in_chars": len(big_sys) + len(big_usr), "error": str(e)[:400]}
+    # 2) РЕАЛЬНЫЙ синтез: тот же JSON-схема из 17 полей. Тестируем при 1300 (старый
+    #    лимит — воспроизводим обрезку) и 3000 (новый). json_ok/ends_brace покажут суть.
+    import json as _json
+    schema = ("Верни СТРОГО валидный JSON по акции SBER с полями (заполни осмысленным "
+              "русским текстом): risk_gate, htf_bias, regime, setup, confluence_score, "
+              "confluence_factors, signal, confidence, entry, stop, target, rr, size, "
+              "invalidation, summary(2-3 предложения), key_insight(развёрнуто), risk(развёрнуто).")
+    for tag, mt in (("synth_1300", 1300), ("synth_3000", 3000)):
+        t0 = _t.time()
+        try:
+            txt = await ag._ask("Ты интрадей-трейдер MOEX.", schema, max_tokens=mt)
+            s, e = txt.find("{"), txt.rfind("}") + 1
+            json_ok = False
+            if s >= 0 and e > s:
+                try:
+                    _json.loads(txt[s:e]); json_ok = True
+                except Exception:
+                    json_ok = False
+            info[tag] = {"ok": True, "ms": int((_t.time() - t0) * 1000),
+                         "reply_len": len(txt or ""), "ends_brace": (txt or "").rstrip().endswith("}"),
+                         "json_ok": json_ok}
+        except Exception as ex:
+            info[tag] = {"ok": False, "ms": int((_t.time() - t0) * 1000), "error": str(ex)[:300]}
     return info
 
 
