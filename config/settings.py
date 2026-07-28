@@ -100,8 +100,8 @@ INTRADAY_OPENING_RANGE_BARS = int(os.getenv("INTRADAY_OPENING_RANGE_BARS", "6"))
 
 # ─── Триаж «словари+ML → Claude» (авто-скан) ──────────────────────────────────
 # Дешёвые слои постоянно скринят рынок; Claude подтверждает только интересное.
-SCAN_MIN_INTEREST = float(os.getenv("SCAN_MIN_INTEREST", "0.7"))   # порог «интересности» [0..1] (выше = реже зовём Claude)
-SCAN_MAX_CLAUDE = int(os.getenv("SCAN_MAX_CLAUDE", "2"))            # макс. вызовов Claude за цикл (экономия)
+SCAN_MIN_INTEREST = float(os.getenv("SCAN_MIN_INTEREST", "0.6"))   # порог «интересности» [0..1] (ниже = больше кандидатов к Claude)
+SCAN_MAX_CLAUDE = int(os.getenv("SCAN_MAX_CLAUDE", "6"))            # макс. вызовов Claude за цикл (баланс есть → шире охват)
 
 # Визуальный разбор графика (Claude Vision) — ВТОРОЙ вызов Claude на тикер + дорогой
 # input-image. По умолчанию ВЫКЛ ради экономии; структурных данных и так достаточно.
