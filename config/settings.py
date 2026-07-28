@@ -146,6 +146,15 @@ MGMT_BE_TRIGGER_R = float(os.getenv("MGMT_BE_TRIGGER_R", "1.0"))   # при ск
 MGMT_PARTIAL_FRAC = float(os.getenv("MGMT_PARTIAL_FRAC", "0.5"))   # доля позиции, фиксируемая на цели T1
 MGMT_TRAIL_ATR = float(os.getenv("MGMT_TRAIL_ATR", "1.5"))         # чандельер-трейл остатка, ×ATR
 
+# ─── Моментум-режим (продолжение тренда) — ловит сильные однонаправленные движения ─
+# Вход по продолжению тренда (не только на откате), СТРУКТУРНЫЙ стоп (с потолком),
+# мягче гейт R:R (прибыль трейлим). Ниже win-rate, но крупнее победители — мерим
+# отдельно под тегом режима trend_momentum. Пуллбэк-режим не трогаем.
+MOMENTUM_ENABLED = os.getenv("MOMENTUM_ENABLED", "true").lower() == "true"
+MOMENTUM_STOP_CAP_PCT = float(os.getenv("MOMENTUM_STOP_CAP_PCT", "0.01"))  # потолок структурного стопа (1%)
+MOMENTUM_EXT_ATR = float(os.getenv("MOMENTUM_EXT_ATR", "2.0"))     # макс. растяжение входа от VWAP, ×ATR (анти-пик)
+MOMENTUM_MIN_CONFLUENCE = int(os.getenv("MOMENTUM_MIN_CONFLUENCE", "3"))   # мин. конфлюенс для моментума
+
 # Авто-старт live-движка при запуске приложения: сканирование → сигналы по
 # плейбуку → оценка созревших прогнозов → обучение. Без него «мозг» простаивает
 # до ручного /api/live-signals/start и гаснет при каждом редеплое.

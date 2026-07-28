@@ -73,19 +73,30 @@ def _quality_veto(direction: str, claude_result: dict, intraday_ctx,
     if getattr(S, "FILTER_REQUIRE_ORB", True) and levels.get("or_high") is None:
         return "диапазон открытия (ORB) ещё не сформирован"
 
-    # ── №2 АНТИ-ЧЕЙЗ: вход у уровня, не догоняем ──────────────────────────────
+    # ── №2 АНТИ-ЧЕЙЗ (зависит от mode) ────────────────────────────────────────
+    mode = (claude_result.get("mode") or "pullback").lower()
     atr = (intraday_ctx or {}).get("atr")
     if c_entry and atr and atr > 0:
-        ref = [levels.get(k) for k in
-               ("vwap", "or_high", "or_low", "session_high", "session_low",
-                "spike_high", "spike_low")]
-        ref = [x for x in ref if x]
-        if ref:
-            nearest = min(abs(c_entry - x) for x in ref)
-            max_atr = getattr(S, "FILTER_ENTRY_MAX_ATR", 0.5)
-            if nearest > max_atr * atr:
-                return (f"вход далеко от уровня ({nearest / atr:.1f}×ATR > "
-                        f"{max_atr}×ATR) — это чейз, ждём откат")
+        if mode == "momentum":
+            # Моментум: вход у уровня НЕ требуется (входим по продолжению тренда),
+            # но НЕ на исходе — потолок растяжения от VWAP (анти-пик).
+            vwap = levels.get("vwap")
+            ext = getattr(S, "MOMENTUM_EXT_ATR", 2.0)
+            if vwap and abs(c_entry - vwap) > ext * atr:
+                return (f"моментум: цена растянута {abs(c_entry - vwap) / atr:.1f}×ATR от VWAP "
+                        f"(> {ext}×ATR) — поздно, ждём")
+        else:
+            # Pullback: вход обязан быть у структуры, не «в поле».
+            ref = [levels.get(k) for k in
+                   ("vwap", "or_high", "or_low", "session_high", "session_low",
+                    "spike_high", "spike_low")]
+            ref = [x for x in ref if x]
+            if ref:
+                nearest = min(abs(c_entry - x) for x in ref)
+                max_atr = getattr(S, "FILTER_ENTRY_MAX_ATR", 0.5)
+                if nearest > max_atr * atr:
+                    return (f"вход далеко от уровня ({nearest / atr:.1f}×ATR > "
+                            f"{max_atr}×ATR) — это чейз, ждём откат")
 
     # ── №4 РЕЖИМ + HTF + КОНФЛЮЕНС ────────────────────────────────────────────
     try:
@@ -363,36 +374,52 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         except (TypeError, ValueError):
             return None
 
-    STOP_PCT = 0.01   # стоп ФИКСИРОВАННЫЙ: 1% от входа (ставим сами)
+    STOP_PCT = 0.01   # потолок стопа: 1% от входа (pullback — жёстко 1%, momentum — ≤1%)
+    mode = ((claude_result or {}).get("mode") or "pullback").lower()
     c_entry = c_stop = c_target = c_rr = None
     claude_trade_plan = None
     if claude_result and direction != "flat":
-        # Вход — от Claude (лимитка), иначе текущая цена. Стоп — фиксированный 1%.
-        # Цель — от Claude из уровней. R:R считаем от 1%-риска.
+        up = direction == "up"
+        # Вход — от Claude (лимитка), иначе текущая цена. Цель — от Claude из уровней.
         c_entry = (_num(claude_result.get("entry"))
                    or (intraday_ctx.get("price") if intraday_ctx else None)
                    or (tech.price if tech else None))
         c_target = _num(claude_result.get("target"))
         if c_entry:
-            c_stop = (round(c_entry * (1 - STOP_PCT), 4) if direction == "up"
-                      else round(c_entry * (1 + STOP_PCT), 4))
-            if c_target is not None:
-                c_rr = round(abs(c_target - c_entry) / (STOP_PCT * c_entry), 2)
+            cap_stop = round(c_entry * (1 - STOP_PCT), 4) if up else round(c_entry * (1 + STOP_PCT), 4)
+            if mode == "momentum":
+                # СТРУКТУРНЫЙ стоп от Claude (за базой пробоя), но НЕ шире 1% (потолок)
+                # и обязательно на верной стороне входа. Тугой стоп → лучше R:R.
+                s = _num(claude_result.get("stop"))
+                if s and ((up and s < c_entry) or (not up and s > c_entry)):
+                    c_stop = max(s, cap_stop) if up else min(s, cap_stop)
+                else:
+                    c_stop = cap_stop
+            else:
+                c_stop = cap_stop   # pullback: фиксированный −1%
+            risk = abs(c_entry - c_stop)
+            if c_target is not None and risk > 0:
+                c_rr = round(abs(c_target - c_entry) / risk, 2)
+            _stop_txt = "структурный стоп ≤1%" if mode == "momentum" else "стоп 1%"
             claude_trade_plan = {
-                "direction": "long" if direction == "up" else "short",
+                "direction": "long" if up else "short",
                 "entry_low": c_entry, "entry_high": c_entry,
                 "price": intraday_ctx.get("price") if intraday_ctx else (tech.price if tech else None),
                 "stop_loss": c_stop,
                 "take_profit_1": c_target, "take_profit_2": None,
                 "risk_reward": c_rr, "current_rr": c_rr,
                 "entry_status": "enter",
-                "entry_note": (claude_result.get("setup") or "") + " · стоп 1%",
+                "mode": mode,
+                "entry_note": (claude_result.get("setup") or "") + f" · {_stop_txt}",
                 "size": claude_result.get("size"),
                 "invalidation": claude_result.get("invalidation"),
                 "atr": intraday_ctx.get("atr") if intraday_ctx else None,
                 "entry_rule": claude_result.get("setup") or "",
-                "exit_rule": ("Стоп −1%; при +1R → в безубыток; на цели фиксируем 50%, "
-                              "остаток трейлим (1.5×ATR) до закрытия сессии."),
+                "exit_rule": (("Моментум: структурный стоп ≤1%; при +1R → безубыток; "
+                               "частичка 50% на цели, остаток трейлим (1.5×ATR) до закрытия.")
+                              if mode == "momentum" else
+                              ("Стоп −1%; при +1R → в безубыток; на цели фиксируем 50%, "
+                               "остаток трейлим (1.5×ATR) до закрытия сессии.")),
             }
             reg = claude_result.get("regime")
             if reg and reg != "unclear":
@@ -542,7 +569,9 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
                 "confidence": confidence,
                 "signal_time_msk": (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M МСК"),
                 "decision_by": "claude",  # сохраняем ТОЛЬКО сигналы Claude
-                "stop_pct": STOP_PCT,     # стоп фиксированный (1%)
+                "mode": mode,             # pullback (фикс −1%) или momentum (структурный ≤1%)
+                "stop_pct": (round(abs(c_entry - c_stop) / c_entry, 4)
+                             if (c_entry and c_stop) else STOP_PCT),  # фактический риск, %
                 "sentiment_index": sentiment_block["sentiment_index"] if sentiment_block else None,
                 "sentiment_label": sentiment_block.get("label") if sentiment_block else None,
                 "sentiment_signal": sentiment_signal,
@@ -593,12 +622,14 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
                 "confidence": confidence,
                 "direction": direction,
                 "price_at": tech.price if tech else None,
-                "regime": (claude_result or {}).get("regime") if claude_result else None,
+                # momentum → тег trend_momentum (отдельная строка в regime-stats).
+                "regime": ("trend_momentum" if mode == "momentum"
+                           else ((claude_result or {}).get("regime") if claude_result else None)),
                 "confluence_score": (claude_result or {}).get("confluence_score") if claude_result else None,
                 "entry": c_entry,        # вход (лимитка Claude / текущая цена)
-                "stop": c_stop,          # стоп ФИКСИРОВАННЫЙ −1% от входа
+                "stop": c_stop,          # pullback: фикс −1%; momentum: структурный ≤1%
                 "target": c_target,      # цель Claude из уровней
-                "rr_planned": c_rr,      # R:R от 1%-риска
+                "rr_planned": c_rr,      # R:R от фактического риска |вход−стоп|
                 "context": context_snapshot,
             })
             result["prediction_id"] = pred_id
