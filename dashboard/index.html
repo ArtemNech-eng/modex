@@ -362,6 +362,25 @@ header {
     <!-- Сводка форвард-точности -->
     <div id="liveTrackSummary" style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;"></div>
 
+    <!-- Claude против человека: обучение на ваших решениях.
+         Claude предлагает сценарий, решаете вы, система записывает решение —
+         и потом показывает, добавляет ваше вето ценность или отнимает.
+         Исход считается для принятых и отклонённых ОДИНАКОВО, иначе сравнение
+         было бы смещённым по построению. -->
+    <div class="card" style="border:1px solid #4a7dff44;">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+        <div class="card-title" style="color:var(--blue);">🧠 Claude против человека — чей вклад в результат</div>
+        <button class="btn btn-ghost" onclick="loadDecisionStats()">↻ Обновить</button>
+      </div>
+      <div style="font-size:11px;color:var(--dim);margin:4px 0 8px;">
+        Нажимайте ПРИНЯТЬ / ОТКЛОНИТЬ / ОЖИДАТЬ на карточках сигналов ниже. Через
+        несколько десятков решений станет видно, где вы сильнее модели, а где она сильнее вас.
+      </div>
+      <div id="decisionStats" style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;">
+        <div style="color:var(--dim);grid-column:1/-1;">Загружается…</div>
+      </div>
+    </div>
+
     <!-- Умные деньги: реальные сделки трейдеров -->
     <div class="card" style="border:1px solid #d2992244;">
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
@@ -694,7 +713,7 @@ function switchTab(name, el) {
   if (name === 'market') { loadFeed(); feedPoll = setInterval(loadFeed, 10000); }
   if (name === 'channels') loadChannels();
   if (name === 'signals') loadSignals();
-  if (name === 'live') { loadLiveSignals(); loadTrackedTraders(); }
+  if (name === 'live') { loadLiveSignals(); loadTrackedTraders(); loadDecisionStats(); }
   if (name === 'track') loadTrackRecord();
   if (name === 'strategy') { refreshBackfill(); if (!window._btLoaded) { window._btLoaded=true; runBacktest(); } }
 }
@@ -1324,7 +1343,80 @@ function liveSigRow(s) {
       цена входа <b>${s.price_at ?? '—'}</b>${s.current_price!=null?` · сейчас ${s.current_price}`:''} · ${plan}
     </div>
     ${s.narrative?`<div style="font-size:10px;color:var(--dim);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">🤖 ${s.narrative}</div>`:''}
+    ${posLine(s)}
+    ${decisionBar(s)}
   </div>`;
+}
+// Размер позиции от Risk Engine. Без него карточка описывает сценарий, но не
+// сделку: «купить SBER» — это мнение, «158 акций, риск 205₽» — исполнимый план.
+function posLine(s) {
+  const p = s.position;
+  if (!p || p.shares == null) return '';
+  const bind = {risk:'риском', exposure:'экспозицией',
+                total_exposure:'общей экспозицией', lot:'лотом'}[p.binding] || p.binding || '—';
+  return `<div style="font-size:11px;color:var(--text);margin-top:5px;padding-top:5px;border-top:1px solid var(--border);">
+    📐 <b>${p.shares}</b> шт · риск <b>${p.risk_rub}₽</b>${p.risk_pct_of_account!=null?` (${Number(p.risk_pct_of_account).toFixed(2)}% счёта)`:''}${p.notional_rub!=null?` · объём ${Math.round(p.notional_rub).toLocaleString('ru-RU')}₽`:''}
+    <span style="color:var(--dim);">· ограничено ${bind}</span></div>`;
+}
+// Кнопки решения: Claude советует — решаете вы. Решение записывается, чтобы
+// потом было видно, добавляет ваше вето ценность или отнимает.
+function decisionBar(s) {
+  if (s.id == null) return '';
+  const cur = _pendingReopen.has(s.id) ? null : s.human_decision;
+  const label = {accept:'🟢 принято', reject:'🔴 отклонено', wait:'⏸ ожидание'}[cur];
+  if (cur) {
+    return `<div style="font-size:11px;margin-top:6px;color:var(--dim);">
+      Ваше решение: <b style="color:var(--text);">${label}</b>${s.decided_at?` · ${_fmtTime(s.decided_at)}`:''}
+      <span style="margin-left:8px;cursor:pointer;text-decoration:underline;"
+            onclick="event.stopPropagation();decideSignal(${s.id},null)">изменить</span></div>`;
+  }
+  const b = (d, txt, col) => `<button class="btn btn-ghost" style="padding:3px 9px;font-size:11px;border-color:${col};color:${col};" onclick="event.stopPropagation();decideSignal(${s.id},'${d}')">${txt}</button>`;
+  return `<div style="display:flex;gap:6px;margin-top:7px;flex-wrap:wrap;" onclick="event.stopPropagation()">
+    ${b('accept','🟢 ПРИНЯТЬ','var(--green)')}${b('reject','🔴 ОТКЛОНИТЬ','var(--red)')}${b('wait','⏸ ОЖИДАТЬ','var(--yellow)')}</div>`;
+}
+// Множество сигналов, у которых пользователь нажал «изменить»: показываем
+// кнопки снова, не трогая сохранённое решение до нового выбора.
+const _pendingReopen = new Set();
+async function decideSignal(id, decision) {
+  if (decision === null) { _pendingReopen.add(id); await loadLiveSignals(); return; }
+  try {
+    const r = await fetch(`${API}/api/signals/${id}/decision?decision=${decision}`, {method:'POST'});
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({detail: r.statusText}));
+      alert(`Не удалось записать решение: ${e.detail || r.statusText}`);
+      return;
+    }
+    _pendingReopen.delete(id);
+    await loadLiveSignals();
+    await loadDecisionStats();
+  } catch (e) { alert(`Ошибка сети: ${e.message}`); }
+}
+// Отчёт «Claude против человека». Главное число — вклад вашего вето в R.
+async function loadDecisionStats() {
+  const box = document.getElementById('decisionStats');
+  if (!box) return;
+  try {
+    const d = await (await fetch(`${API}/api/decisions`)).json();
+    const edge = d.human_edge_r;
+    const edgeCol = edge == null ? 'var(--dim)' : edge > 0 ? 'var(--green)' : edge < 0 ? 'var(--red)' : 'var(--yellow)';
+    const share = d.decided_share != null ? Math.round(d.decided_share * 100) + '%' : '—';
+    box.innerHTML =
+      metricCard('Предложений Claude', d.all_proposals.n, 'var(--blue)') +
+      metricCard('Принято вами', d.accepted.n, 'var(--green)') +
+      metricCard('Отклонено вами', d.rejected.n, 'var(--red)') +
+      metricCard('Вклад вашего вето, R', edge == null ? '—' : edge, edgeCol) +
+      metricCard('Решений принято', share, (d.decided_share >= 0.5) ? 'var(--text)' : 'var(--yellow)') +
+      `<div style="grid-column:1/-1;font-size:11px;color:var(--dim);margin-top:4px;line-height:1.5;">
+        ${d.human_edge_note}.<br>
+        ${d.all_proposals.expectancy_r == null
+          ? '<b style="color:var(--yellow);">Ожидание в R пока не считается: ни у одной сделки не заполнен realized_r — для этого нужны сделки с входом, стопом и целью.</b>'
+          : `Ожидание по всем предложениям Claude: <b>${d.all_proposals.expectancy_r}R</b>.`}
+        ${(d.decided_share != null && d.decided_share < 0.5)
+          ? '<br><b style="color:var(--yellow);">Решений пока мало — сравнение читать нельзя: нерешённые сценарии не случайная подвыборка.</b>' : ''}
+      </div>`;
+  } catch (e) {
+    box.innerHTML = `<div style="color:var(--red);">Не загрузилось: ${e.message}</div>`;
+  }
 }
 function liveClosedRow(c) {
   const ok = c.correct;

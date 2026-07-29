@@ -154,15 +154,29 @@ class Prediction(Base):
     decision_note: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
     def to_dict(self) -> dict:
-        # МСК-время сигнала из снимка контекста — чтобы было видно в списке.
+        # МСК-время сигнала и размер позиции — из снимка контекста, чтобы были
+        # видны в списке. Размер считает Risk Engine на момент сигнала; без него
+        # карточка показывает сценарий, но не сделку.
         _sig_msk = None
+        _risk: dict = {}
         if self.context_json:
             try:
                 import json as _json
-                _sig_msk = _json.loads(self.context_json).get("signal_time_msk")
+                _ctx = _json.loads(self.context_json) or {}
+                _sig_msk = _ctx.get("signal_time_msk")
+                _risk = {
+                    "shares": _ctx.get("risk_shares"),
+                    "risk_rub": _ctx.get("risk_rub"),
+                    "risk_pct_of_account": _ctx.get("risk_pct_of_account"),
+                    "notional_rub": _ctx.get("risk_notional_rub"),
+                    "binding": _ctx.get("risk_binding"),
+                }
+                if _risk.get("shares") is None:
+                    _risk = {}
             except Exception:
-                _sig_msk = None
+                _sig_msk, _risk = None, {}
         return {
+            "position": _risk or None,
             "id": self.id,
             "ticker": self.ticker,
             "created_at": self.created_at.isoformat() if self.created_at else None,
