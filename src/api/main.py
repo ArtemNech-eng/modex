@@ -1632,6 +1632,40 @@ async def websocket_endpoint(websocket: WebSocket):
 
 # ─── Статика (дашборд) ────────────────────────────────────────────────────────
 
+# ─── AI-панели дашборда: КЕШ + учёт расхода ───────────────────────────────────
+# Эти три эндпоинта зовут Claude по клику в интерфейсе и берут деньги из ТОГО ЖЕ
+# дневного бюджета, что и сигналы. Без кеша каждое открытие вкладки стоило ~4₽ и
+# нигде не учитывалось: десять клików — и бюджет сигналов на день съеден незаметно.
+# Теперь: TTL-кеш (повторные клики бесплатны) + строка в журнале попыток со
+# stage="dashboard", чтобы расход был виден и объясним.
+_ai_panel_cache: dict = {}          # {key: (ts, payload)}
+AI_PANEL_TTL = 600                  # 10 мин — свежо для панели, дёшево для бюджета
+
+
+async def _ai_panel(key: str, ttl: int, producer, note: str):
+    """Отдать AI-панель из кеша или посчитать, записав расход в журнал попыток."""
+    import time
+    hit = _ai_panel_cache.get(key)
+    now = time.time()
+    if hit and now - hit[0] < ttl:
+        out = dict(hit[1])
+        out["cached"] = True
+        out["cached_age_sec"] = int(now - hit[0])
+        return out
+    agent = ClaudeAgent()
+    payload = await producer(agent)
+    _ai_panel_cache[key] = (now, payload)
+    call = getattr(agent, "last_call", {}) or {}
+    await db.add_signal_attempt({
+        "stage": "dashboard", "verdict": "panel", "reason": "manual",
+        "cost_rub": call.get("cost_rub"), "tokens_in": call.get("tokens_in"),
+        "tokens_out": call.get("tokens_out"), "note": f"{note} (кеш {ttl // 60} мин)",
+    })
+    out = dict(payload)
+    out["cached"] = False
+    return out
+
+
 @app.get("/api/ai/ticker/{ticker}", summary="AI анализ тикера")
 async def ai_analyze_ticker(ticker: str):
     """Claude анализирует все сигналы по тикеру и даёт инсайт"""
@@ -1647,16 +1681,19 @@ async def ai_analyze_ticker(ticker: str):
     points = list(aggregator._history.get(ticker, []))[-20:]
     top_messages = [p.text_snippet for p in points if p.text_snippet]
 
-    result = await claude.synthesize_ticker(
-        ticker=ticker,
-        company=MOEX_TICKERS.get(ticker, ticker),
-        sentiment_index=idx.sentiment_index,
-        message_count=idx.message_count,
-        positive_pct=idx.positive_pct,
-        negative_pct=idx.negative_pct,
-        top_messages=top_messages,
-    )
-    return result
+    async def _produce(agent):
+        return await agent.synthesize_ticker(
+            ticker=ticker,
+            company=MOEX_TICKERS.get(ticker, ticker),
+            sentiment_index=idx.sentiment_index,
+            message_count=idx.message_count,
+            positive_pct=idx.positive_pct,
+            negative_pct=idx.negative_pct,
+            top_messages=top_messages,
+        )
+
+    return await _ai_panel(f"ticker:{ticker}", AI_PANEL_TTL, _produce,
+                           f"AI-панель по {ticker}")
 
 
 @app.get("/api/ai/market", summary="AI сводка рынка")
@@ -1666,19 +1703,31 @@ async def ai_market_summary():
     indices = aggregator.get_all_indices()
     anomalies = [idx.to_dict() for idx in indices.values() if idx.is_anomaly]
 
-    summary = await claude.market_summary(
-        market_index=market.sentiment_index,
-        top_bullish=market.top_bullish,
-        top_bearish=market.top_bearish,
-        total_messages=market.total_messages,
-        anomalies=anomalies,
-    )
-    return {"summary": summary, "market_index": market.sentiment_index}
+    async def _produce(agent):
+        summary = await agent.market_summary(
+            market_index=market.sentiment_index,
+            top_bullish=market.top_bullish,
+            top_bearish=market.top_bearish,
+            total_messages=market.total_messages,
+            anomalies=anomalies,
+        )
+        return {"summary": summary, "market_index": market.sentiment_index}
+
+    return await _ai_panel("market", AI_PANEL_TTL, _produce, "AI-сводка рынка")
 
 
 @app.get("/api/ai/correlations", summary="AI анализ корреляций")
 async def ai_correlations():
     """Claude находит нелинейные паттерны в данных корреляции"""
+    # Кеш проверяем ДО тяжёлой выкачки Пульса и свечей: иначе каждый клик — это и
+    # десятки сетевых запросов, и вызов Claude из бюджета сигналов.
+    import time
+    _hit = _ai_panel_cache.get("correlations")
+    if _hit and time.time() - _hit[0] < AI_PANEL_TTL * 3:
+        _out = dict(_hit[1])
+        _out["cached"] = True
+        _out["cached_age_sec"] = int(time.time() - _hit[0])
+        return _out
     from datetime import date, timedelta
     from src.collector.moex_price_collector import MOEXPriceCollector
     from src.collector.pulse_collector import PulseCollector, PULSE_TICKERS
@@ -1719,14 +1768,16 @@ async def ai_correlations():
     corr_analyzer = CorrelationAnalyzer()
     results = corr_analyzer.analyze_all(sentiment_history, price_history, MOEX_TICKERS)
 
-    # Claude анализирует результаты
-    ai_insights = await claude.find_correlations([r.to_dict() for r in results])
+    # Claude анализирует результаты (расход пишется в журнал попыток, кеш 30 мин)
+    async def _produce(agent):
+        ai_insights = await agent.find_correlations([r.to_dict() for r in results])
+        return {
+            "correlations": [r.to_dict() for r in results],
+            "ai_insights": ai_insights,
+            "analyzed_tickers": len(results),
+        }
 
-    return {
-        "correlations": [r.to_dict() for r in results],
-        "ai_insights": ai_insights,
-        "analyzed_tickers": len(results),
-    }
+    return await _ai_panel("correlations", AI_PANEL_TTL * 3, _produce, "AI-корреляции")
 
 
 @app.get("/", include_in_schema=False)

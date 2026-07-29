@@ -223,23 +223,66 @@ class ClaudeAgent:
             "сильный МОМЕНТУМ по тренду (высокий ADX + расширение + цена за VWAP), или фейд "
             "границы с признаком разворота. Будь СЕЛЕКТИВЕН: watch=true только там, где сетап "
             "реально стоит глубокого разбора. Не входи против сильного фона без веских причин. "
-            "Отвечай ТОЛЬКО валидным JSON-массивом, по одному объекту на тикер.")
+            "Отвечай ТОЛЬКО валидным JSON-массивом.")
+        # ВАЖНО: просим ТОЛЬКО тикеры с сетапом (максимум 5), а не объект на каждый
+        # тикер. Иначе ответ на 30 бумаг — это ~1300+ токенов, он обрезался по
+        # max_tokens, JSON рвался, парсинг давал ноль watch — и цикл впустую жёг
+        # деньги «без сетапов». Короткий ответ обрезаться не может физически.
         user = (
             f"{market_context}\n\nТИКЕРЫ (кратко):\n{tickers_block}\n\n"
-            "Верни JSON-массив: "
-            '[{"ticker":"SBER","watch":true,"bias":"long|short|none",'
-            '"regime":"trend|trend_momentum|range|squeeze_breakout|news_spike|unclear",'
-            '"reason":"кратко почему"}]. watch=true — ТОЛЬКО реальные сетапы, остальным false.')
+            "Верни JSON-массив ТОЛЬКО тех тикеров, где есть торгуемый сетап — "
+            "МАКСИМУМ 5, самые сильные. Остальные НЕ включай вообще. "
+            "Если сетапов нет — верни пустой массив [].\n"
+            '[{"ticker":"SBER","watch":true,"bias":"long|short",'
+            '"regime":"trend|trend_momentum|range|squeeze_breakout|news_spike",'
+            '"reason":"кратко почему (до 12 слов)"}]')
         try:
             result = await self._ask(system, user, max_tokens=max_tokens)
-            s = result.find("[")
-            e = result.rfind("]") + 1
-            if s >= 0 and e > s:
-                arr = json.loads(result[s:e])
-                return [x for x in arr if isinstance(x, dict) and x.get("ticker")]
+            return self._parse_batch(result)
         except Exception as ex:
             logger.warning(f"batch_scan failed: {ex}")
         return []
+
+    @staticmethod
+    def _parse_batch(result: str) -> list:
+        """
+        Разбор ответа batch-скрина, устойчивый к обрезке.
+
+        Сначала пробуем массив целиком. Если он битый (обрезан по max_tokens —
+        именно так молча терялись ВСЕ сетапы), вытаскиваем целые объекты {...}
+        по одному: пусть лучше вернётся 3 из 5, чем ноль из 5.
+        """
+        import json
+        if not result:
+            return []
+        s, e = result.find("["), result.rfind("]") + 1
+        if s >= 0 and e > s:
+            try:
+                arr = json.loads(result[s:e])
+                if isinstance(arr, list):
+                    return [x for x in arr if isinstance(x, dict) and x.get("ticker")]
+            except Exception:
+                pass   # массив битый → спасаем по объектам ниже
+        out, depth, start = [], 0, None
+        for i, ch in enumerate(result):
+            if ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}" and depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    try:
+                        obj = json.loads(result[start:i + 1])
+                        if isinstance(obj, dict) and obj.get("ticker"):
+                            out.append(obj)
+                    except Exception:
+                        pass
+                    start = None
+        if out:
+            logger.warning(f"batch_scan: массив битый (вероятно обрезан) — "
+                           f"спасли {len(out)} объектов по одному")
+        return out
 
     async def _ask_with_image(self, system: str, user: str,
                               image_b64: str, max_tokens: int = 1024) -> str:

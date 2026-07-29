@@ -161,7 +161,10 @@ MOMENTUM_MIN_CONFLUENCE = int(os.getenv("MOMENTUM_MIN_CONFLUENCE", "3"))   # м�
 # Втрое дешевле поштучного триажа и покрывает ВСЕ бумаги (ничего не «теряется»).
 BATCH_SCAN_ENABLED = os.getenv("BATCH_SCAN_ENABLED", "true").lower() == "true"
 BATCH_SCAN_MAX_DEEP = int(os.getenv("BATCH_SCAN_MAX_DEEP", "1"))     # глубоких разборов после batch
-BATCH_SCAN_MAX_TOKENS = int(os.getenv("BATCH_SCAN_MAX_TOKENS", "700"))   # потолок ответа batch-скрина
+# 900: Claude возвращает ТОЛЬКО сетапы (максимум 5 объектов ≈ 250 токенов), а не
+# объект на каждый тикер. На 700 при «объекте на тикер» ответ обрезался, JSON
+# рвался и watch всегда выходил 0 — цикл жёг ~4.3₽ вообще без сигналов.
+BATCH_SCAN_MAX_TOKENS = int(os.getenv("BATCH_SCAN_MAX_TOKENS", "900"))   # потолок ответа batch-скрина
 BATCH_SCAN_MAX_TICKERS = int(os.getenv("BATCH_SCAN_MAX_TICKERS", "30"))  # сколько брифов слать в batch (топ по интересу)
 
 # ─── БЮДЖЕТ Claude (жёсткий дневной лимит) ────────────────────────────────────
