@@ -157,7 +157,8 @@ def _veto_code(reason) -> str:
         for code in ("risk_kill_switch", "risk_daily_loss", "risk_weekly_loss",
                      "risk_max_trades", "risk_max_positions", "risk_sector_limit",
                      "risk_exposure_full", "risk_zero_size", "risk_no_levels",
-                     "risk_stop_wrong_side"):
+                     "risk_stop_wrong_side", "risk_spread_too_wide",
+                     "risk_book_too_thin"):
             if code in r:
                 return code
         return "risk_other"
@@ -537,8 +538,16 @@ async def analyze(ticker: str, aggregator, save: bool = True,
             from src.risk import engine as _risk
             _rcfg = _risk.load_config()
             _rstate = await _risk.load_state(_rcfg)
+            # Ликвидность из снимка стакана: спред и глубина у середины. Нужны,
+            # потому что вселенную мы сознательно НЕ сужаем — тонкие бумаги дают
+            # самые крупные проценты. Но тонкий стакан ломает арифметику риска
+            # (выход происходит хуже стопа), поэтому размер режется под то, что
+            # книга реально переварит, а стоп уже спреда отклоняется совсем.
+            _spread, _depth = _risk.liquidity_from_orderbook(
+                (tinkoff_snap or {}).get("orderbook"))
             risk_decision = _risk.evaluate_trade(
-                float(c_entry), float(c_stop), direction, _rstate, _rcfg)
+                float(c_entry), float(c_stop), direction, _rstate, _rcfg,
+                spread_pct=_spread, depth_near_mid=_depth)
             if not risk_decision.approved:
                 direction, confidence, combined = "flat", 0.0, 0.0
                 claude_trade_plan = None
@@ -691,6 +700,13 @@ async def analyze(ticker: str, aggregator, save: bool = True,
                                       if risk_decision else None),
                 "risk_binding": (risk_decision.binding_constraint
                                  if risk_decision else None),
+                # Ликвидность на момент сигнала — нужна, чтобы потом
+                # разложить результаты по корзинам ликвидности и
+                # ответить данными, работает ли система на тонких бумагах.
+                "spread_pct_at_signal": (risk_decision.spread_pct
+                                         if risk_decision else None),
+                "depth_near_mid_at_signal": (risk_decision.depth_near_mid
+                                             if risk_decision else None),
                 "sentiment_index": sentiment_block["sentiment_index"] if sentiment_block else None,
                 "sentiment_label": sentiment_block.get("label") if sentiment_block else None,
                 "sentiment_signal": sentiment_signal,

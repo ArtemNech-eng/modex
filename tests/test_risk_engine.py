@@ -165,6 +165,76 @@ def test_kill_switch_priority_over_other_limits():
     assert check_limits(st, CFG).reason == "risk_kill_switch"
 
 
+
+# ─────────────────────── ликвидность (тонкий стакан) ─────────────────────────
+
+def test_liquidity_inactive_without_orderbook_data():
+    """Без данных стакана проверка не выполняется И об этом сообщается."""
+    d = size_position(100.0, 90.0, "up", CFG)
+    assert d.approved and d.liquidity_active is False
+    assert d.spread_pct is None and d.depth_near_mid is None
+
+
+def test_stop_narrower_than_spread_is_rejected():
+    """Стоп 0.4% при спреде 0.3% выбьет спредом — отказ при любом размере."""
+    d = size_position(315.20, 313.90, "up", CFG, spread_pct=0.30)
+    assert not d.approved and d.reason == "risk_spread_too_wide"
+    assert d.liquidity_active is True and d.stop_to_spread is not None
+    assert d.stop_to_spread < CFG.min_stop_to_spread
+
+
+def test_wide_enough_stop_passes_spread_check():
+    """Стоп 10% при спреде 0.1% — проходит с запасом."""
+    d = size_position(100.0, 90.0, "up", CFG, spread_pct=0.10)
+    assert d.approved and d.liquidity_active is True
+    assert d.stop_to_spread == 100.0
+
+
+def test_thin_book_reduces_size_not_rejects():
+    """Тонкий стакан УМЕНЬШАЕТ размер: бумага остаётся доступной."""
+    # по риску влезло бы 50 акций; глубина 200 лотов × 10% = 20
+    d = size_position(100.0, 90.0, "up", CFG, depth_near_mid=200)
+    assert d.approved
+    assert d.shares == 20 and d.binding_constraint == "depth"
+    assert d.risk_rub < CFG.risk_rub          # риск вышел ниже целевого
+
+
+def test_deep_book_does_not_bind():
+    """Глубокий стакан не ограничивает: связывает риск, как и без него."""
+    d = size_position(100.0, 90.0, "up", CFG, depth_near_mid=100_000)
+    assert d.approved and d.shares == 50 and d.binding_constraint == "risk"
+
+
+def test_too_thin_book_rejected_with_own_code():
+    """Если даже одного лота не набирается — отдельный код, не risk_zero_size."""
+    d = size_position(100.0, 90.0, "up", CFG, depth_near_mid=5)
+    assert not d.approved and d.reason == "risk_book_too_thin"
+    assert d.binding_constraint == "depth"
+
+
+def test_liquidity_never_increases_size():
+    """Ликвидность может только уменьшить размер, никогда не увеличить."""
+    base = size_position(100.0, 90.0, "up", CFG).shares
+    for depth in (10, 100, 1000, 10_000):
+        d = size_position(100.0, 90.0, "up", CFG, depth_near_mid=depth)
+        if d.approved:
+            assert d.shares <= base, (depth, d.shares, base)
+
+
+def test_evaluate_trade_passes_liquidity_through():
+    d = evaluate_trade(100.0, 90.0, "up", RiskState(), CFG, depth_near_mid=200)
+    assert d.approved and d.binding_constraint == "depth" and d.shares == 20
+
+
+def test_liquidity_from_orderbook_parsing():
+    from src.risk.engine import liquidity_from_orderbook as lfo
+    assert lfo({"spread_pct": 0.12, "depth_near_mid": 340}) == (0.12, 340)
+    assert lfo(None) == (None, None)
+    assert lfo({}) == (None, None)
+    # спред 0 — признак неполного снимка, а не идеальной ликвидности
+    assert lfo({"spread_pct": 0, "depth_near_mid": 10}) == (None, 10)
+    assert lfo({"spread_pct": "мусор", "depth_near_mid": "мусор"}) == (None, None)
+
 # ────────────────────────────── запуск ───────────────────────────────────────
 
 if __name__ == "__main__":

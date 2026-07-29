@@ -1352,11 +1352,11 @@ function liveSigRow(s) {
 function posLine(s) {
   const p = s.position;
   if (!p || p.shares == null) return '';
-  const bind = {risk:'риском', exposure:'экспозицией',
-                total_exposure:'общей экспозицией', lot:'лотом'}[p.binding] || p.binding || '—';
+  const bind = {risk:'риском', exposure:'экспозицией', total_exposure:'общей экспозицией',
+                lot:'лотом', depth:'глубиной стакана'}[p.binding] || p.binding || '—';
   return `<div style="font-size:11px;color:var(--text);margin-top:5px;padding-top:5px;border-top:1px solid var(--border);">
     📐 <b>${p.shares}</b> шт · риск <b>${p.risk_rub}₽</b>${p.risk_pct_of_account!=null?` (${Number(p.risk_pct_of_account).toFixed(2)}% счёта)`:''}${p.notional_rub!=null?` · объём ${Math.round(p.notional_rub).toLocaleString('ru-RU')}₽`:''}
-    <span style="color:var(--dim);">· ограничено ${bind}</span></div>`;
+    <span style="color:var(--dim);">· ограничено ${bind}${p.spread_pct!=null?` · спред ${p.spread_pct}%`:''}</span></div>`;
 }
 // Кнопки решения: Claude советует — решаете вы. Решение записывается, чтобы
 // потом было видно, добавляет ваше вето ценность или отнимает.

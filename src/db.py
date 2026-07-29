@@ -170,6 +170,8 @@ class Prediction(Base):
                     "risk_pct_of_account": _ctx.get("risk_pct_of_account"),
                     "notional_rub": _ctx.get("risk_notional_rub"),
                     "binding": _ctx.get("risk_binding"),
+                    "spread_pct": _ctx.get("spread_pct_at_signal"),
+                    "depth_near_mid": _ctx.get("depth_near_mid_at_signal"),
                 }
                 if _risk.get("shares") is None:
                     _risk = {}
@@ -1536,6 +1538,8 @@ ATTEMPT_REASONS = {
     "risk_zero_size":      "риск: размер вышел нулевым (стоп далеко / лот велик)",
     "risk_no_levels":      "риск: нет входа или стопа — размер не считается",
     "risk_stop_wrong_side": "риск: стоп по неверную сторону от входа",
+    "risk_spread_too_wide": "риск: стоп уже спреда — выбьет спредом, не движением",
+    "risk_book_too_thin":  "риск: стакан не переварит даже минимальный размер",
     "risk_other":          "риск: движок отклонил или недоступен",
 }
 

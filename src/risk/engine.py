@@ -47,6 +47,8 @@ REASONS = {
     "risk_sector_limit":    "лимит позиций в одном секторе",
     "risk_kill_switch":     "kill switch: просадка от пика",
     "risk_exposure_full":   "суммарная экспозиция исчерпана",
+    "risk_spread_too_wide": "стоп уже спреда — выбьет одним спредом, а не движением",
+    "risk_book_too_thin":   "стакан не переварит позицию даже минимального размера",
 }
 
 
@@ -71,6 +73,16 @@ class RiskConfig:
     max_open_positions: int = 2
     max_per_sector: int = 1
     kill_switch_dd_pct: float = 5.0       # просадка от пика капитала
+
+    # ── ЛИКВИДНОСТЬ ──────────────────────────────────────────────────────────
+    # Тонкие бумаги дают самые крупные проценты (15% за день на малом капе
+    # бывает, на Сбере нет), поэтому вселенную сужать не нужно. Но тонкий стакан
+    # ломает арифметику риска: движок считает риск как shares × (вход − стоп),
+    # предполагая выход ПО стопу. На тонком рынке выход происходит хуже, и
+    # заявленные 0.25% превращаются в 1%+. Поэтому не исключаем бумагу, а режем
+    # размер до того, что стакан реально переварит.
+    min_stop_to_spread: float = 3.0   # стоп должен быть не уже 3 спредов
+    max_depth_fraction: float = 10.0  # позиция ≤ 10% лотов у середины стакана
 
     @property
     def risk_rub(self) -> float:
@@ -161,6 +173,12 @@ class RiskDecision:
     r_per_share: float = 0.0
     lot_size: int = 1
     sector_limit_active: bool = False
+    # Ликвидность: активна только при наличии данных стакана. Если данных нет,
+    # флаг False — движок не делает вид, что проверил тонкий рынок.
+    liquidity_active: bool = False
+    spread_pct: Optional[float] = None
+    depth_near_mid: Optional[int] = None
+    stop_to_spread: Optional[float] = None
 
     def as_dict(self) -> dict:
         d = asdict(self)
@@ -173,11 +191,23 @@ class RiskDecision:
 def size_position(entry: Optional[float], stop: Optional[float],
                   direction: str, cfg: RiskConfig,
                   lot_size: int = 1,
-                  available_exposure_rub: Optional[float] = None) -> RiskDecision:
+                  available_exposure_rub: Optional[float] = None,
+                  spread_pct: Optional[float] = None,
+                  depth_near_mid: Optional[int] = None) -> RiskDecision:
     """Чистая функция: сколько акций брать. Без БД и без сети — легко тестируется.
 
-    Возвращает НАИМЕНЬШИЙ размер из допустимых по риску и по экспозиции.
-    Округление лотов — всегда ВНИЗ: превысить целевой риск нельзя.
+    Возвращает НАИМЕНЬШИЙ размер из допустимых по риску, экспозиции и глубине
+    стакана. Округление лотов — всегда ВНИЗ: превысить целевой риск нельзя.
+
+    ЛИКВИДНОСТЬ. `spread_pct` и `depth_near_mid` приходят из снимка стакана
+    (tinkoff_client: spread в %, глубина в ЛОТАХ в пределах ±0.5% от середины).
+    Если их нет, проверки не выполняются и `liquidity_active=False` — движок не
+    делает вид, что проверил тонкий рынок.
+
+    Единицы: глубина в лотах, размер в акциях, поэтому сравнение идёт через
+    lot_size. Пока справочника лотности MOEX нет и lot_size=1, одна акция
+    считается одним лотом. Когда лотность появится, обе стороны должны
+    использовать её — иначе глубина будет завышена в lot_size раз.
     """
     if not entry or not stop or entry <= 0 or stop <= 0:
         return RiskDecision(False, "risk_no_levels",
@@ -199,6 +229,25 @@ def size_position(entry: Optional[float], stop: Optional[float],
         return RiskDecision(False, "risk_stop_wrong_side",
                             "вход и стоп совпадают", lot_size=lot_size)
 
+    liquidity_active = spread_pct is not None or depth_near_mid is not None
+    stop_pct = r_per_share / entry * 100.0
+    stop_to_spread = (round(stop_pct / spread_pct, 2)
+                      if spread_pct else None)
+
+    # ── ЛИКВИДНОСТЬ, проверка 1: стоп против спреда ──────────────────────────
+    # Стоп в 0.4% при спреде 0.3% выбьет одним спредом, без всякого движения
+    # цены. Это не вопрос размера — такой стоп неисполним при любом объёме,
+    # поэтому отказ, а не уменьшение.
+    if spread_pct and stop_pct < cfg.min_stop_to_spread * spread_pct:
+        return RiskDecision(
+            False, "risk_spread_too_wide",
+            f"стоп {stop_pct:.2f}% против спреда {spread_pct:.2f}% "
+            f"(нужно ≥ {cfg.min_stop_to_spread}× спреда): выбьет спредом, "
+            "а не движением",
+            r_per_share=r_per_share, lot_size=lot_size,
+            liquidity_active=True, spread_pct=spread_pct,
+            depth_near_mid=depth_near_mid, stop_to_spread=stop_to_spread)
+
     # 1) по риску
     shares_by_risk = cfg.risk_rub / r_per_share
     # 2) по экспозиции на одну позицию
@@ -209,27 +258,51 @@ def size_position(entry: Optional[float], stop: Optional[float],
     if room <= 0:
         return RiskDecision(False, "risk_exposure_full",
                             "суммарная экспозиция уже исчерпана",
-                            r_per_share=r_per_share, lot_size=lot_size)
+                            r_per_share=r_per_share, lot_size=lot_size,
+                            liquidity_active=liquidity_active,
+                            spread_pct=spread_pct, depth_near_mid=depth_near_mid)
     shares_by_total = room / entry
 
-    raw = min(shares_by_risk, shares_by_position, shares_by_total)
-    binding = min(
-        (shares_by_risk, "risk"),
-        (shares_by_position, "exposure"),
-        (shares_by_total, "total_exposure"),
-        key=lambda t: t[0],
-    )[1]
+    candidates = [(shares_by_risk, "risk"),
+                  (shares_by_position, "exposure"),
+                  (shares_by_total, "total_exposure")]
+
+    # ── ЛИКВИДНОСТЬ, проверка 2: глубина стакана ─────────────────────────────
+    # Позиция не должна быть значимой частью книги: иначе вы сами и есть стакан,
+    # и войдёте с проскальзыванием, а выйдете ещё хуже. Здесь именно УМЕНЬШАЕМ
+    # размер, а не отказываем — так тонкая бумага остаётся доступной, просто
+    # меньшим объёмом.
+    if depth_near_mid is not None:
+        shares_by_depth = depth_near_mid * (cfg.max_depth_fraction / 100.0) * max(1, lot_size)
+        candidates.append((shares_by_depth, "depth"))
+
+    raw = min(c[0] for c in candidates)
+    binding = min(candidates, key=lambda t: t[0])[1]
 
     lot = max(1, int(lot_size))
     lots = int(raw // lot)          # только вниз
     shares = lots * lot
     if shares <= 0:
+        # Различаем «стакан слишком тонкий» и «стоп слишком далеко»: это разные
+        # проблемы, и в журнале они должны выглядеть по-разному, иначе непонятно,
+        # что калибровать — порог глубины или уровни сделки.
+        if binding == "depth":
+            return RiskDecision(
+                False, "risk_book_too_thin",
+                f"у середины стакана {depth_near_mid} лотов, допустимая доля "
+                f"{cfg.max_depth_fraction:.0f}% не даёт даже одного лота",
+                r_per_share=r_per_share, lot_size=lot,
+                binding_constraint="depth", liquidity_active=True,
+                spread_pct=spread_pct, depth_near_mid=depth_near_mid,
+                stop_to_spread=stop_to_spread)
         return RiskDecision(
             False, "risk_zero_size",
             f"на {cfg.risk_rub:.0f}₽ риска при {r_per_share:.2f}₽/акцию "
             f"и лоте {lot} не набирается ни одного лота",
             r_per_share=r_per_share, lot_size=lot,
-            binding_constraint="lot" if raw >= 1 else binding)
+            binding_constraint="lot" if raw >= 1 else binding,
+            liquidity_active=liquidity_active, spread_pct=spread_pct,
+            depth_near_mid=depth_near_mid, stop_to_spread=stop_to_spread)
 
     notional = shares * entry
     risk_rub = shares * r_per_share
@@ -239,7 +312,9 @@ def size_position(entry: Optional[float], stop: Optional[float],
         f"ограничивает: {binding}",
         shares=shares, notional_rub=notional, risk_rub=risk_rub,
         risk_pct_of_account=risk_rub / cfg.account_rub * 100.0,
-        binding_constraint=binding, r_per_share=r_per_share, lot_size=lot)
+        binding_constraint=binding, r_per_share=r_per_share, lot_size=lot,
+        liquidity_active=liquidity_active, spread_pct=spread_pct,
+        depth_near_mid=depth_near_mid, stop_to_spread=stop_to_spread)
 
 
 # ──────────────────────────── жёсткие лимиты ─────────────────────────────────
@@ -291,17 +366,45 @@ def evaluate_trade(entry: Optional[float], stop: Optional[float],
                    cfg: Optional[RiskConfig] = None,
                    lot_size: int = 1,
                    sector: Optional[str] = None,
-                   sector_map_available: bool = False) -> RiskDecision:
-    """Единая точка входа: сначала запреты, потом размер."""
+                   sector_map_available: bool = False,
+                   spread_pct: Optional[float] = None,
+                   depth_near_mid: Optional[int] = None) -> RiskDecision:
+    """Единая точка входа: сначала запреты, потом размер с учётом стакана."""
     cfg = cfg or load_config()
     gate = check_limits(state, cfg, sector, sector_map_available)
     if not gate.approved:
         return gate
 
     room = max(0.0, cfg.max_total_exposure_rub - max(0.0, state.open_exposure_rub))
-    out = size_position(entry, stop, direction, cfg, lot_size, room)
+    out = size_position(entry, stop, direction, cfg, lot_size, room,
+                        spread_pct=spread_pct, depth_near_mid=depth_near_mid)
     out.sector_limit_active = bool(sector_map_available)
     return out
+
+
+def liquidity_from_orderbook(ob: Optional[dict]) -> tuple:
+    """Достать (spread_pct, depth_near_mid) из снимка стакана tinkoff_client.
+
+    Отдельная функция, потому что источник может отсутствовать или устареть, и
+    решение «проверять ликвидность или честно сказать, что не проверяли» должно
+    приниматься в одном месте.
+    """
+    if not isinstance(ob, dict):
+        return None, None
+    sp = ob.get("spread_pct")
+    dp = ob.get("depth_near_mid")
+    try:
+        sp = float(sp) if sp is not None else None
+    except (TypeError, ValueError):
+        sp = None
+    try:
+        dp = int(dp) if dp is not None else None
+    except (TypeError, ValueError):
+        dp = None
+    # Спред 0 бывает при неполном снимке — не считаем это идеальной ликвидностью.
+    if sp is not None and sp <= 0:
+        sp = None
+    return sp, dp
 
 
 # ──────────────────────── состояние из БД (МСК-сутки) ────────────────────────
