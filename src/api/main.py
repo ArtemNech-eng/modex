@@ -1116,8 +1116,15 @@ async def get_claude_backtest_status():
     return _bt_claude_status
 
 
+@app.get("/api/accuracy", summary="Честная точность: калибровка и ожидание в R")
 async def get_accuracy(ticker: Optional[str] = None):
-    """Статистика точности прогнозов агента (основа для оценки качества)."""
+    """Статистика точности прогнозов агента (основа для оценки качества).
+
+    ВНИМАНИЕ: у этой функции не было декоратора маршрута, поэтому самый полный
+    расчёт качества — калибровка уверенности по корзинам и ожидание в R —
+    считался, но наружу не отдавался. Снаружи были видны только две цифры из
+    него в /api/live-signals. Теперь эндпоинт открыт.
+    """
     return await db.accuracy_stats(ticker=ticker)
 
 
@@ -1490,6 +1497,16 @@ async def get_live_signals(limit: int = 200):
         "legacy_flat_open": legacy_flat,   # старые не-сигналы (flat), в счёт не идут
         "evaluated_count": stats.get("evaluated", 0) if isinstance(stats, dict) else 0,
         "accuracy": stats.get("accuracy") if isinstance(stats, dict) else None,
+        # Точность считается только по направленным прогнозам, поэтому рядом с
+        # ней обязаны стоять объём выборки и число отказов от мнения: без них
+        # цифра снова начнёт вводить в заблуждение.
+        "directional_count": stats.get("directional") if isinstance(stats, dict) else None,
+        "abstained_count": stats.get("abstained") if isinstance(stats, dict) else None,
+        "accuracy_legacy": stats.get("accuracy_legacy") if isinstance(stats, dict) else None,
+        "calibration": stats.get("calibration") if isinstance(stats, dict) else None,
+        "expectancy_r": stats.get("expectancy_r") if isinstance(stats, dict) else None,
+        "profit_factor": stats.get("profit_factor") if isinstance(stats, dict) else None,
+        "r_sample": stats.get("r_sample") if isinstance(stats, dict) else None,
         "recent_closed": closed_sig[:20],
     }
 
