@@ -1150,6 +1150,32 @@ async def post_signal_decision(pred_id: int, decision: str, note: Optional[str] 
     return {"status": "ok", "prediction": updated}
 
 
+@app.post("/api/analyst-signal", summary="Сценарий от внешнего аналитика в общий журнал")
+async def post_analyst_signal(payload: dict = Body(...)):
+    """Принять торговый сценарий от внешнего аналитика.
+
+    Нужен, потому что прогноз в системе создавался только внутренним путём
+    Claude. Пока бюджет API не пополнен, роль аналитика выполняет внешняя
+    модель, и её сценарии обязаны попадать в ТОТ ЖЕ журнал: с планом, размером
+    от Risk Engine, оценкой по исходу и сравнением с решением человека. Иначе
+    это мнение в переписке, а не сделка.
+
+    Внешний сценарий проходит ТЕ ЖЕ проверки, что внутренний: полнота плана,
+    лимиты риска, стоп против спреда, глубина стакана. Обходного пути нет —
+    иначе сравнить внешнего аналитика с API на равных будет невозможно.
+
+    Обязательные поля: ticker, direction (up|down), entry, stop, target,
+    confidence (>0), reason, invalidation. Поле analyst — ось сравнения
+    (hyperagent | claude-api | human).
+    """
+    from src.agent import external_signal
+    result = await external_signal.submit(payload or {})
+    if result.get("status") == "rejected":
+        code = 409 if result.get("stage") == "already_open" else 422
+        raise HTTPException(status_code=code, detail=result)
+    return result
+
+
 @app.get("/api/paper-account", summary="Виртуальный счёт: paper trading по принятым сделкам")
 async def get_paper_account():
     """Состояние виртуального счёта и активных лимитов риска.
