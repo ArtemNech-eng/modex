@@ -1128,6 +1128,40 @@ async def get_accuracy(ticker: Optional[str] = None):
     return await db.accuracy_stats(ticker=ticker)
 
 
+@app.post("/api/signals/{pred_id}/decision",
+          summary="Решение человека по сценарию: accept / reject / wait")
+async def post_signal_decision(pred_id: int, decision: str, note: Optional[str] = None):
+    """Записать ваше решение по сценарию Claude (advisory-режим).
+
+    Claude предлагает — решаете вы. Решение сохраняется, чтобы потом можно было
+    сравнить: где прав Claude, где правы вы, и добавляет ли ваше вето ценность.
+    Исход при этом считается для ВСЕХ сценариев одинаково, независимо от
+    решения, — иначе сравнение было бы смещённым.
+
+    Менять решение можно, пока сценарий не оценён. После оценки — нельзя:
+    «переголосование» задним числом обесценило бы всю статистику.
+    """
+    try:
+        updated = await db.set_human_decision(pred_id, decision, note)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"прогноз {pred_id} не найден")
+    return {"status": "ok", "prediction": updated}
+
+
+@app.get("/api/decisions", summary="Claude против человека: чей вклад в результат")
+async def get_decisions(ticker: Optional[str] = None):
+    """Сравнение решений Claude и человека в R.
+
+    Главное число — `human_edge_r`: ожидание по ПРИНЯТЫМ сделкам минус ожидание
+    по ВСЕМ предложениям. Больше нуля — ваше вето добавляет ценность, меньше
+    нуля — отнимает. Пока доля решённых сценариев (`decided_share`) низкая,
+    читать сравнение нельзя: нерешённые — не случайная подвыборка.
+    """
+    return await db.decision_stats(ticker=ticker)
+
+
 def _bucket(items: list[dict]) -> dict:
     """Срез точности по подвыборке прогнозов.
 

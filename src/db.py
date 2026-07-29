@@ -142,6 +142,17 @@ class Prediction(Base):
     pm_tags: Mapped[Optional[str]] = mapped_column(String, nullable=True)        # теги причин через запятую
     pm_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # ── Решение ЧЕЛОВЕКА по сценарию (advisory-режим) ────────────────────────
+    # Claude предлагает, решает человек. Записываем решение, чтобы можно было
+    # сравнить: где прав Claude, где прав человек, и добавляет ли вето человека
+    # ценность или отнимает её. Ключевое требование к корректности сравнения:
+    # исход считается для ВСЕХ сценариев одинаково, независимо от решения —
+    # иначе отклонённые сделки оценивались бы мягче принятых, и сравнение
+    # «человек против модели» было бы смещённым по построению.
+    human_decision: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)  # accept|reject|wait
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    decision_note: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
     def to_dict(self) -> dict:
         # МСК-время сигнала из снимка контекста — чтобы было видно в списке.
         _sig_msk = None
@@ -185,6 +196,9 @@ class Prediction(Base):
             "post_mortem": self.post_mortem,
             "lesson": self.lesson,
             "pm_tags": [t for t in (self.pm_tags or "").split(",") if t],
+            "human_decision": self.human_decision,
+            "decided_at": self.decided_at.isoformat() if self.decided_at else None,
+            "decision_note": self.decision_note,
         }
 
 
@@ -401,6 +415,10 @@ _PREDICTION_ADDED_COLUMNS = {
     # №3 — управление сделкой:
     "mfe_r": "DOUBLE PRECISION",
     "legs_json": "TEXT",
+    # Advisory-режим: решение человека по сценарию Claude.
+    "human_decision": "TEXT",
+    "decided_at": "TIMESTAMP",
+    "decision_note": "TEXT",
 }
 
 
@@ -947,6 +965,118 @@ async def accuracy_stats(ticker: Optional[str] = None) -> dict:
         "profit_factor": round(sum(wins) / loss_sum, 3) if wins and loss_sum else None,
         "r_sample": len(rs),
         "pending": total - len(evaluated),
+    }
+
+
+HUMAN_DECISIONS = ("accept", "reject", "wait")
+
+
+def decision_bucket_stats(rows: list) -> dict:
+    """Статистика по подвыборке сценариев. Вынесено на уровень модуля, чтобы
+    покрывалось тестами: считалка, которую нельзя проверить, — источник тихих
+    ошибок в отчётах.
+
+    `hit_rate` считается по всем строкам подвыборки, `expectancy_r` — только по
+    тем, где посчитан фактический R, поэтому `r_sample` выводится отдельно:
+    ожидание по трём сделкам и по тридцати читаются по-разному.
+    """
+    if not rows:
+        return {"n": 0, "hit_rate": None, "expectancy_r": None,
+                "r_sample": 0, "avg_return_pct": None}
+    hits = sum(1 for p in rows if p.correct)
+    rs = [p.realized_r for p in rows if p.realized_r is not None]
+    rets = [p.realized_return for p in rows if p.realized_return is not None]
+    return {
+        "n": len(rows),
+        "hit_rate": round(hits / len(rows), 3),
+        "expectancy_r": round(sum(rs) / len(rs), 3) if rs else None,
+        "r_sample": len(rs),
+        "avg_return_pct": round(sum(rets) / len(rets), 3) if rets else None,
+    }
+
+
+async def set_human_decision(pred_id: int, decision: str,
+                             note: Optional[str] = None) -> Optional[dict]:
+    """Записать решение человека по сценарию Claude.
+
+    Возвращает обновлённую запись или None, если прогноз не найден.
+    Решение можно менять до момента оценки: пока исход не посчитан, человек
+    вправе передумать. После оценки менять нельзя — иначе появится соблазн
+    «переголосовать» задним числом, и вся статистика сравнения обесценится.
+    """
+    d = (decision or "").strip().lower()
+    if d not in HUMAN_DECISIONS:
+        raise ValueError(f"decision должен быть одним из {HUMAN_DECISIONS}, получено {decision!r}")
+
+    async with async_session() as session:
+        pred = await session.get(Prediction, pred_id)
+        if pred is None:
+            return None
+        if pred.correct is not None:
+            raise ValueError(
+                f"прогноз {pred_id} уже оценён — решение задним числом не принимается")
+        pred.human_decision = d
+        pred.decision_note = (note or None)
+        pred.decided_at = datetime.now(timezone.utc)
+        await session.commit()
+        return pred.to_dict()
+
+
+async def decision_stats(ticker: Optional[str] = None) -> dict:
+    """Сравнение: где прав Claude, где прав человек, что даёт вето человека.
+
+    КОРРЕКТНОСТЬ СРАВНЕНИЯ. Исход считается для ВСЕХ сценариев одинаково —
+    оценщик работает по пути цены и горизонту, а не по факту исполнения.
+    Поэтому отклонённые сделки оцениваются той же меркой, что принятые, и
+    сравнение «человек против модели» не смещено по построению. Если бы
+    отклонённые оценивались на глазок («цена ушла +3%»), а принятые по стопам и
+    целям, любой вывод был бы артефактом методики.
+
+    ГЛАВНОЕ ЧИСЛО — `human_edge_r`: разница между ожиданием по ПРИНЯТЫМ сделкам
+    и ожиданием по ВСЕМ предложениям. Больше нуля — вето человека добавляет
+    ценность, меньше нуля — отнимает. Это и есть ответ на вопрос «где человек
+    лучше модели», выраженный в деньгах, а не в ощущениях.
+
+    ОГОВОРКА О ВЫБОРКЕ. Нерешённые сценарии (`undecided`) — не случайная
+    подвыборка: человек мог просто не успеть к экрану. Пока их доля велика,
+    сравнение читать нельзя, поэтому число выводится явно.
+    """
+    async with async_session() as session:
+        stmt = select(Prediction)
+        if ticker:
+            stmt = stmt.where(Prediction.ticker == ticker.upper())
+        result = await session.execute(stmt)
+        preds = result.scalars().all()
+
+    directional = [p for p in preds if _is_directional(p)]
+    scored = [p for p in directional if p.correct is not None]
+
+    by = {d: decision_bucket_stats([p for p in scored if (p.human_decision or "") == d])
+          for d in HUMAN_DECISIONS}
+    all_stats = decision_bucket_stats(scored)
+    undecided = decision_bucket_stats([p for p in scored if not p.human_decision])
+
+    # Вклад человека: ожидание по принятым минус ожидание по всем предложениям.
+    human_edge = None
+    if by["accept"]["expectancy_r"] is not None and all_stats["expectancy_r"] is not None:
+        human_edge = round(by["accept"]["expectancy_r"] - all_stats["expectancy_r"], 3)
+
+    return {
+        "all_proposals": all_stats,          # сырой эйдж Claude
+        "accepted": by["accept"],            # что вы фактически получили
+        "rejected": by["reject"],            # на что вы не пошли
+        "waited": by["wait"],
+        "undecided": undecided,              # решения не было — читать с осторожностью
+        "human_edge_r": human_edge,
+        "human_edge_note": (
+            "разница ожидания по принятым и по всем предложениям; "
+            "> 0 — вето человека добавляет ценность, < 0 — отнимает"),
+        "decided_share": (round(1 - undecided["n"] / all_stats["n"], 3)
+                          if all_stats["n"] else None),
+        "pending_evaluation": len(directional) - len(scored),
+        "comparability": (
+            "исход считается одинаково для принятых и отклонённых — "
+            "оценщик не знает о решении человека"),
     }
 
 
