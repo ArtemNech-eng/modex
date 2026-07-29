@@ -232,11 +232,17 @@ async def scan_batch(aggregator, tickers=None, save: bool = True, max_deep: int 
         "cost_rub": _call.get("cost_rub"),
         "tokens_in": _call.get("tokens_in"),
         "tokens_out": _call.get("tokens_out"),
+        # Когда watch пуст — пишем ПОЧЕМУ и что модель реально ответила (raw_head),
+        # чтобы отличить «сетапов нет» от «модель написала прозу вместо JSON».
         "note": (("watch: " + ", ".join(f"{v.get('ticker')}/{v.get('regime') or '?'}"
                                         for v in watch[:20])) if watch
-                 else (f"обрезка ответа по max_tokens={_call.get('max_tokens')}"
-                       if _call.get("truncated")
-                       else (_call.get("error") or "watch пуст — сетапов нет"))),
+                 else " · ".join(x for x in (
+                     ("ОБРЕЗАН по max_tokens=%s" % _call.get("max_tokens"))
+                     if _call.get("truncated") else None,
+                     _call.get("error"),
+                     ("raw[%s]: %s" % (_call.get("raw_len"), _call.get("raw_head")))
+                     if _call.get("raw_head") is not None else None,
+                 ) if x) or "watch пуст — сетапов нет"),
     })
 
     try:
@@ -255,6 +261,29 @@ async def scan_batch(aggregator, tickers=None, save: bool = True, max_deep: int 
             shortlist.append(t)
         if len(shortlist) >= max_deep:
             break
+
+    # СТРАХОВКА: batch — только слой внимания, а не единственный путь к сигналу.
+    # Если он ничего не дал из-за СВОЕЙ поломки (обрезка/проза вместо JSON), цикл
+    # не должен оставаться пустым: берём шортлист из локального триажа, который
+    # считается бесплатно. Если же Claude честно ответил «сетапов нет» — уважаем
+    # его решение и НЕ навязываем глубокий разбор.
+    fallback_used = None
+    if not shortlist and (_call.get("truncated") or _call.get("raw_head") is not None
+                          or _call.get("error")):
+        try:
+            from config.settings import SCAN_MIN_INTEREST
+        except Exception:
+            SCAN_MIN_INTEREST = 0.6
+        for s in screened:
+            t = s["ticker"].upper()
+            if s.get("interest", 0) >= SCAN_MIN_INTEREST and t not in open_tickers:
+                shortlist.append(t)
+            if len(shortlist) >= max_deep:
+                break
+        if shortlist:
+            fallback_used = (f"batch не дал JSON → шортлист из локального триажа "
+                             f"(interest ≥ {SCAN_MIN_INTEREST}): {', '.join(shortlist)}")
+            logger.warning(f"🧯 {fallback_used}")
 
     confirmed = 0
     deep_skipped = None
@@ -285,6 +314,8 @@ async def scan_batch(aggregator, tickers=None, save: bool = True, max_deep: int 
         "claude_confirmed": confirmed,
         "budget": bud,
         "skipped": deep_skipped,
+        "fallback": fallback_used,     # сработала ли страховка вместо batch
+        "batch_raw_head": _call.get("raw_head"),   # что модель ответила, если JSON не вышел
         "interesting": [{"ticker": v.get("ticker"), "bias": v.get("bias"),
                          "regime": v.get("regime"), "reason": v.get("reason")}
                         for v in watch][:25],

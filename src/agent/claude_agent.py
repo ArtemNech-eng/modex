@@ -202,20 +202,32 @@ class ClaudeAgent:
         по шортлисту делает synthesize_ticker отдельно.
         """
         import json
+
+        def _s(v, dash="-"):
+            return dash if v in (None, "") else v
+
         lines = []
         for b in (briefs or []):
             if not isinstance(b, dict) or not b.get("ticker"):
                 continue
+            # СЖАТАЯ строка (~110 симв вместо ~250): input был ~5.1К токенов = 2.6₽
+            # за цикл. Сокращения расшифрованы в легенде ниже — модели этого хватает,
+            # а бюджет на день удваивается по числу циклов.
             lines.append(
-                f"{b.get('ticker')}: price {b.get('price')}, {b.get('vwap_rel') or 'VWAP н/д'}, "
-                f"режим {b.get('regime')}/ADX {b.get('adx')}, RSI {b.get('rsi')}, "
-                f"ATR {b.get('atr')}, вола {b.get('vol')}, ROC {b.get('price_roc')}%/об×{b.get('vol_ratio')}, "
-                f"фаза {b.get('phase')}, сетап {b.get('setup')}, ORB {b.get('orb_lo')}–{b.get('orb_hi')}, "
-                f"R/R {b.get('rr')}, вход {b.get('entry_status')}, "
-                f"стакан {b.get('ob_pressure')}/bid-ask {b.get('bid_ask')}/ликв {b.get('liquidity')}, "
-                f"поток {b.get('flow')} Δ{b.get('delta')} buy {b.get('buy_pct')}%, настр {b.get('si')}")
+                f"{b.get('ticker')} p{_s(b.get('price'))} {_s(b.get('vwap_rel'))} "
+                f"{_s(b.get('regime'))} adx{_s(b.get('adx'))} rsi{_s(b.get('rsi'))} "
+                f"atr{_s(b.get('atr'))} {_s(b.get('vol'))} roc{_s(b.get('price_roc'))} "
+                f"v{_s(b.get('vol_ratio'))} orb{_s(b.get('orb_lo'))}-{_s(b.get('orb_hi'))} "
+                f"rr{_s(b.get('rr'))} {_s(b.get('entry_status'))} ob:{_s(b.get('ob_pressure'))}"
+                f"/{_s(b.get('bid_ask'))}/{_s(b.get('liquidity'))} "
+                f"fl:{_s(b.get('flow'))}/{_s(b.get('delta'))}/{_s(b.get('buy_pct'))}% "
+                f"si{_s(b.get('si'))} set:{_s(b.get('setup'))}")
         if not lines:
             return []
+        legend = ("Формат строки: ТИКЕР p<цена> <позиция к VWAP> <режим> adx rsi atr "
+                  "<волатильность> roc<скорость цены,%> v<объём×среднего> orb<низ-верх> "
+                  "rr<R:R> <статус входа> ob:<давление стакана>/<bid-ask>/<ликвидность> "
+                  "fl:<поток>/<дельта,лот>/<%покупок> si<настроение> set:<сетап>")
         tickers_block = "\n".join(lines)
         system = (
             "Ты интрадей-скринер MOEX. По КРАТКИМ данным по каждому тикеру реши, есть ли "
@@ -223,22 +235,48 @@ class ClaudeAgent:
             "сильный МОМЕНТУМ по тренду (высокий ADX + расширение + цена за VWAP), или фейд "
             "границы с признаком разворота. Будь СЕЛЕКТИВЕН: watch=true только там, где сетап "
             "реально стоит глубокого разбора. Не входи против сильного фона без веских причин. "
-            "Отвечай ТОЛЬКО валидным JSON-массивом.")
+            "Твой ответ — ЭТО JSON-массив и ничего больше. Никаких рассуждений, "
+            "пояснений, markdown и заголовков. ПЕРВЫЙ символ ответа — '[', "
+            "ПОСЛЕДНИЙ — ']'.")
         # ВАЖНО: просим ТОЛЬКО тикеры с сетапом (максимум 5), а не объект на каждый
         # тикер. Иначе ответ на 30 бумаг — это ~1300+ токенов, он обрезался по
         # max_tokens, JSON рвался, парсинг давал ноль watch — и цикл впустую жёг
         # деньги «без сетапов». Короткий ответ обрезаться не может физически.
         user = (
-            f"{market_context}\n\nТИКЕРЫ (кратко):\n{tickers_block}\n\n"
+            f"{market_context}\n\n{legend}\n\nТИКЕРЫ:\n{tickers_block}\n\n"
             "Верни JSON-массив ТОЛЬКО тех тикеров, где есть торгуемый сетап — "
             "МАКСИМУМ 5, самые сильные. Остальные НЕ включай вообще. "
             "Если сетапов нет — верни пустой массив [].\n"
             '[{"ticker":"SBER","watch":true,"bias":"long|short",'
             '"regime":"trend|trend_momentum|range|squeeze_breakout|news_spike",'
-            '"reason":"кратко почему (до 12 слов)"}]')
+            '"reason":"кратко, до 12 слов"}]\n'
+            "Сразу начинай с '[' — без единого слова до него.")
         try:
             result = await self._ask(system, user, max_tokens=max_tokens)
-            return self._parse_batch(result)
+            out = self._parse_batch(result)
+            # Различаем ДВА принципиально разных «нуля»:
+            #   • валидный пустой массив [] — Claude честно сказал «сетапов нет»
+            #     → это РЕШЕНИЕ, его уважаем, страховку не включаем;
+            #   • ответ не разобрался (обрезка/проза/ошибка) — это ПОЛОМКА
+            #     → кладём начало сырого ответа в телеметрию и включаем страховку.
+            # Без этого различия «watch:0» неотличим от сломанного вызова, и каждая
+            # проверка гипотезы стоит отдельного платного вызова.
+            valid_empty = False
+            if not out:
+                s, e = (result or "").find("["), (result or "").rfind("]") + 1
+                if s >= 0 and e > s:
+                    try:
+                        valid_empty = isinstance(json.loads(result[s:e]), list)
+                    except Exception:
+                        valid_empty = False
+                if not valid_empty:
+                    self.last_call["raw_head"] = (result or "")[:300]
+                    self.last_call["raw_len"] = len(result or "")
+                    logger.warning(f"batch_scan: ответ не разобрался ({len(result or '')} симв): "
+                                   f"{(result or '')[:200]}")
+                else:
+                    logger.info("batch_scan: Claude вернул пустой массив — сетапов нет")
+            return out
         except Exception as ex:
             logger.warning(f"batch_scan failed: {ex}")
         return []
