@@ -30,6 +30,66 @@ _BASE_URL  = os.getenv(
 _MODEL = os.getenv("AI_MODEL", "claude-sonnet-5")
 
 
+# ─── БЮДЖЕТ: жёсткий дневной лимит расхода на Claude ──────────────────────────
+# Считаем стоимость каждого вызова (по usage от провайдера, иначе оценкой) и
+# копим в настройке БД по МСК-дате. Перед вызовом проверяем остаток — так дневной
+# лимит (напр. 100₽) физически не может быть превышен, и деньги живут весь день.
+_BUDGET_KEY = "ai_spend_day"
+
+
+def _prices():
+    try:
+        from config.settings import (AI_DAILY_BUDGET_RUB, AI_PRICE_IN_RUB_1K,
+                                     AI_PRICE_OUT_RUB_1K, AI_DEEP_MIN_RESERVE_RUB)
+        return AI_DAILY_BUDGET_RUB, AI_PRICE_IN_RUB_1K, AI_PRICE_OUT_RUB_1K, AI_DEEP_MIN_RESERVE_RUB
+    except Exception:
+        return 100.0, 0.5, 2.5, 12.0
+
+
+def _msk_day() -> str:
+    from datetime import timedelta
+    return (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d")
+
+
+async def budget_state() -> dict:
+    """Текущий расход за МСК-день: {date, rub, calls, budget, left}."""
+    import json as _j
+    from src import db
+    limit, *_ = _prices()
+    try:
+        raw = await db.get_setting(_BUDGET_KEY)
+        st = _j.loads(raw) if raw else {}
+    except Exception:
+        st = {}
+    if st.get("date") != _msk_day():
+        st = {"date": _msk_day(), "rub": 0.0, "calls": 0}
+    st["budget"] = limit
+    st["left"] = round(max(0.0, limit - float(st.get("rub") or 0)), 2)
+    return st
+
+
+async def _budget_add(rub: float) -> None:
+    import json as _j
+    from src import db
+    st = await budget_state()
+    st = {"date": st["date"], "rub": round(float(st.get("rub") or 0) + rub, 4),
+          "calls": int(st.get("calls") or 0) + 1}
+    try:
+        await db.set_setting(_BUDGET_KEY, _j.dumps(st))
+    except Exception:
+        pass
+
+
+async def budget_left() -> float:
+    return (await budget_state())["left"]
+
+
+async def can_afford_deep() -> bool:
+    """Хватает ли остатка на ГЛУБОКИЙ разбор (иначе — только дешёвый batch)."""
+    _, _, _, reserve = _prices()
+    return (await budget_left()) >= reserve
+
+
 class ClaudeAgent:
 
     def __init__(self, api_key: str = None):
@@ -74,16 +134,84 @@ class ClaudeAgent:
                 ],
             }
 
+        # ── БЮДЖЕТ-ГАРД: не выходим за дневной лимит ──────────────────────────
+        _limit, p_in, p_out, _res = _prices()
+        est_in = int((len(system) + len(user)) / 2.5)          # ~2.5 симв/токен (рус.)
+        est_cost = (est_in * p_in + max_tokens * p_out) / 1000  # худший случай
+        left = await budget_left()
+        if left < est_cost:
+            raise RuntimeError(
+                f"AI budget guard: остаток {left:.2f}₽ < оценки вызова {est_cost:.2f}₽ "
+                f"(дневной лимит {_limit:.0f}₽) — вызов пропущен")
+
         async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(url, headers=headers, json=payload)
             if resp.status_code != 200:
                 raise RuntimeError(f"AI API error {resp.status_code}: {resp.text[:300]}")
             data = resp.json()
 
+        # Фактический расход: из usage провайдера, иначе — по оценке.
+        try:
+            u = data.get("usage") or {}
+            in_tok = int(u.get("prompt_tokens") or u.get("input_tokens") or est_in)
+            out_tok = int(u.get("completion_tokens") or u.get("output_tokens") or 0)
+            await _budget_add((in_tok * p_in + out_tok * p_out) / 1000)
+        except Exception:
+            await _budget_add(est_cost)
+
         if self.provider == "anthropic":
             return data["content"][0]["text"]
         else:
             return data["choices"][0]["message"]["content"]
+
+    async def batch_scan(self, market_context: str, briefs: list,
+                         max_tokens: int = 1600) -> list:
+        """
+        ОДИН запрос по МНОГИМ тикерам («общая картина»): по кратким данным Claude
+        решает, у каких есть торгуемый интрадей-сетап. Дёшево (input мал, output
+        терсовый). Возвращает список {ticker, watch(bool), bias, regime, reason}.
+        Это УМНЫЙ СКРИН (шортлист), а не финальное entry-решение — глубокий разбор
+        по шортлисту делает synthesize_ticker отдельно.
+        """
+        import json
+        lines = []
+        for b in (briefs or []):
+            if not isinstance(b, dict) or not b.get("ticker"):
+                continue
+            lines.append(
+                f"{b.get('ticker')}: price {b.get('price')}, {b.get('vwap_rel') or 'VWAP н/д'}, "
+                f"режим {b.get('regime')}/ADX {b.get('adx')}, RSI {b.get('rsi')}, "
+                f"ATR {b.get('atr')}, вола {b.get('vol')}, ROC {b.get('price_roc')}%/об×{b.get('vol_ratio')}, "
+                f"фаза {b.get('phase')}, сетап {b.get('setup')}, ORB {b.get('orb_lo')}–{b.get('orb_hi')}, "
+                f"R/R {b.get('rr')}, вход {b.get('entry_status')}, "
+                f"стакан {b.get('ob_pressure')}/bid-ask {b.get('bid_ask')}/ликв {b.get('liquidity')}, "
+                f"поток {b.get('flow')} Δ{b.get('delta')} buy {b.get('buy_pct')}%, настр {b.get('si')}")
+        if not lines:
+            return []
+        tickers_block = "\n".join(lines)
+        system = (
+            "Ты интрадей-скринер MOEX. По КРАТКИМ данным по каждому тикеру реши, есть ли "
+            "ТОРГУЕМЫЙ внутридневной сетап: тренд-откат к VWAP, пробой ORB с удержанием, "
+            "сильный МОМЕНТУМ по тренду (высокий ADX + расширение + цена за VWAP), или фейд "
+            "границы с признаком разворота. Будь СЕЛЕКТИВЕН: watch=true только там, где сетап "
+            "реально стоит глубокого разбора. Не входи против сильного фона без веских причин. "
+            "Отвечай ТОЛЬКО валидным JSON-массивом, по одному объекту на тикер.")
+        user = (
+            f"{market_context}\n\nТИКЕРЫ (кратко):\n{tickers_block}\n\n"
+            "Верни JSON-массив: "
+            '[{"ticker":"SBER","watch":true,"bias":"long|short|none",'
+            '"regime":"trend|trend_momentum|range|squeeze_breakout|news_spike|unclear",'
+            '"reason":"кратко почему"}]. watch=true — ТОЛЬКО реальные сетапы, остальным false.')
+        try:
+            result = await self._ask(system, user, max_tokens=max_tokens)
+            s = result.find("[")
+            e = result.rfind("]") + 1
+            if s >= 0 and e > s:
+                arr = json.loads(result[s:e])
+                return [x for x in arr if isinstance(x, dict) and x.get("ticker")]
+        except Exception as ex:
+            logger.warning(f"batch_scan failed: {ex}")
+        return []
 
     async def _ask_with_image(self, system: str, user: str,
                               image_b64: str, max_tokens: int = 1024) -> str:
@@ -376,9 +504,10 @@ B) mode="momentum" (режим trend_momentum): вход по ПРОДОЛЖЕН
 Против HTF-биаса нужен конфлюенс ≥ 5; фейд границ диапазона (range) — конфлюенс ≥ 4."""
 
         try:
-            # 3000 токенов: полный JSON плейбука — 17 полей с русским текстом — не
-            # влезал в 1300 и обрезался → json.loads падал → «Claude недоступен».
-            result = await self._ask(system, user, max_tokens=3000)
+            # 1800 токенов: полный JSON плейбука реально ~900–1300 токенов (в 1300
+            # обрезался). 1800 — с запасом, но втрое дешевле резерва 3000 → бюджет
+            # 100₽/день доживает до конца сессии.
+            result = await self._ask(system, user, max_tokens=1800)
             import json
             start = result.find("{")
             end   = result.rfind("}") + 1

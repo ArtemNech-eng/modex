@@ -485,7 +485,9 @@ def _format_orderbook_read(ticker: str, obs: list[dict], trs: list[dict]) -> str
             trend_txt = " · тренд: без изменений →"
     if ratio is not None:
         spread_txt = f", спред {spread}%" if spread is not None else ""
-        lines.append(f"  Стакан: {pressure} (bid/ask {ratio}{spread_txt}){trend_txt}")
+        _liq, _liqs = latest.get("liquidity"), latest.get("liquidity_score")
+        liq_txt = f", ликвидность {_liq} ({_liqs}/100)" if _liq else ""
+        lines.append(f"  Стакан: {pressure} (bid/ask {ratio}{spread_txt}{liq_txt}){trend_txt}")
 
     # Стены из карты стакана (до 20 уровней): крупнейшие лимитки = уровни
     # поддержки/сопротивления, с дистанцией от середины спреда.
@@ -517,7 +519,9 @@ def _format_orderbook_read(ticker: str, obs: list[dict], trs: list[dict]) -> str
             note = " ⚠️ мало сделок — поток ненадёжен"
         elif buy_pct >= 95 or buy_pct <= 5:
             note = " ⚠️ экстремум на ретейл-фиде — доверять осторожно"
-        lines.append(f"  Поток сделок: {flow.get('order_flow', '—')} (buy {buy_pct}%){note}")
+        _d = flow.get("delta")
+        _dtxt = f", Δ{_d:+d} лот" if isinstance(_d, (int, float)) else ""
+        lines.append(f"  Поток сделок: {flow.get('order_flow', '—')} (buy {buy_pct}%{_dtxt}){note}")
 
     # Footprint: какая цена впитала объём (из реальных сделок) + сплит buy/sell
     fp = flow.get("footprint") or []
@@ -594,7 +598,13 @@ def _format_session_footprint(buckets: dict) -> str:
     rows.sort(key=lambda r: r[1], reverse=True)
     poc = rows[0]
     top = " · ".join(f"{p} ({int(v)} лот, {bp}% buy)" for p, v, bp in rows[:4])
-    return f"За день (footprint по сделкам): POC {poc[0]} · {top}"
+    # Cumulative delta за сессию: Σ агрессивный buy − sell по всем ценам.
+    tot_b = sum(float(c[0]) for c in buckets.values() if len(c) >= 2)
+    tot_s = sum(float(c[1]) for c in buckets.values() if len(c) >= 2)
+    cum_delta = int(tot_b - tot_s)
+    bias = "покупатели" if cum_delta > 0 else "продавцы" if cum_delta < 0 else "нейтр"
+    return (f"За день (footprint по сделкам): POC {poc[0]} · {top}\n"
+            f"  Cumulative delta за день: {cum_delta:+d} лот ({bias} накопили)")
 
 
 async def build_levels_context(ticker: str) -> str:

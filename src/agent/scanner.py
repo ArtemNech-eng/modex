@@ -174,3 +174,90 @@ async def scan_interesting(aggregator, tickers=None, save: bool = True,
         "claude_confirmed": confirmed,
         "top": screened[:10],
     }
+
+
+async def scan_batch(aggregator, tickers=None, save: bool = True, max_deep: int = 3) -> dict:
+    """
+    Batch-скрин Claude: ОДИН вызов по ВСЕМ тикерам («общая картина») → шортлист
+    реальных сетапов → глубокий synthesize только по лучшим (max_deep). Дёшево
+    (~5₽ на batch) и НИЧЕГО не теряется в триаже — Claude видит все бумаги.
+    """
+    from src.agent import analyst, screen
+    from src.agent.claude_agent import ClaudeAgent, budget_state, can_afford_deep
+    from src import db
+    try:
+        from config.settings import BATCH_SCAN_MAX_TOKENS, BATCH_SCAN_MAX_TICKERS
+    except Exception:
+        BATCH_SCAN_MAX_TOKENS, BATCH_SCAN_MAX_TICKERS = 700, 30
+
+    screened = await screen.screen_all(aggregator, tickers=tickers)
+    # В batch отправляем ТОП по интересу (дешевле input, не теряем сетапы).
+    briefs = [s["brief"] for s in screened if s.get("brief")][:BATCH_SCAN_MAX_TICKERS]
+    bud = await budget_state()
+    if not briefs:
+        return {"screened": len(screened), "batch_watch": 0, "claude_confirmed": 0,
+                "shortlist": [], "interesting": [], "budget": bud}
+    if bud["left"] <= 0:
+        logger.warning(f"💸 Дневной бюджет Claude исчерпан ({bud['rub']:.1f}/{bud['budget']:.0f}₽) — пропускаем")
+        return {"screened": len(screened), "batch_watch": 0, "claude_confirmed": 0,
+                "shortlist": [], "interesting": [], "budget": bud,
+                "skipped": "бюджет исчерпан"}
+
+    # Общий фон — один раз в контекст batch (гео — сильный рыночный драйвер).
+    market_ctx = ""
+    try:
+        from src.analysis import geopolitics as geo
+        gs = geo.MONITOR.snapshot()
+        market_ctx = f"Общий фон: геополитика {gs.get('label')} (score {gs.get('score')})."
+    except Exception:
+        pass
+
+    verdicts = await ClaudeAgent().batch_scan(market_ctx, briefs,
+                                              max_tokens=BATCH_SCAN_MAX_TOKENS)
+    watch = [v for v in verdicts if v.get("watch")]
+
+    try:
+        open_tickers = await db.get_open_signal_tickers()
+    except Exception:
+        open_tickers = set()
+
+    def _pri(v):   # моментум/тренд — вперёд
+        reg = (v.get("regime") or "").lower()
+        return 0 if "momentum" in reg else 1 if reg == "trend" else 2
+
+    shortlist = []
+    for v in sorted(watch, key=_pri):
+        t = (v.get("ticker") or "").upper()
+        if t and t not in open_tickers and t not in shortlist:
+            shortlist.append(t)
+        if len(shortlist) >= max_deep:
+            break
+
+    confirmed = 0
+    deep_skipped = None
+    for t in shortlist:
+        if not await can_afford_deep():   # остатка мало → только дешёвый batch
+            deep_skipped = "мало бюджета на глубокий разбор"
+            logger.warning(f"💸 {t}: {deep_skipped} — пропуск")
+            break
+        try:
+            a = await analyst.analyze(t, aggregator, save=save)   # ← глубокий разбор + сохранение
+            CACHE.update(t, a)
+            confirmed += 1
+        except Exception as e:
+            logger.debug(f"deep {t}: {e}")
+
+    bud = await budget_state()
+    logger.info(f"🔎 Batch-скрин: {len(screened)} тикеров → watch {len(watch)} → "
+                f"глубоко {confirmed} {shortlist} · бюджет {bud['rub']:.1f}/{bud['budget']:.0f}₽")
+    return {
+        "screened": len(screened),
+        "batch_watch": len(watch),
+        "shortlist": shortlist,
+        "claude_confirmed": confirmed,
+        "budget": bud,
+        "skipped": deep_skipped,
+        "interesting": [{"ticker": v.get("ticker"), "bias": v.get("bias"),
+                         "regime": v.get("regime"), "reason": v.get("reason")}
+                        for v in watch][:25],
+    }

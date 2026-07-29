@@ -135,6 +135,50 @@ async def screen_ticker(ticker: str, aggregator) -> Optional[dict]:
     res = interest_score(sentiment, technical, intraday)
     res["ticker"] = ticker
     res["setup"] = (intraday or {}).get("setup")
+    # Последний снимок стакана/потока из базы (реальные деньги) — для batch-брифа.
+    ob = fl = {}
+    try:
+        from src import db
+        _obs = await db.recent_events(ticker=ticker, source="tinkoff",
+                                      kind="orderbook", since_minutes=30, limit=1)
+        _trs = await db.recent_events(ticker=ticker, source="tinkoff",
+                                      kind="trades", since_minutes=30, limit=1)
+        ob = (_obs[0].get("payload") if _obs else None) or {}
+        fl = (_trs[0].get("payload") if _trs else None) or {}
+    except Exception:
+        ob = fl = {}
+
+    # Компактная сводка для batch-скрина Claude (одна строка на тикер → «общая
+    # картина» дёшево): техника + интрадей + стакан/поток/velocity.
+    _lv = (intraday or {}).get("levels") or {}
+    _tp = (technical or {}).get("trade_plan") or {}
+    _vel = (intraday or {}).get("velocity") or {}
+    res["brief"] = {
+        "ticker": ticker,
+        "price": (technical or {}).get("price"),
+        "vwap_rel": (intraday or {}).get("vwap_rel"),
+        "atr": (intraday or {}).get("atr"),
+        "vol": (intraday or {}).get("volatility_state"),
+        "phase": (intraday or {}).get("phase"),
+        "regime": (technical or {}).get("regime"),
+        "adx": (technical or {}).get("adx"),
+        "rsi": (technical or {}).get("rsi"),
+        "setup": (intraday or {}).get("setup"),
+        "orb_hi": _lv.get("or_high"),
+        "orb_lo": _lv.get("or_low"),
+        "rr": _tp.get("risk_reward"),
+        "entry_status": _tp.get("entry_status"),
+        "si": (sentiment or {}).get("sentiment_index"),
+        # производные «реальных денег» (спек Data Engine):
+        "price_roc": _vel.get("price_roc"),
+        "vol_ratio": _vel.get("vol_ratio"),
+        "ob_pressure": ob.get("pressure"),
+        "bid_ask": ob.get("bid_ask_ratio"),
+        "liquidity": ob.get("liquidity"),
+        "flow": fl.get("order_flow"),
+        "delta": fl.get("delta"),
+        "buy_pct": fl.get("buy_pct"),
+    }
     return res
 
 

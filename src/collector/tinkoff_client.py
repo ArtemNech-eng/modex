@@ -254,6 +254,17 @@ class TinkoffClient:
         bid_walls = sorted(bids, key=lambda x: x["qty"], reverse=True)[:3]
         ask_walls = sorted(asks, key=lambda x: x["qty"], reverse=True)[:3]
 
+        # Ликвидность: глубина у СЕРЕДИНЫ (±0.5%) + тугой спред. depth_near — сколько
+        # лотов реально стоит рядом с ценой; liquidity_score 0..100 (эвристика: тугой
+        # спред = ликвидно). Помогает риск-гейту и Claude отличать тонкий стакан.
+        mid = (bids[0]["price"] + asks[0]["price"]) / 2 if (bids and asks) else 0
+        band = mid * 0.005
+        depth_near = (sum(b["qty"] for b in bids if b["price"] >= mid - band)
+                      + sum(a["qty"] for a in asks if a["price"] <= mid + band))
+        liquidity_score = max(0, round(100 - spread_pct * 200, 0))  # спред 0%→100, 0.5%→0
+        liquidity = ("глубокий" if liquidity_score >= 70 else
+                     "нормальный" if liquidity_score >= 40 else "тонкий")
+
         return {
             "best_bid":      bids[0]["price"] if bids else None,
             "best_ask":      asks[0]["price"] if asks else None,
@@ -262,6 +273,9 @@ class TinkoffClient:
             "pressure":      pressure,
             "total_bid_qty": total_bid_qty,
             "total_ask_qty": total_ask_qty,
+            "depth_near_mid": depth_near,      # лотов в пределах ±0.5% от середины
+            "liquidity_score": liquidity_score,  # 0..100 (тугой спред = выше)
+            "liquidity":     liquidity,        # тонкий | нормальный | глубокий
             "top_bids":      bids[:5],
             "top_asks":      asks[:5],
             "bid_walls":     bid_walls,
@@ -484,6 +498,7 @@ def _classify_flow(trades: list[dict]) -> dict:
         "sell_pct":     sell_pct,
         "buy_volume":   buy_vol,
         "sell_volume":  sell_vol,
+        "delta":        buy_vol - sell_vol,   # агрессивный buy−sell (снимок): + покупатели, − продавцы
         "order_flow":   flow,
         "avg_price":    avg_price,
         # ── диагностика/прозрачность (видно в /api/feed) ──

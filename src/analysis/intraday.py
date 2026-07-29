@@ -276,6 +276,24 @@ def is_last_minutes(minute_of_day: int, buffer_min: int = 10) -> bool:
     return False
 
 
+def velocity(closes: list, volumes: list, k: int = 6) -> dict:
+    """
+    Скорость цены и объёма (ROC) за последние k баров — «движение ускоряется?».
+    price_roc — % изменения цены за k баров; vol_ratio — объём последних k баров
+    относительно предыдущих k (>1 = приток объёма/ускорение). Чистая функция.
+    """
+    out = {"price_roc": None, "vol_ratio": None}
+    if closes and len(closes) >= k + 1 and closes[-k - 1]:
+        out["price_roc"] = round((closes[-1] / closes[-k - 1] - 1) * 100, 3)
+    if volumes and len(volumes) >= 2 * k:
+        recent = volumes[-k:]
+        base = volumes[-2 * k:-k]
+        ra = sum(recent) / len(recent) if recent else 0
+        ba = sum(base) / len(base) if base else 0
+        out["vol_ratio"] = round(ra / ba, 2) if ba else None
+    return out
+
+
 # ─── helpers ──────────────────────────────────────────────────────────────────
 
 def _plan(signal: str, entry: float, stop: float, target: float,

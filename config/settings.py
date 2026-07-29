@@ -155,13 +155,31 @@ MOMENTUM_STOP_CAP_PCT = float(os.getenv("MOMENTUM_STOP_CAP_PCT", "0.01"))  # п�
 MOMENTUM_EXT_ATR = float(os.getenv("MOMENTUM_EXT_ATR", "2.0"))     # макс. растяжение входа от VWAP, ×ATR (анти-пик)
 MOMENTUM_MIN_CONFLUENCE = int(os.getenv("MOMENTUM_MIN_CONFLUENCE", "3"))   # мин. конфлюенс для моментума
 
+# ─── Batch-скрин Claude: ОДИН запрос по ВСЕМ тикерам («общая картина») ─────────
+# Дёшево: Claude бегло судит все тикеры за 1 вызов (~5₽) → шортлист реальных
+# сетапов → глубокий разбор только по лучшим (BATCH_SCAN_MAX_DEEP вызовов).
+# Втрое дешевле поштучного триажа и покрывает ВСЕ бумаги (ничего не «теряется»).
+BATCH_SCAN_ENABLED = os.getenv("BATCH_SCAN_ENABLED", "true").lower() == "true"
+BATCH_SCAN_MAX_DEEP = int(os.getenv("BATCH_SCAN_MAX_DEEP", "1"))     # глубоких разборов после batch
+BATCH_SCAN_MAX_TOKENS = int(os.getenv("BATCH_SCAN_MAX_TOKENS", "700"))   # потолок ответа batch-скрина
+BATCH_SCAN_MAX_TICKERS = int(os.getenv("BATCH_SCAN_MAX_TICKERS", "30"))  # сколько брифов слать в batch (топ по интересу)
+
+# ─── БЮДЖЕТ Claude (жёсткий дневной лимит) ────────────────────────────────────
+# Считаем стоимость КАЖДОГО вызова и не даём выйти за дневной лимит: когда
+# остаток мал — глубокие разборы отключаются (batch-скрин дешёвый идёт дальше),
+# при нуле Claude не зовётся вообще. Так 100₽ гарантированно живут весь день.
+AI_DAILY_BUDGET_RUB = float(os.getenv("AI_DAILY_BUDGET_RUB", "100"))
+AI_PRICE_IN_RUB_1K = float(os.getenv("AI_PRICE_IN_RUB_1K", "0.5"))    # ₽ за 1К входных токенов
+AI_PRICE_OUT_RUB_1K = float(os.getenv("AI_PRICE_OUT_RUB_1K", "2.5"))  # ₽ за 1К выходных токенов
+AI_DEEP_MIN_RESERVE_RUB = float(os.getenv("AI_DEEP_MIN_RESERVE_RUB", "12"))  # ниже — только batch
+
 # Авто-старт live-движка при запуске приложения: сканирование → сигналы по
 # плейбуку → оценка созревших прогнозов → обучение. Без него «мозг» простаивает
 # до ручного /api/live-signals/start и гаснет при каждом редеплое.
 # Сканер (Claude-сигналы) — по умолчанию РУЧНОЙ: включаешь, когда садишься торговать,
 # выключаешь при выходе (Claude не зовётся → расход 0). Кнопки: /api/live-signals/start|stop.
 LIVE_SIGNALS_AUTOSTART = os.getenv("LIVE_SIGNALS_AUTOSTART", "false").lower() == "true"
-LIVE_SIGNALS_INTERVAL_MIN = int(os.getenv("LIVE_SIGNALS_INTERVAL_MIN", "15"))  # период сканера, мин (min 5) — Claude сканит каждые 15 мин
+LIVE_SIGNALS_INTERVAL_MIN = int(os.getenv("LIVE_SIGNALS_INTERVAL_MIN", "30"))  # период сканера, мин (30 = бюджет 100₽ живёт всю сессию)
 # Learning-цикл (оценка прогнозов, БЕЗ Claude) — работает ВСЕГДА, даже при выкл.
 # сканере: самообучение (точность / R / regime-stats) не прерывается.
 LEARNING_AUTOSTART = os.getenv("LEARNING_AUTOSTART", "true").lower() == "true"

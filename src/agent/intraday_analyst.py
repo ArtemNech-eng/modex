@@ -88,6 +88,7 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
     vwap_last = vw[-1] if vw else None
     atr = iv.intraday_atr(h, l, c)
     vol = iv.volatility_state(h, l, c)
+    vel = iv.velocity(c, v)   # скорость цены/объёма (ROC): движение ускоряется?
     orr = iv.opening_range(h, l, bars=opening_range_bars)
     phase = iv.session_phase(minute_of_day)
     last_min = iv.is_last_minutes(minute_of_day)
@@ -166,6 +167,7 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
         "vwap_rel": vwap_rel,
         "atr": atr,
         "volatility_state": vol.get("state"),
+        "velocity": vel,
         "phase": phase,
         "event": event,
         "delayed": delayed,

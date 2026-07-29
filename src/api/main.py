@@ -1276,15 +1276,28 @@ async def _live_scan_once() -> dict:
         return {"saved": 0, "skipped": _phase}
 
     _live_status["skipped"] = None
-    from config.settings import SCAN_MIN_INTEREST, SCAN_MAX_CLAUDE
-    triage = await scanner.scan_interesting(
-        aggregator, tickers=_live_status["tickers"], save=True,
-        min_interest=SCAN_MIN_INTEREST, max_claude=SCAN_MAX_CLAUDE)
+    from config.settings import (SCAN_MIN_INTEREST, SCAN_MAX_CLAUDE,
+                                 BATCH_SCAN_ENABLED, BATCH_SCAN_MAX_DEEP)
+    if BATCH_SCAN_ENABLED:
+        # Batch-скрин: 1 вызов Claude по всем тикерам (общая картина) → глубокий
+        # разбор по шортлисту. Дёшево и ничего не теряется в триаже.
+        triage = await scanner.scan_batch(
+            aggregator, tickers=_live_status["tickers"], save=True,
+            max_deep=BATCH_SCAN_MAX_DEEP)
+        _live_status["batch_watch"] = triage.get("batch_watch", 0)
+        _live_status["shortlist"] = triage.get("shortlist", [])
+        _live_status["budget"] = triage.get("budget")
+        if triage.get("skipped"):
+            _live_status["skipped"] = triage["skipped"]
+    else:
+        triage = await scanner.scan_interesting(
+            aggregator, tickers=_live_status["tickers"], save=True,
+            min_interest=SCAN_MIN_INTEREST, max_claude=SCAN_MAX_CLAUDE)
+        _live_status["skipped_open"] = triage.get("skipped_open", [])
     saved = triage.get("claude_confirmed", 0)
     _live_status["last_scan"] = _now_iso()
     _live_status["scanned"] = triage.get("screened", 0)
     _live_status["interesting"] = triage.get("interesting", [])
-    _live_status["skipped_open"] = triage.get("skipped_open", [])
     _live_status["saved"] = saved
     return {"saved": saved}
 
@@ -1365,6 +1378,15 @@ async def live_start(interval_min: int = 15, tickers: Optional[str] = None):
 async def live_stop():
     _live_status["enabled"] = False
     return {"status": "stopping", **_live_status}
+
+
+@app.get("/api/ai/budget", summary="Расход Claude за день (бюджет-гард)")
+async def get_ai_budget():
+    """Сколько ₽ Claude потратил за МСК-день и сколько осталось до дневного лимита."""
+    from src.agent.claude_agent import budget_state, can_afford_deep
+    st = await budget_state()
+    st["deep_affordable"] = await can_afford_deep()
+    return st
 
 
 @app.get("/api/learning", summary="Статус контура обучения (always-on)")
