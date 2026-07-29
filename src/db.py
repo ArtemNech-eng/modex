@@ -987,6 +987,70 @@ async def accuracy_stats(ticker: Optional[str] = None) -> dict:
 HUMAN_DECISIONS = ("accept", "reject", "wait")
 
 
+def _position_from_context(p) -> dict:
+    """Размер позиции из снимка контекста. Нужен, чтобы посчитать P&L в рублях:
+    R сам по себе денег не даёт, нужен фактический риск позиции."""
+    if not p.context_json:
+        return {}
+    try:
+        import json as _json
+        ctx = _json.loads(p.context_json) or {}
+        return {"risk_rub": ctx.get("risk_rub"),
+                "shares": ctx.get("risk_shares"),
+                "notional_rub": ctx.get("risk_notional_rub")}
+    except Exception:
+        return {}
+
+
+async def accepted_closed_trades() -> list[dict]:
+    """Закрытые сделки, которые человек ПРИНЯЛ — в порядке закрытия.
+
+    Порядок по времени оценки, а не создания: виртуальный счёт двигается в
+    момент закрытия сделки, и пик капитала должен считаться по той же шкале.
+    """
+    async with async_session() as session:
+        stmt = (select(Prediction)
+                .where(Prediction.human_decision == "accept")
+                .where(Prediction.correct.is_not(None))
+                .order_by(Prediction.evaluated_at.asc()))
+        rows = (await session.execute(stmt)).scalars().all()
+
+    out = []
+    for p in rows:
+        pos = _position_from_context(p)
+        out.append({
+            "id": p.id, "ticker": p.ticker, "direction": p.direction,
+            "realized_r": p.realized_r, "realized_return": p.realized_return,
+            "correct": p.correct, "outcome": p.outcome,
+            "evaluated_at": p.evaluated_at,
+            "risk_rub": pos.get("risk_rub"),
+            "shares": pos.get("shares"),
+            "notional_rub": pos.get("notional_rub"),
+        })
+    return out
+
+
+async def accepted_open_trades() -> list[dict]:
+    """Принятые сценарии, которые ещё не закрыты — то, что реально держим."""
+    async with async_session() as session:
+        stmt = (select(Prediction)
+                .where(Prediction.human_decision == "accept")
+                .where(Prediction.correct.is_(None)))
+        rows = (await session.execute(stmt)).scalars().all()
+
+    out = []
+    for p in rows:
+        pos = _position_from_context(p)
+        out.append({
+            "id": p.id, "ticker": p.ticker, "direction": p.direction,
+            "entry": p.entry, "stop": p.stop, "target": p.target,
+            "shares": pos.get("shares"),
+            "risk_rub": pos.get("risk_rub"),
+            "notional_rub": pos.get("notional_rub"),
+        })
+    return out
+
+
 def decision_bucket_stats(rows: list) -> dict:
     """Статистика по подвыборке сценариев. Вынесено на уровень модуля, чтобы
     покрывалось тестами: считалка, которую нельзя проверить, — источник тихих

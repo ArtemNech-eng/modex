@@ -235,6 +235,99 @@ def test_liquidity_from_orderbook_parsing():
     assert lfo({"spread_pct": 0, "depth_near_mid": 10}) == (None, 10)
     assert lfo({"spread_pct": "мусор", "depth_near_mid": "мусор"}) == (None, None)
 
+
+# ──────────────────── виртуальный счёт (paper trading) ───────────────────────
+
+from datetime import datetime, timezone, timedelta  # noqa: E402
+from src.risk.engine import accumulate_paper        # noqa: E402
+
+TODAY = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d")
+_y, _w, _ = (datetime.now(timezone.utc) + timedelta(hours=3)).isocalendar()
+WEEK = f"{_y}-W{_w:02d}"
+
+
+def _tr(r, risk=500.0, when=None):
+    return {"realized_r": r, "risk_rub": risk,
+            "evaluated_at": when or datetime.now(timezone.utc)}
+
+
+def test_empty_account_is_untouched():
+    a = accumulate_paper([], 200_000.0, TODAY, WEEK)
+    assert a["equity_rub"] == 200_000.0 and a["pnl_rub"] == 0.0
+    assert a["trades_total"] == 0 and a["drawdown_pct"] == 0.0
+
+
+def test_pnl_in_rubles_from_r():
+    """P&L = R × риск позиции. +2R при риске 500₽ это +1000₽."""
+    a = accumulate_paper([_tr(2.0)], 200_000.0, TODAY, WEEK)
+    assert a["pnl_rub"] == 1000.0
+    assert a["equity_rub"] == 201_000.0
+    assert a["wins"] == 1 and a["losses"] == 0
+
+
+def test_loss_reduces_equity_and_creates_drawdown():
+    a = accumulate_paper([_tr(2.0), _tr(-1.0), _tr(-1.0)], 200_000.0, TODAY, WEEK)
+    # +1000, -500, -500 -> 200000, пик был 201000
+    assert a["equity_rub"] == 200_000.0
+    assert a["equity_peak_rub"] == 201_000.0
+    assert abs(a["drawdown_pct"] - round(1000/201000*100, 3)) < 0.01
+
+
+def test_recompute_is_idempotent():
+    """Дважды посчитанный один и тот же список даёт один результат.
+    Это и есть защита от двойного учёта при повторном проходе оценщика."""
+    rows = [_tr(1.5), _tr(-1.0), _tr(0.5)]
+    a1 = accumulate_paper(rows, 200_000.0, TODAY, WEEK)
+    a2 = accumulate_paper(rows, 200_000.0, TODAY, WEEK)
+    assert a1 == a2
+
+
+def test_trade_without_size_does_not_move_equity():
+    """Легаси-сделка без risk_rub считается, но счёт не двигает."""
+    a = accumulate_paper([_tr(3.0, risk=None)], 200_000.0, TODAY, WEEK)
+    assert a["equity_rub"] == 200_000.0
+    assert a["skipped_no_size"] == 1
+    assert a["trades_total"] == 1 and a["realized_r_total"] == 3.0
+
+
+def test_unevaluated_trade_counted_but_not_summed():
+    a = accumulate_paper([{"realized_r": None, "risk_rub": 500.0,
+                           "evaluated_at": None}], 200_000.0, TODAY, WEEK)
+    assert a["trades_total"] == 1 and a["realized_r_total"] == 0.0
+    assert a["wins"] == 0 and a["losses"] == 0
+
+
+def test_old_trades_not_counted_in_today_or_week():
+    """Сделка месячной давности в суммы дня и недели не попадает."""
+    old = datetime.now(timezone.utc) - timedelta(days=30)
+    a = accumulate_paper([_tr(-2.0, when=old)], 200_000.0, TODAY, WEEK)
+    assert a["realized_r_today"] == 0.0 and a["realized_r_week"] == 0.0
+    assert a["trades_today"] == 0
+    assert a["realized_r_total"] == -2.0          # в общей сумме есть
+    assert a["equity_rub"] == 199_000.0           # и счёт двигает
+
+
+def test_daily_limit_fed_from_paper_account():
+    """Главное: накопленный дневной убыток реально блокирует торговлю.
+    До этой правки realized_r_today всегда был 0, и лимит был мёртвым."""
+    a = accumulate_paper([_tr(-1.0), _tr(-1.0), _tr(-1.0)], 200_000.0, TODAY, WEEK)
+    assert a["realized_r_today"] == -3.0
+    st = RiskState(realized_r_today=a["realized_r_today"],
+                   equity_peak_rub=a["equity_peak_rub"],
+                   equity_now_rub=a["equity_rub"])
+    assert check_limits(st, CFG).reason == "risk_daily_loss"
+
+
+def test_kill_switch_fed_from_paper_account():
+    """Просадка 5% от пика через реальные убытки роняет kill switch."""
+    rows = [_tr(-1.0, risk=2000.0) for _ in range(5)]   # -10 000₽ = -5%
+    a = accumulate_paper(rows, 200_000.0, TODAY, WEEK)
+    assert a["equity_rub"] == 190_000.0
+    st = RiskState(equity_peak_rub=a["equity_peak_rub"],
+                   equity_now_rub=a["equity_rub"])
+    assert st.drawdown_pct >= 5.0
+    assert check_limits(st, CFG).reason == "risk_kill_switch"
+
 # ────────────────────────────── запуск ───────────────────────────────────────
 
 if __name__ == "__main__":

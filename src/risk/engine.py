@@ -413,6 +413,107 @@ def _msk_day() -> str:
     return (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d")
 
 
+def _msk_week() -> str:
+    d = datetime.now(timezone.utc) + timedelta(hours=3)
+    y, w, _ = d.isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+def _msk(dt: datetime) -> datetime:
+    """Момент в МСК. Сутки и неделя риска считаются по бирже, а не по UTC."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc) + timedelta(hours=3)
+
+
+async def compute_paper_account(cfg: Optional[RiskConfig] = None) -> dict:
+    """Виртуальный счёт: пересчёт с нуля по закрытым ПРИНЯТЫМ сделкам.
+
+    ПОЧЕМУ ПЕРЕСЧЁТ, А НЕ ИНКРЕМЕНТ. Инкрементальное обновление состояния
+    требует помнить, какие сделки уже учтены, иначе повторный проход оценщика
+    удвоит убыток и ложно сработает kill switch. Полный пересчёт идемпотентен по
+    построению и самовосстанавливается после любого сбоя. Сделок сотни, счёт
+    мгновенный — экономить тут нечего, а цена ошибки высокая.
+
+    ПОЧЕМУ ТОЛЬКО ПРИНЯТЫЕ. В советническом режиме деньгами двигают только те
+    сделки, которые человек взял. Отклонённый убыточный сигнал не должен ни
+    уменьшать виртуальный счёт, ни съедать дневной лимит убытка: вы его не
+    брали. При этом ОЦЕНИВАЮТСЯ все сценарии — это нужно для измерения качества
+    сигналов и сравнения человека с моделью, но к счёту отношения не имеет.
+
+    P&L в рублях = realized_r × risk_rub, где risk_rub — фактический риск
+    позиции, посчитанный Risk Engine на момент сигнала. У старых сделок его нет;
+    такие считаются в статистике сделок, но счёт не двигают, и их число
+    возвращается отдельно, чтобы расхождение не выглядело загадкой.
+    """
+    cfg = cfg or load_config()
+    today, week = _msk_day(), _msk_week()
+    try:
+        from src import db
+        rows = await db.accepted_closed_trades()
+    except Exception as e:                       # noqa: BLE001
+        logger.warning("RiskEngine: не удалось собрать виртуальный счёт: %s", e)
+        out = accumulate_paper([], cfg.account_rub, today, week)
+        out["error"] = str(e)[:200]
+        return out
+    return accumulate_paper(rows, cfg.account_rub, today, week)
+
+
+def accumulate_paper(rows: list, start_rub: float,
+                     today: str, week: str) -> dict:
+    """Чистая арифметика виртуального счёта. Вынесена из БД-функции, чтобы
+    покрывалась тестами: ошибка в подсчёте капитала дороже любой другой, потому
+    что на него смотрит kill switch.
+
+    Ожидает список словарей с realized_r, risk_rub и evaluated_at, уже
+    упорядоченный по времени закрытия.
+    """
+    out = {
+        "equity_rub": start_rub, "equity_peak_rub": start_rub,
+        "start_rub": start_rub, "pnl_rub": 0.0, "pnl_pct": 0.0,
+        "drawdown_pct": 0.0, "trades_total": 0, "trades_today": 0,
+        "realized_r_total": 0.0, "realized_r_today": 0.0, "realized_r_week": 0.0,
+        "wins": 0, "losses": 0, "skipped_no_size": 0,
+        "day": today, "week": week,
+    }
+    equity = peak = float(start_rub)
+    for r in rows or []:
+        rr = r.get("realized_r")
+        risk_rub = r.get("risk_rub")
+        out["trades_total"] += 1
+        if rr is None:
+            continue
+        out["realized_r_total"] += rr
+        out["wins" if rr > 0 else "losses"] += 1
+        closed = r.get("evaluated_at")
+        if closed is not None:
+            c = _msk(closed)
+            if c.strftime("%Y-%m-%d") == today:
+                out["trades_today"] += 1
+                out["realized_r_today"] += rr
+            y, w, _ = c.isocalendar()
+            if f"{y}-W{w:02d}" == week:
+                out["realized_r_week"] += rr
+        if not risk_rub:
+            # Сделка без рассчитанного размера (легаси) двигать счёт не может:
+            # R без риска в рублях не переводится в деньги. Считаем её в
+            # статистике и показываем счётчик, чтобы расхождение было объяснимо.
+            out["skipped_no_size"] += 1
+            continue
+        equity += rr * risk_rub
+        peak = max(peak, equity)
+
+    out["equity_rub"] = round(equity, 2)
+    out["equity_peak_rub"] = round(peak, 2)
+    out["pnl_rub"] = round(equity - start_rub, 2)
+    out["pnl_pct"] = round((equity / start_rub - 1) * 100, 3) if start_rub else 0.0
+    out["drawdown_pct"] = (round(max(0.0, (peak - equity) / peak * 100), 3)
+                           if peak > 0 else 0.0)
+    for k in ("realized_r_total", "realized_r_today", "realized_r_week"):
+        out[k] = round(out[k], 3)
+    return out
+
+
 async def load_state(cfg: Optional[RiskConfig] = None) -> RiskState:
     """Собрать состояние риска из БД. Пишется по образцу бюджет-гарда.
 
@@ -428,26 +529,35 @@ async def load_state(cfg: Optional[RiskConfig] = None) -> RiskState:
     # повезло ли с импортом.
     state.equity_peak_rub = cfg.account_rub
     state.equity_now_rub = cfg.account_rub
+
+    # Накопительные лимиты (дневной, недельный, число сделок, kill switch) до
+    # этого были ИНЕРТНЫ: состояние читалось, но никто его не заполнял, поэтому
+    # realized_r_today всегда был 0, просадка 0, и ни один из них не мог
+    # сработать. Тесты это не поймали, потому что подставляли состояние напрямую.
+    # Теперь состояние выводится из виртуального счёта по закрытым принятым
+    # сделкам — тем же пересчётом, что и paper trading.
     try:
-        from src import db
-    except Exception:
+        acc = await compute_paper_account(cfg)
+    except Exception as e:                        # noqa: BLE001
+        logger.warning("RiskEngine: состояние не собралось, лимиты неактивны: %s", e)
         return state
 
-    try:
-        raw = await db.get_setting(_STATE_KEY)
-        saved = json.loads(raw) if raw else {}
-    except Exception:
-        saved = {}
+    state.equity_now_rub = float(acc.get("equity_rub") or cfg.account_rub)
+    state.equity_peak_rub = float(acc.get("equity_peak_rub") or cfg.account_rub)
+    state.realized_r_today = float(acc.get("realized_r_today") or 0.0)
+    state.realized_r_week = float(acc.get("realized_r_week") or 0.0)
+    state.trades_today = int(acc.get("trades_today") or 0)
 
-    peak = saved.get("equity_peak_rub") or cfg.account_rub
-    state.equity_peak_rub = float(peak)
-    state.equity_now_rub = float(saved.get("equity_now_rub") or cfg.account_rub)
-    if saved.get("date") != _msk_day():
-        state.trades_today = 0
-    else:
-        state.trades_today = int(saved.get("trades_today") or 0)
-        state.realized_r_today = float(saved.get("realized_r_today") or 0.0)
-    state.realized_r_week = float(saved.get("realized_r_week") or 0.0)
+    # Открытые позиции и связанная экспозиция — только по ПРИНЯТЫМ сценариям:
+    # держим мы лишь то, что взяли, значит и лимиты концентрации считаются по ним.
+    try:
+        from src import db
+        open_rows = await db.accepted_open_trades()
+        state.open_positions = len(open_rows)
+        state.open_exposure_rub = sum(
+            float(r.get("notional_rub") or 0.0) for r in open_rows)
+    except Exception as e:                        # noqa: BLE001
+        logger.debug("RiskEngine: открытые позиции не прочитались: %s", e)
     return state
 
 

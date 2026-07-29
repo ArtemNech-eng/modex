@@ -1150,6 +1150,39 @@ async def post_signal_decision(pred_id: int, decision: str, note: Optional[str] 
     return {"status": "ok", "prediction": updated}
 
 
+@app.get("/api/paper-account", summary="Виртуальный счёт: paper trading по принятым сделкам")
+async def get_paper_account():
+    """Состояние виртуального счёта и активных лимитов риска.
+
+    Счёт двигают ТОЛЬКО принятые сделки: отклонённый убыточный сигнал не должен
+    ни уменьшать капитал, ни съедать дневной лимит — вы его не брали. Оцениваются
+    при этом все сценарии, но это про качество сигналов, а не про деньги.
+
+    Считается полным пересчётом по закрытым принятым сделкам, поэтому
+    идемпотентно: повторный проход оценщика не может удвоить убыток и ложно
+    уронить kill switch.
+    """
+    from src.risk import engine as _risk
+    cfg = _risk.load_config()
+    acc = await _risk.compute_paper_account(cfg)
+    state = await _risk.load_state(cfg)
+    gate = _risk.check_limits(state, cfg)
+    acc["limits"] = {
+        "trading_allowed": gate.approved,
+        "blocking_reason": None if gate.approved else gate.reason,
+        "blocking_detail": None if gate.approved else gate.detail,
+        "risk_per_trade_pct": cfg.risk_per_trade_pct,
+        "daily_loss_limit_r": cfg.daily_loss_limit_r,
+        "weekly_loss_limit_r": cfg.weekly_loss_limit_r,
+        "max_trades_per_day": cfg.max_trades_per_day,
+        "max_open_positions": cfg.max_open_positions,
+        "kill_switch_dd_pct": cfg.kill_switch_dd_pct,
+        "open_positions": state.open_positions,
+        "open_exposure_rub": round(state.open_exposure_rub, 2),
+    }
+    return acc
+
+
 @app.get("/api/decisions", summary="Claude против человека: чей вклад в результат")
 async def get_decisions(ticker: Optional[str] = None):
     """Сравнение решений Claude и человека в R.
