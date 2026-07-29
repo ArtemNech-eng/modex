@@ -1122,11 +1122,24 @@ async def get_accuracy(ticker: Optional[str] = None):
 
 
 def _bucket(items: list[dict]) -> dict:
-    ev = [p for p in items if p.get("correct") is not None]
+    """Срез точности по подвыборке прогнозов.
+
+    Записи с direction=flat или confidence=0 — это отказ от мнения, а не
+    прогноз, и в знаменатель они не идут: считать их ошибкой, когда цена
+    сдвинулась, некорректно. Тот же принцип, что в db.accuracy_stats.
+    """
+    def _directional(p: dict) -> bool:
+        return (str(p.get("direction") or "").lower() in ("up", "down")
+                and (p.get("confidence") or 0) > 0)
+
+    scored = [p for p in items if p.get("correct") is not None]
+    ev = [p for p in scored if _directional(p)]
     cor = [p for p in ev if p["correct"]]
+    abstained = len(scored) - len(ev)
     return {
         "total": len(items),
         "evaluated": len(ev),
+        "abstained": abstained,
         "correct": len(cor),
         "accuracy": round(len(cor) / len(ev), 3) if ev else None,
     }
