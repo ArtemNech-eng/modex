@@ -319,6 +319,12 @@ async def load_state(cfg: Optional[RiskConfig] = None) -> RiskState:
     """
     cfg = cfg or load_config()
     state = RiskState()
+    # Значения по умолчанию выставляем ДО обращения к БД: иначе при её
+    # недоступности пик капитала остался бы None, drawdown_pct вернул бы None,
+    # и kill switch молча стал бы неактивным. Защита не должна зависеть от того,
+    # повезло ли с импортом.
+    state.equity_peak_rub = cfg.account_rub
+    state.equity_now_rub = cfg.account_rub
     try:
         from src import db
     except Exception:

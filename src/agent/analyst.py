@@ -150,6 +150,17 @@ def _veto_code(reason) -> str:
         return "veto_confluence"
     if "неполный план" in r:
         return "no_plan"
+    # Risk Engine возвращает готовые коды (risk_daily_loss и т.д.) — пропускаем
+    # их как есть, чтобы в журнале было видно, КАКОЕ ограничение съело сделку,
+    # а не безликое veto_other.
+    if "риск-движок" in r:
+        for code in ("risk_kill_switch", "risk_daily_loss", "risk_weekly_loss",
+                     "risk_max_trades", "risk_max_positions", "risk_sector_limit",
+                     "risk_exposure_full", "risk_zero_size", "risk_no_levels",
+                     "risk_stop_wrong_side"):
+            if code in r:
+                return code
+        return "risk_other"
     return "veto_other"
 
 
@@ -514,6 +525,45 @@ async def analyze(ticker: str, aggregator, save: bool = True,
         result_veto_reason = f"неполный план: нет {', '.join(_miss)}"
         logger.info(f"🛑 {ticker}: {result_veto_reason} — сигнал не сохраняем")
 
+    # ── 5б. RISK ENGINE — независимый контур, ПОСЛЕДНЕЕ слово ────────────────
+    # Стоит после проверки плана: без входа и стопа размер не определён.
+    # Движок решает размер позиции и право на сделку, и его вето ПРИОРИТЕТНЕЕ
+    # решения Claude — модель не может его переопределить ни промптом, ни
+    # ответом. Сюда же попадают стоп дня и недели, лимит числа сделок и
+    # kill switch по просадке: сигнал может быть хорошим, а торговать нельзя.
+    risk_decision = None
+    if direction != "flat" and c_entry and c_stop:
+        try:
+            from src.risk import engine as _risk
+            _rcfg = _risk.load_config()
+            _rstate = await _risk.load_state(_rcfg)
+            risk_decision = _risk.evaluate_trade(
+                float(c_entry), float(c_stop), direction, _rstate, _rcfg)
+            if not risk_decision.approved:
+                direction, confidence, combined = "flat", 0.0, 0.0
+                claude_trade_plan = None
+                recommendation = f"⚪ Наблюдать — риск-движок: {risk_decision.detail}"
+                result_veto_reason = f"риск-движок: {risk_decision.reason}"
+                logger.info(f"🛑 {ticker}: риск-движок отклонил "
+                            f"({risk_decision.reason}) — {risk_decision.detail}")
+            else:
+                logger.info(
+                    f"📐 {ticker}: размер {risk_decision.shares} шт, риск "
+                    f"{risk_decision.risk_rub:.0f}₽ "
+                    f"({risk_decision.risk_pct_of_account:.2f}% счёта), "
+                    f"экспозиция {risk_decision.notional_rub:,.0f}₽, "
+                    f"ограничивает {risk_decision.binding_constraint}")
+        except Exception as e:
+            # Движок недоступен — сигнал НЕ пропускаем без размера: сделка без
+            # рассчитанного риска неисполнима, а молчаливый пропуск вернул бы
+            # нас к «мнению вместо плана».
+            logger.warning(f"Risk Engine недоступен для {ticker}: {e}")
+            direction, confidence, combined = "flat", 0.0, 0.0
+            claude_trade_plan = None
+            recommendation = "⚪ Наблюдать — риск-движок недоступен"
+            result_veto_reason = "риск-движок: risk_other"
+            risk_decision = None
+
     # ── 6. Обоснование ──────────────────────────────────────────────────────
     reasons: list[str] = []
     if sentiment_block:
@@ -599,6 +649,11 @@ async def analyze(ticker: str, aggregator, save: bool = True,
     if claude_trade_plan:
         result["trade_plan"] = claude_trade_plan
 
+    # Размер позиции от Risk Engine — без него план не исполним: «купить SBER»
+    # это мнение, «158 акций, риск 205₽» это сделка.
+    if risk_decision is not None:
+        result["position"] = risk_decision.as_dict()
+
     # ── 7. Сохраняем прогноз — ТОЛЬКО направленные сигналы Claude (up/down) ──
     # «Наблюдать» / нет-сигнала / не-Claude в обучение НЕ идут: учимся только на
     # реальных сигналах Claude. И не плодим второй сигнал по тикеру, пока
@@ -625,6 +680,17 @@ async def analyze(ticker: str, aggregator, save: bool = True,
                 "mode": mode,             # pullback (фикс −1%) или momentum (структурный ≤1%)
                 "stop_pct": (round(abs(c_entry - c_stop) / c_entry, 4)
                              if (c_entry and c_stop) else STOP_PCT),  # фактический риск, %
+                # Размер от Risk Engine — чтобы в разборе было видно, каким
+                # объёмом сделка была бы исполнена и что ограничивало размер.
+                "risk_shares": risk_decision.shares if risk_decision else None,
+                "risk_rub": (round(risk_decision.risk_rub, 2)
+                             if risk_decision else None),
+                "risk_pct_of_account": (round(risk_decision.risk_pct_of_account, 4)
+                                        if risk_decision else None),
+                "risk_notional_rub": (round(risk_decision.notional_rub, 2)
+                                      if risk_decision else None),
+                "risk_binding": (risk_decision.binding_constraint
+                                 if risk_decision else None),
                 "sentiment_index": sentiment_block["sentiment_index"] if sentiment_block else None,
                 "sentiment_label": sentiment_block.get("label") if sentiment_block else None,
                 "sentiment_signal": sentiment_signal,
