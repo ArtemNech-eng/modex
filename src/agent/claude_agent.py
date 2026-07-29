@@ -29,6 +29,72 @@ _BASE_URL  = os.getenv(
 )
 _MODEL = os.getenv("AI_MODEL", "claude-sonnet-5")
 
+# ─── РАССУЖДЕНИЯ МОДЕЛИ: главная причина «оплатили, но сигнала нет» ────────────
+# Симптом (журнал попыток 29.07): tokens_out РОВНО равен потолку (900→900,
+# 1800→1800), а message.content приходит ПУСТЫМ. Токены рассуждений считаются
+# провайдером в completion_tokens, но в content не попадают: модель думает до
+# упора в лимит и не успевает выдать ответ. Поднятие потолка не лечит — просто
+# даёт рассуждениям больше места (и дороже платим: 2.5₽ за 1К выходных).
+#   "off"  — пытаемся подавить рассуждения (дёшево и предсказуемо);
+#   "keep" — оставляем как есть, если потолок задан с запасом на рассуждения.
+_REASONING = os.getenv("AI_REASONING", "off").lower()
+
+# Пред-оценка стоимости для бюджет-гарда. Раньше считалась по ПОТОЛКУ, т.е.
+# резервировала 2.25₽ на batch при потолке 900, даже если реальный ответ — 50
+# токенов. Пока рассуждения съедали весь потолок, оценка случайно совпадала с
+# фактом; после починки она завышена в 10-20 раз и начнёт отказывать при живом
+# остатке. Берём реалистичную долю потолка; фактический расход всё равно
+# дописывается по usage после вызова, поэтому перерасход ограничен одним вызовом.
+_OUT_EST_FACTOR = float(os.getenv("AI_OUT_EST_FACTOR", "0.35"))
+
+
+def _extract_text(data: dict, provider: str) -> tuple[str, dict]:
+    """Достать текст ответа, где бы провайдер его ни положил.
+
+    Возвращает (текст, диагностика). Диагностика попадает в журнал попыток и
+    отвечает на вопрос «ответ пустой или мы читаем не то поле».
+
+    Раньше код брал ровно одно место: data["choices"][0]["message"]["content"]
+    для OpenAI-формата и data["content"][0]["text"] для Anthropic. Первое даёт
+    пустоту, когда весь бюджет ушёл в reasoning_content; второе падает или
+    возвращает мусор, если нулевой блок — thinking, а не text.
+    """
+    meta: dict = {"text_source": None, "resp_keys": None}
+    try:
+        if provider == "anthropic":
+            blocks = data.get("content") or []
+            meta["resp_keys"] = [b.get("type") for b in blocks if isinstance(b, dict)]
+            # Собираем ВСЕ текстовые блоки: при включённых рассуждениях нулевым
+            # блоком идёт thinking, и брать content[0] нельзя.
+            texts = [b.get("text") or "" for b in blocks
+                     if isinstance(b, dict) and b.get("type") == "text"]
+            joined = "".join(texts).strip()
+            if joined:
+                meta["text_source"] = "content.text"
+                return joined, meta
+            # Ответа нет — но, возможно, есть рассуждения: покажем их в диагностике.
+            think = "".join(b.get("thinking") or "" for b in blocks
+                            if isinstance(b, dict) and b.get("type") == "thinking")
+            if think.strip():
+                meta["text_source"] = "thinking_only"
+                return "", meta
+            return "", meta
+
+        msg = ((data.get("choices") or [{}])[0].get("message") or {})
+        meta["resp_keys"] = sorted(msg.keys())
+        # Порядок важен: сначала штатное поле, затем места, куда прокси кладёт
+        # рассуждения. JSON иногда оказывается именно там, если модель не успела
+        # переключиться на «чистовой» ответ.
+        for key in ("content", "reasoning_content", "reasoning"):
+            val = msg.get(key)
+            if isinstance(val, str) and val.strip():
+                meta["text_source"] = key
+                return val, meta
+        return "", meta
+    except Exception as e:      # noqa: BLE001 — форма ответа провайдера непредсказуема
+        meta["text_source"] = f"error: {str(e)[:80]}"
+        return "", meta
+
 
 # ─── БЮДЖЕТ: жёсткий дневной лимит расхода на Claude ──────────────────────────
 # Считаем стоимость каждого вызова (по usage от провайдера, иначе оценкой) и
@@ -125,6 +191,8 @@ class ClaudeAgent:
                 "system": system,
                 "messages": [{"role": "user", "content": user}],
             }
+            if _REASONING == "off":
+                payload["thinking"] = {"type": "disabled"}
         else:
             url = f"{self.base_url}/chat/completions"
             payload = {
@@ -135,16 +203,25 @@ class ClaudeAgent:
                     {"role": "user", "content": user},
                 ],
             }
+            if _REASONING == "off":
+                # Разные прокси понимают разные ключи. Незнакомые поля обычно
+                # игнорируются; если провайдер отвечает 400 — ниже повторяем
+                # запрос без них, чтобы подавление не ломало работу совсем.
+                payload["reasoning_effort"] = "none"
+                payload["thinking"] = {"type": "disabled"}
 
         # ── БЮДЖЕТ-ГАРД: не выходим за дневной лимит ──────────────────────────
         _limit, p_in, p_out, _res = _prices()
         est_in = int((len(system) + len(user)) / 2.5)          # ~2.5 симв/токен (рус.)
-        est_cost = (est_in * p_in + max_tokens * p_out) / 1000  # худший случай
+        est_out = max(64, int(max_tokens * _OUT_EST_FACTOR))   # реалистично, не потолок
+        est_cost = (est_in * p_in + est_out * p_out) / 1000
         # Телеметрия вызова для журнала попыток: цена и токены пишутся в БД, чтобы
         # было видно «₽ за сигнал» и обрезку JSON (из-за неё раньше молча не было
         # сигналов — max_tokens не хватало на ответ).
         self.last_call = {"cost_rub": None, "tokens_in": None, "tokens_out": None,
-                          "max_tokens": max_tokens, "truncated": False, "error": None}
+                          "max_tokens": max_tokens, "truncated": False, "error": None,
+                          "reasoning_suppressed": (_REASONING == "off"),
+                          "text_source": None, "resp_keys": None, "raw_len": None}
         left = await budget_left()
         if left < est_cost:
             self.last_call["error"] = f"budget_guard: остаток {left:.2f}₽ < {est_cost:.2f}₽"
@@ -155,6 +232,16 @@ class ClaudeAgent:
         try:
             async with httpx.AsyncClient(timeout=60) as client:
                 resp = await client.post(url, headers=headers, json=payload)
+                # Провайдер может не знать полей подавления рассуждений. Тогда это
+                # 400, и лучше повторить чистый запрос, чем остаться без ответа.
+                if resp.status_code == 400 and _REASONING == "off":
+                    stripped = {k: v for k, v in payload.items()
+                                if k not in ("reasoning_effort", "thinking")}
+                    if stripped != payload:
+                        logger.info("AI: провайдер отклонил подавление рассуждений — "
+                                    "повтор без reasoning_effort/thinking")
+                        self.last_call["reasoning_suppressed"] = "rejected_400"
+                        resp = await client.post(url, headers=headers, json=stripped)
                 if resp.status_code != 200:
                     raise RuntimeError(f"AI API error {resp.status_code}: {resp.text[:300]}")
                 data = resp.json()
@@ -187,10 +274,27 @@ class ClaudeAgent:
         except Exception:
             pass
 
-        if self.provider == "anthropic":
-            return data["content"][0]["text"]
-        else:
-            return data["choices"][0]["message"]["content"]
+        text, meta = _extract_text(data, self.provider)
+        self.last_call.update(meta)
+        self.last_call["raw_len"] = len(text or "")
+
+        # Самый дорогой сценарий: токены израсходованы и оплачены, а ответа нет.
+        # Именно так 29.07 сгорело 30₽ при нуле сигналов. Логируем громко и с
+        # разбором, иначе это выглядит как «Claude решил, что сетапов нет».
+        if not (text or "").strip():
+            logger.error(
+                "💸 AI: ответ ПУСТОЙ при tokens_out=%s (потолок %s). Поля ответа: %s. "
+                "Похоже, бюджет вывода израсходован рассуждениями. "
+                "Лечится AI_REASONING=off, сменой модели на нерассуждающую "
+                "или потолком с запасом на рассуждения.",
+                self.last_call.get("tokens_out"), max_tokens,
+                self.last_call.get("resp_keys"))
+        elif meta.get("text_source") not in (None, "content", "content.text"):
+            # Ответ нашёлся, но не в штатном поле — знать об этом полезно.
+            logger.warning("AI: текст найден в поле %s, а не в content",
+                           meta.get("text_source"))
+
+        return text
 
     async def batch_scan(self, market_context: str, briefs: list,
                          max_tokens: int = 1600) -> list:
@@ -278,6 +382,18 @@ class ClaudeAgent:
                     logger.info("batch_scan: Claude вернул пустой массив — сетапов нет")
             return out
         except Exception as ex:
+            # Раньше здесь терялась вся диагностика: raw_head пишется только на
+            # успешной ветке выше, поэтому бюджет-гард, ошибка HTTP и неожиданная
+            # форма ответа выглядели в журнале одинаково — «watch:0», то есть
+            # неотличимо от честного решения «сетапов нет».
+            try:
+                if isinstance(self.last_call, dict):
+                    self.last_call.setdefault("error", str(ex)[:300])
+                    self.last_call["batch_failed"] = True
+                    self.last_call.setdefault("raw_head", "")
+                    self.last_call.setdefault("raw_len", 0)
+            except Exception:
+                pass
             logger.warning(f"batch_scan failed: {ex}")
         return []
 
@@ -371,16 +487,56 @@ class ClaudeAgent:
                 ],
             }
 
-        async with httpx.AsyncClient(timeout=90) as client:
-            resp = await client.post(url, headers=headers, json=payload)
-            if resp.status_code != 200:
-                raise RuntimeError(f"AI Vision error {resp.status_code}: {resp.text[:300]}")
-            data = resp.json()
+        # ── БЮДЖЕТ-ГАРД для vision ────────────────────────────────────────────
+        # Раньше его здесь НЕ БЫЛО: vision-вызовы тратили деньги мимо дневного
+        # лимита и мимо журнала, хотя докстринг модуля обещает, что лимит
+        # «физически не может быть превышен». Картинка в base64 — это ощутимый
+        # вход, так что дыра была не косметической.
+        _limit, p_in, p_out, _res = _prices()
+        est_in = int((len(system) + len(user) + len(image_b64 or "")) / 2.5)
+        est_out = max(64, int(max_tokens * _OUT_EST_FACTOR))
+        est_cost = (est_in * p_in + est_out * p_out) / 1000
+        self.last_call = {"cost_rub": None, "tokens_in": None, "tokens_out": None,
+                          "max_tokens": max_tokens, "truncated": False, "error": None,
+                          "stage_hint": "vision", "text_source": None,
+                          "resp_keys": None, "raw_len": None}
+        left = await budget_left()
+        if left < est_cost:
+            self.last_call["error"] = f"budget_guard(vision): остаток {left:.2f}₽ < {est_cost:.2f}₽"
+            raise RuntimeError(
+                f"AI budget guard (vision): остаток {left:.2f}₽ < оценки {est_cost:.2f}₽ "
+                f"(дневной лимит {_limit:.0f}₽) — вызов пропущен")
 
-        if self.provider == "anthropic":
-            return data["content"][0]["text"]
-        else:
-            return data["choices"][0]["message"]["content"]
+        try:
+            async with httpx.AsyncClient(timeout=90) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+                if resp.status_code != 200:
+                    raise RuntimeError(f"AI Vision error {resp.status_code}: {resp.text[:300]}")
+                data = resp.json()
+        except Exception as e:
+            self.last_call["error"] = str(e)[:300]
+            raise
+
+        try:
+            u = data.get("usage") or {}
+            in_tok = int(u.get("prompt_tokens") or u.get("input_tokens") or est_in)
+            out_tok = int(u.get("completion_tokens") or u.get("output_tokens") or 0)
+            cost = (in_tok * p_in + out_tok * p_out) / 1000
+            self.last_call.update({"cost_rub": round(cost, 4),
+                                   "tokens_in": in_tok, "tokens_out": out_tok})
+            await _budget_add(cost)
+        except Exception:
+            self.last_call["cost_rub"] = round(est_cost, 4)
+            await _budget_add(est_cost)
+
+        text, meta = _extract_text(data, self.provider)
+        self.last_call.update(meta)
+        self.last_call["raw_len"] = len(text or "")
+        if not (text or "").strip():
+            logger.error("💸 AI vision: ответ ПУСТОЙ при tokens_out=%s (потолок %s), поля: %s",
+                         self.last_call.get("tokens_out"), max_tokens,
+                         self.last_call.get("resp_keys"))
+        return text
 
     async def analyze_chart(self, ticker: str, image_b64: str,
                             sentiment_index: Optional[float] = None,
