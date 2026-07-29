@@ -312,19 +312,35 @@ def _session_over(sig_date, now: datetime) -> bool:
 
 async def intraday_outcome(ticker: str, start_iso: str, direction: str,
                            entry: float, stop: float, target: float,
-                           now_utc: Optional[datetime] = None) -> Optional[dict]:
+                           now_utc: Optional[datetime] = None,
+                           horizon_hours: Optional[float] = None) -> Optional[dict]:
     """
     МНОГОНОГОЕ ведение интрадей-сделки по ПУТИ цены (в рамках фикс-риска 1%, без
     расширения начального риска). Оценивается на КАЖДОМ тике; исходы:
       • "stop"      — выбито по начальному стопу −1R (до частичной фиксации);
       • "breakeven" — стоп ушёл в безубыток (+BE_TRIGGER_R достигнут), затем выбит ~0R;
       • "target"    — достигнута цель T1: банкуем PARTIAL_FRAC, остаток трейлим;
-      • "session"   — ни цель, ни стоп; сессия закрылась → выход остатка по close;
+      • "session"   — ни цель, ни стоп; окно истекло → выход остатка по close;
       • "pending"   — сделка ещё в игре (частично может быть закрыта) → НЕ финализируем.
+
+    ОКНО ОЦЕНКИ. Если задан `horizon_hours`, путь цены идёт от сигнала до
+    истечения горизонта и МОЖЕТ пересекать сессии. Раньше окно жёстко
+    ограничивалось МСК-сутками сигнала, из-за чего сценарий, выданный вечером на
+    следующую сессию, не мог быть оценён вообще: до конца вечерней сессии цель и
+    стоп обычно не трогают, оценщик возвращал pending, и сделка уходила в
+    легаси-бэкстоп без расчёта R. Для советнического режима это делало метрику в
+    R недостижимой. Без `horizon_hours` поведение прежнее — окно в пределах суток
+    сигнала.
+
+    ГЭПЫ. Раз окно пересекает сессии, выход по стопу считается по ХУДШЕЙ из двух
+    цен: сам стоп и открытие бара. Если бумага открылась ниже стопа (для лонга),
+    реальный выход происходит по открытию, а не по стопу. Иначе овернайт-убытки
+    систематически занижались бы — а это ровно тот самый случай, когда система
+    льстит себе на деньгах.
 
     Управление (параметры MGMT_* в settings): при +BE_TRIGGER_R стоп→вход; на T1
     фиксируем PARTIAL_FRAC и остаток ведём чандельер-трейлом (peak − TRAIL_ATR×ATR,
-    не ниже BE) до конца сессии. Итоговый R — ВЗВЕШЕННЫЙ по ногам выхода.
+    не ниже BE) до конца окна. Итоговый R — ВЗВЕШЕННЫЙ по ногам выхода.
     Касание — по intrabar high/low; в одном баре стоп имеет приоритет над целью.
     Возвращает dict или None (нет данных → бэкстоп по close в вызывающем коде).
     """
@@ -334,16 +350,29 @@ async def intraday_outcome(ticker: str, start_iso: str, direction: str,
     if start is None:
         return None
     now = now_utc or datetime.now(timezone.utc)
-    data = await fetch_intraday(ticker, tf_min=5, hours=48)
+    # Окно выборки свечей должно покрывать весь горизонт плюс запас на выходные.
+    fetch_hours = 48
+    deadline = None
+    if horizon_hours:
+        deadline = start + timedelta(hours=float(horizon_hours))
+        age_h = (now - start).total_seconds() / 3600.0
+        fetch_hours = int(max(48, min(720, age_h + float(horizon_hours) + 24)))
+    data = await fetch_intraday(ticker, tf_min=5, hours=fetch_hours)
     if not data or not data.get("close"):
         return None
     dates = data.get("dates", [])
     highs, lows, closes = data.get("high", []), data.get("low", []), data.get("close", [])
+    opens = data.get("open", []) or closes
     sig_date = _msk_date(start)
 
-    # Свечи ПОСЛЕ сигнала, в пределах того же МСК-дня (вся сессия: main+evening).
-    path = [i for i, ts in enumerate(dates)
-            if (dt := _parse_dt(ts)) is not None and dt >= start and _msk_date(dt) == sig_date]
+    # Свечи ПОСЛЕ сигнала: до истечения горизонта (может пересекать сессии) либо,
+    # если горизонт не задан, в пределах МСК-суток сигнала — прежнее поведение.
+    if deadline is not None:
+        path = [i for i, ts in enumerate(dates)
+                if (dt := _parse_dt(ts)) is not None and start <= dt <= deadline]
+    else:
+        path = [i for i, ts in enumerate(dates)
+                if (dt := _parse_dt(ts)) is not None and dt >= start and _msk_date(dt) == sig_date]
 
     R_unit = abs(entry - stop)          # 1R = |вход − стоп| = 1% входа
     if R_unit <= 0:
@@ -372,6 +401,12 @@ async def intraday_outcome(ticker: str, start_iso: str, direction: str,
     mfe_r = 0.0               # max favorable excursion, R
     resolved = False
     outcome = None
+    # Касалась ли цена уровня входа. Пишется как ДАННЫЕ и ничего не блокирует:
+    # решение «учитывать ли незаполненную лимитку в деньгах» принимает владелец.
+    # Но не записать это — значит потерять информацию навсегда, а по ней потом
+    # видно, чего стоила статистика: сделка, которая не открылась, не приносит и
+    # не теряет денег, как бы удачно ни сложилось направление.
+    entry_touched = False
 
     for i in path:
         hi = highs[i] if i < len(highs) else closes[i]
@@ -379,6 +414,10 @@ async def intraday_outcome(ticker: str, start_iso: str, direction: str,
         fav = hi if long else lo          # экстремум в нашу сторону в этом баре
         adv = lo if long else hi          # экстремум против нас
         mfe_r = max(mfe_r, r_of(fav))
+        # Диапазон бара накрыл уровень входа — заявка исполнилась бы независимо
+        # от того, подходила цена сверху (стоп-заявка) или снизу (лимитка).
+        if not entry_touched and lo <= entry <= hi:
+            entry_touched = True
 
         # 1) Неблагоприятно: стоп/трейл (тест по стопу, выставленному ПРОШЛЫМИ барами)
         stop_hit = (adv <= cur_stop) if long else (adv >= cur_stop)
@@ -389,7 +428,12 @@ async def intraday_outcome(ticker: str, start_iso: str, direction: str,
                 outcome = "breakeven"      # BE-стоп до частичной фиксации, ~0R
             else:
                 outcome = "target"         # T1 уже сняли, остаток вышел по трейлу
-            legs.append((rem, r_of(cur_stop), cur_stop, "stop" if outcome != "target" else "trail"))
+            # ГЭП: если бар ОТКРЫЛСЯ хуже стопа, выход происходит по открытию, а
+            # не по стопу. Без этого овернайт-убытки занижаются — окно оценки
+            # теперь пересекает сессии, поэтому учитывать обязательно.
+            op = opens[i] if i < len(opens) else closes[i]
+            fill = min(cur_stop, op) if long else max(cur_stop, op)
+            legs.append((rem, r_of(fill), fill, "stop" if outcome != "target" else "trail"))
             rem = 0.0
             resolved = True
             break
@@ -427,11 +471,16 @@ async def intraday_outcome(ticker: str, start_iso: str, direction: str,
             cur_stop = max(cur_stop, trail) if long else min(cur_stop, trail)
 
     if not resolved:
-        # Не выбито и цель (полностью) не отработала. Финализируем ТОЛЬКО если сессия
-        # закрылась; иначе сделка ещё в игре (возможно, частично снята) → pending.
-        if not _session_over(sig_date, now):
+        # Не выбито и цель (полностью) не отработала. Финализируем ТОЛЬКО когда
+        # окно оценки истекло; иначе сделка ещё в игре → pending.
+        # При заданном горизонте окно закрывает он, а не конец суток сигнала:
+        # иначе вечерний сценарий на следующую сессию финализировался бы раньше,
+        # чем эта сессия вообще начнётся.
+        window_over = (now >= deadline) if deadline is not None else _session_over(sig_date, now)
+        if not window_over:
             return {"outcome": "pending", "bars": len(path),
-                    "mfe_r": round(mfe_r, 3), "partial": partial_done}
+                    "mfe_r": round(mfe_r, 3), "partial": partial_done,
+                    "entry_touched": entry_touched}
         if not path:
             return None                    # сессия закрыта, но данных нет → бэкстоп
         last_close = closes[path[-1]]
@@ -455,4 +504,10 @@ async def intraday_outcome(ticker: str, start_iso: str, direction: str,
                  for f, r, p, w in legs],
         "bars": len(path),
         "source": data.get("_source"),
+        # Данные, а не запрет: касалась ли цена уровня входа за окно оценки.
+        # Незаполненная заявка не приносит и не теряет денег, каким бы верным ни
+        # оказалось направление, — по этому полю потом видно, чего стоила
+        # статистика в рублях.
+        "entry_touched": entry_touched,
+        "window_hours": float(horizon_hours) if horizon_hours else None,
     }

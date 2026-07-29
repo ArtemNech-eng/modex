@@ -131,13 +131,32 @@ def validate_scenario(payload: dict) -> tuple:
     return errors, normalized
 
 
-def _default_horizon_hours() -> int:
-    """Горизонт как во внутреннем пути: созревание к 08:00 МСК следующего дня,
-    когда путь всей сессии закрыт и исход виден."""
-    msk_now = datetime.now(timezone.utc) + timedelta(hours=3)
-    due = (msk_now + timedelta(days=1)).replace(hour=8, minute=0, second=0,
-                                                microsecond=0)
-    return max(1, int((due - msk_now).total_seconds() // 3600) + 1)
+def _default_horizon_hours(msk_now: Optional[datetime] = None) -> int:
+    """Горизонт до конца той сессии, в которую сделку МОЖНО исполнить.
+
+    Прежняя логика целилась в 08:00 следующего дня. Для сигнала, выданного днём,
+    это верно: остаток сессии плюс вечерняя укладываются в окно. Но для сигнала,
+    выданного ВЕЧЕРОМ после закрытия, окно истекало в 08:00 — то есть РАНЬШЕ, чем
+    в 10:00 откроется сессия, в которую его вообще можно торговать. Сценарий
+    гарантированно истекал неисполнимым, а оценщик не видел ни одной свечи
+    нужной сессии.
+
+    Правило теперь по фазе суток МСК:
+      • до 10:00      — торгуем сегодняшнюю сессию, окно до 23:50 сегодня;
+      • 10:00-18:40   — сессия идёт, окно до 08:00 следующего дня (как было);
+      • после 18:40   — торгуем СЛЕДУЮЩУЮ сессию, окно до 23:50 следующего дня.
+    """
+    now = msk_now or (datetime.now(timezone.utc) + timedelta(hours=3))
+    mod = now.hour * 60 + now.minute
+    if mod < 10 * 60:                                  # раннее утро
+        due = now.replace(hour=23, minute=50, second=0, microsecond=0)
+    elif mod <= 18 * 60 + 40:                          # сессия идёт
+        due = (now + timedelta(days=1)).replace(hour=8, minute=0,
+                                               second=0, microsecond=0)
+    else:                                              # вечер, торгуем завтра
+        due = (now + timedelta(days=1)).replace(hour=23, minute=50,
+                                               second=0, microsecond=0)
+    return max(1, int((due - now).total_seconds() // 3600) + 1)
 
 
 async def submit(payload: dict) -> dict:

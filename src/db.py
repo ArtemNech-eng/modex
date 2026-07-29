@@ -984,6 +984,35 @@ async def accuracy_stats(ticker: Optional[str] = None) -> dict:
     }
 
 
+async def merge_prediction_context(pred_id: int, extra: dict) -> bool:
+    """Дописать поля в снимок контекста прогноза, не затирая существующие.
+
+    Нужно, чтобы результаты оценки (например, касалась ли цена входа) ложились
+    рядом с обстоятельствами сигнала, а не в отдельную таблицу: пост-мортем и
+    аудит читают именно контекст. Слияние, а не перезапись — иначе оценка стёрла
+    бы снимок на момент сигнала, и разбор потерял бы половину смысла.
+    """
+    if not extra:
+        return False
+    async with async_session() as session:
+        pred = await session.get(Prediction, pred_id)
+        if pred is None:
+            return False
+        ctx = {}
+        if pred.context_json:
+            try:
+                ctx = json.loads(pred.context_json) or {}
+            except Exception:
+                ctx = {}
+        ctx.update({k: v for k, v in extra.items() if v is not None})
+        try:
+            pred.context_json = json.dumps(ctx, ensure_ascii=False)
+        except Exception:
+            return False
+        await session.commit()
+        return True
+
+
 HUMAN_DECISIONS = ("accept", "reject", "wait")
 
 # Корзины технического score. Подпись «фейд верхней границы диапазона» — это

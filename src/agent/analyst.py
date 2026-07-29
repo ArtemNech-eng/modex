@@ -850,9 +850,13 @@ async def evaluate_due_predictions() -> dict:
         if not p.created_at:
             continue
         try:
+            # Горизонт передаём обязательно: без него окно оценки схлопывается
+            # до МСК-суток сигнала, и вечерний сценарий на следующую сессию
+            # оценить невозможно — цель и стоп до 23:50 обычно не трогают.
             oc = await ia.intraday_outcome(
                 p.ticker, p.created_at.isoformat(), p.direction,
-                float(p.entry), float(p.stop), float(p.target))
+                float(p.entry), float(p.stop), float(p.target),
+                horizon_hours=p.horizon_hours)
         except Exception as e:
             logger.debug(f"intraday_outcome {p.ticker}: {e}")
             oc = None
@@ -860,6 +864,16 @@ async def evaluate_due_predictions() -> dict:
             continue  # ещё в игре / нет данных — оставляем открытым
         rr = oc.get("realized_r")
         correct = bool(rr is not None and rr > 0)  # прибыльна в R → «верна»
+        # Факт касания входа — в снимок контекста, как данные. Направление
+        # оценивается как раньше (владелец так решил: верно прочитанный тренд
+        # ценен сам по себе), но информация о незаполненной заявке сохраняется.
+        try:
+            if oc.get("entry_touched") is not None:
+                await db.merge_prediction_context(
+                    p.id, {"entry_touched": bool(oc.get("entry_touched")),
+                           "eval_window_hours": oc.get("window_hours")})
+        except Exception as _e:
+            logger.debug(f"entry_touched {p.ticker}: {_e}")
         await db.evaluate_prediction(
             p.id, oc["realized_price"], oc["realized_return"], correct,
             outcome=oc["outcome"], realized_r=rr,
