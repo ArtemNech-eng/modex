@@ -243,3 +243,26 @@ MOEX_TICKERS = {
     "NKNC": "Нижнекамскнефтехим",
     "LSRG": "ЛСР",
 }
+
+
+# ─── RISK ENGINE: независимый контур управления риском ────────────────────────
+# Эти числа НЕ может переопределить Claude: движок в src/risk/ имеет приоритет
+# над его решениями. Агент предлагает сценарий — движок решает размер и право.
+#
+# Почему 0.25% на сделку в фазе обучения. Симуляция 20 000 прогонов, 50 сделок
+# в месяц, год: при НУЛЕВОМ эйдже риск 0.25% даёт медиану −0.3% и нулевую
+# вероятность потери половины счёта, а 1.33% — медианную просадку 38% и 6.6%
+# вероятность потерять половину. При эйдже +0.30R: 0.25% -> +56% за год,
+# 1.33% -> +855%. То есть размер ставки — это ставка на существование эйджа,
+# а он пока НЕ ИЗМЕРЕН (r_sample = 0). Поднимать после 40-50 закрытых сделок
+# с подтверждённым expectancy_r.
+RISK_ACCOUNT_RUB = float(os.getenv("RISK_ACCOUNT_RUB", "200000"))
+RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.25"))       # % счёта на сделку
+RISK_MAX_POSITION_PCT = float(os.getenv("RISK_MAX_POSITION_PCT", "25"))   # экспозиция на позицию
+RISK_MAX_TOTAL_EXPOSURE_PCT = float(os.getenv("RISK_MAX_TOTAL_EXPOSURE_PCT", "50"))
+RISK_DAILY_LOSS_R = float(os.getenv("RISK_DAILY_LOSS_R", "3"))            # стоп дня в R
+RISK_WEEKLY_LOSS_R = float(os.getenv("RISK_WEEKLY_LOSS_R", "6"))          # стоп недели в R
+RISK_MAX_TRADES_DAY = int(os.getenv("RISK_MAX_TRADES_DAY", "3"))
+RISK_MAX_OPEN_POSITIONS = int(os.getenv("RISK_MAX_OPEN_POSITIONS", "2"))
+RISK_MAX_PER_SECTOR = int(os.getenv("RISK_MAX_PER_SECTOR", "1"))          # неактивно без справочника секторов
+RISK_KILL_SWITCH_DD_PCT = float(os.getenv("RISK_KILL_SWITCH_DD_PCT", "5"))
