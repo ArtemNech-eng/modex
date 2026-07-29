@@ -374,6 +374,12 @@ class TechnicalAnalysis:
     trade_plan: dict     # уровни входа/выхода
     candles_used: int
     updated_at: str
+    # Объём: без него нельзя отличить пробой на интересе от пустого движения.
+    rel_volume: Optional[float] = None      # последний бар / среднее предыдущих
+    rel_turnover: Optional[float] = None    # то же по обороту в рублях
+    volume_label: Optional[str] = None      # всплеск / выше среднего / норма / ниже
+    last_volume: Optional[float] = None
+    last_turnover: Optional[float] = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -385,11 +391,70 @@ class TechnicalAnalysis:
         return d
 
 
+
+def volume_stats(volumes: Optional[list], values: Optional[list] = None,
+                 lookback: int = 20) -> dict:
+    """Относительный объём: последний бар против среднего предыдущих.
+
+    Возвращает rel_volume, rel_turnover и словесную метку. Нужен для базовой
+    проверки любого сетапа: пробой на объёме и пробой на пустоте — это разные
+    события, и без этого числа их не отличить. И ваша архитектура, и стандартный
+    Quant Engine требуют relative volume, но раньше он был недоступен, потому что
+    fetch_candles выбрасывал объём при разборе ответа MOEX.
+
+    Оборот в рублях (`value`) считается наравне со штуками: он сравним между
+    бумагами разной цены, тогда как штуки — нет.
+
+    ВАЖНАЯ ОГОВОРКА. Последний бар может быть НЕЗАВЕРШЁННЫМ (сессия ещё идёт).
+    Тогда его объём сравнивается с полными предыдущими днями и выходит
+    заниженным. Поле `last_bar_may_be_partial` предупреждает об этом, чтобы
+    низкий rel_volume в середине дня не читался как отсутствие интереса.
+    """
+    def _rel(series):
+        if not series:
+            return None
+        clean = [(i, v) for i, v in enumerate(series) if v is not None and v > 0]
+        if len(clean) < 3:
+            return None
+        last = clean[-1][1]
+        prior = [v for _i, v in clean[:-1]][-lookback:]
+        if not prior:
+            return None
+        avg = sum(prior) / len(prior)
+        if avg <= 0:
+            return None
+        return round(last / avg, 2)
+
+    rv = _rel(volumes)
+    rt = _rel(values)
+    ref = rt if rt is not None else rv
+    if ref is None:
+        label = None
+    elif ref >= 2.0:
+        label = "всплеск объёма"
+    elif ref >= 1.3:
+        label = "выше среднего"
+    elif ref >= 0.7:
+        label = "норма"
+    else:
+        label = "ниже среднего"
+    return {
+        "rel_volume": rv,
+        "rel_turnover": rt,
+        "volume_label": label,
+        "last_volume": (volumes or [None])[-1] if volumes else None,
+        "last_turnover": (values or [None])[-1] if values else None,
+        "last_bar_may_be_partial": True,
+    }
+
+
 def compute_from_series(
     ticker: str,
     closes: list[float],
     highs: Optional[list[float]] = None,
     lows: Optional[list[float]] = None,
+    volumes: Optional[list] = None,
+    values: Optional[list] = None,
 ) -> TechnicalAnalysis:
     """
     Полный технический анализ по рядам цен, с учётом режима рынка.
@@ -475,12 +540,20 @@ def compute_from_series(
 
     trade_plan = compute_levels(closes, highs, lows, signal, s20, regime=regime, range_pos=rpos) if price else {}
 
+    vs = volume_stats(volumes, values)
+    if vs.get("volume_label"):
+        _ref = vs.get("rel_turnover") or vs.get("rel_volume")
+        reasons.append(f"Объём: {vs['volume_label']} ({_ref}× среднего)")
+
     return TechnicalAnalysis(
         ticker=ticker, price=price, sma20=s20, sma50=s50, rsi14=r, macd_hist=hist,
         change_1d=ch1, change_7d=ch7, volatility=vol,
         regime=regime, range_position=rpos, adx=reg["adx"], strategy=strategy,
         signal=signal, score=score, reasons=reasons, trade_plan=trade_plan,
         candles_used=len(closes), updated_at=datetime.now(timezone.utc).isoformat(),
+        rel_volume=vs.get("rel_volume"), rel_turnover=vs.get("rel_turnover"),
+        volume_label=vs.get("volume_label"),
+        last_volume=vs.get("last_volume"), last_turnover=vs.get("last_turnover"),
     )
 
 
@@ -511,7 +584,12 @@ async def fetch_candles(ticker: str, days: int = 120) -> dict:
     candles = data.get("candles", {})
     columns = candles.get("columns", [])
     rows = candles.get("data", [])
-    out = {"dates": [], "open": [], "high": [], "low": [], "close": []}
+    # MOEX ISS отдаёт колонки open/close/high/low/value/volume/begin/end.
+    # volume и value РАНЬШЕ ВЫБРАСЫВАЛИСЬ при разборе, хотя приходили в каждом
+    # ответе. Без них нельзя отличить пробой на объёме от пустого движения —
+    # базовая проверка любого сетапа была недоступна.
+    out = {"dates": [], "open": [], "high": [], "low": [], "close": [],
+           "volume": [], "value": []}
     if "close" not in columns:
         return out
     ci = columns.index("close")
@@ -519,6 +597,8 @@ async def fetch_candles(ticker: str, days: int = 120) -> dict:
     hi = columns.index("high") if "high" in columns else ci
     li = columns.index("low") if "low" in columns else ci
     bi = columns.index("begin") if "begin" in columns else None
+    vi = columns.index("volume") if "volume" in columns else None
+    vali = columns.index("value") if "value" in columns else None
     for row in rows:
         if row[ci] is None:
             continue
@@ -527,6 +607,8 @@ async def fetch_candles(ticker: str, days: int = 120) -> dict:
         out["high"].append(row[hi] if row[hi] is not None else row[ci])
         out["low"].append(row[li] if row[li] is not None else row[ci])
         out["dates"].append(row[bi] if bi is not None else "")
+        out["volume"].append(row[vi] if (vi is not None and row[vi] is not None) else None)
+        out["value"].append(row[vali] if (vali is not None and row[vali] is not None) else None)
     return out
 
 
@@ -537,16 +619,26 @@ async def fetch_closes(ticker: str, days: int = 120) -> list[float]:
 
 
 async def analyze_ticker(ticker: str, days: int = 120) -> Optional[TechnicalAnalysis]:
-    """Полный технический анализ тикера по данным MOEX. None при ошибке/нехватке данных."""
+    """Полный технический анализ тикера по данным MOEX. None при ошибке/нехватке данных.
+
+    Берём ПОЛНЫЕ свечи, а не только (close, high, low): объём и оборот нужны для
+    относительного объёма. Раньше здесь вызывался fetch_ohlc, который отбрасывал
+    всё кроме трёх рядов, поэтому объём до анализа не доходил вообще — и отличить
+    пробой на интересе от пустого движения было нечем.
+    """
     try:
-        closes, highs, lows = await fetch_ohlc(ticker, days=days)
+        full = await fetch_candles(ticker, days=days)
     except Exception as e:
         logger.warning(f"MOEX ISS: не удалось загрузить свечи {ticker}: {e}")
         return None
+    closes = full.get("close") or []
     if len(closes) < 30:
         logger.info(f"MOEX ISS: мало свечей для {ticker} ({len(closes)})")
         return None
-    return compute_from_series(ticker.upper(), closes, highs, lows)
+    return compute_from_series(ticker.upper(), closes,
+                               full.get("high"), full.get("low"),
+                               volumes=full.get("volume"),
+                               values=full.get("value"))
 
 
 # ─── Структура графика: свинги, S/R-пивоты, тренд, RSI-дивергенция ────────────

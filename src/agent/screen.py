@@ -163,6 +163,10 @@ async def screen_ticker(ticker: str, aggregator) -> Optional[dict]:
         "regime": (technical or {}).get("regime"),
         "adx": (technical or {}).get("adx"),
         "rsi": (technical or {}).get("rsi"),
+        # Относительный объём: пробой на интересе или на пустоте. Раньше поля не
+        # было, потому что объём выбрасывался при разборе свечей MOEX.
+        "rvol": (technical or {}).get("rel_turnover") or (technical or {}).get("rel_volume"),
+        "vlabel": (technical or {}).get("volume_label"),
         "setup": (intraday or {}).get("setup"),
         "orb_hi": _lv.get("or_high"),
         "orb_lo": _lv.get("or_low"),
