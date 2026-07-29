@@ -715,6 +715,12 @@ async def analyze(ticker: str, aggregator, save: bool = True,
                 "rsi": technical_block.get("rsi") if technical_block else None,
                 "technical_score": technical_score,
                 "strategy": tech.strategy if tech else None,
+                # Параметры детектора режима — сырьё для /api/regime-audit.
+                # Без них нельзя проверить, не назвал ли детектор тренд
+                # боковиком: порог ADX >= 25 пропускает плавный рост, и
+                # стратегия боковика начинает шортить хаи растущего рынка.
+                "range_position": getattr(tech, "range_position", None) if tech else None,
+                "adx": getattr(tech, "adx", None) if tech else None,
                 "regime_claude": (claude_result or {}).get("regime") if claude_result else None,
                 "confluence_score": (claude_result or {}).get("confluence_score") if claude_result else None,
                 "setup": (claude_result or {}).get("setup") if claude_result else None,

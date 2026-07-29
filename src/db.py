@@ -986,6 +986,181 @@ async def accuracy_stats(ticker: Optional[str] = None) -> dict:
 
 HUMAN_DECISIONS = ("accept", "reject", "wait")
 
+# Корзины технического score. Подпись «фейд верхней границы диапазона» — это
+# score от −0.5 до −0.9: в боковике при range_position ≥ 0.70 правило голосует
+# в шорт с силой 0.5 + (rpos − 0.70), обрезанной на 0.9 (src/analysis/technical.py).
+_SCORE_BUCKETS = (
+    (-1.01, -0.70, "сильный шорт (score ≤ −0.70)"),
+    (-0.70, -0.50, "фейд верха диапазона (−0.70…−0.50)"),
+    (-0.50, -0.20, "слабый шорт (−0.50…−0.20)"),
+    (-0.20, 0.20, "нейтрально (−0.20…+0.20)"),
+    (0.20, 0.50, "слабый лонг (+0.20…+0.50)"),
+    (0.50, 1.01, "сильный лонг (score > +0.50)"),
+)
+
+
+def analyze_regime_audit(rows: list) -> dict:
+    """Аудит детектора режима: совпадала ли метка с фактическим движением.
+
+    Чистая функция — покрывается тестами. Ожидает список словарей с полями
+    realized_return, technical_score, regime, range_position, adx, created_at.
+
+    ЗАЧЕМ. Порог `ADX >= 25` в technical.py объявляет трендом только выраженное
+    движение; плавный устойчивый рост держит ADX в низких двадцатых и получает
+    метку «боковик». Дальше стратегия боковика фадит верхнюю границу — то есть
+    шортит хаи растущего рынка. Этот отчёт показывает, происходит ли так на
+    фактических данных, и позволяет проверить любую правку детектора.
+
+    ВАЖНО: функция сама предупреждает о своей выборке. Один режим рынка и
+    перекрывающиеся горизонты не позволяют делать вывод о стратегии — только о
+    том, что метка режима не совпала с реальностью в этом окне.
+    """
+    import math
+    from datetime import datetime as _dt
+
+    ev = [r for r in (rows or []) if r.get("realized_return") is not None]
+    out: dict = {
+        "n": len(ev),
+        "regime_recorded_share": 0.0,
+        "drift": {}, "by_regime": [], "by_tech_score": [],
+        "range_fade_signature": None, "window": {}, "caveats": [],
+    }
+    if not ev:
+        out["caveats"].append("нет оценённых прогнозов — мерить нечего")
+        return out
+
+    rets = [r["realized_return"] for r in ev]
+    n = len(rets)
+    mean_ret = sum(rets) / n
+    share_up = sum(1 for x in rets if x > 0) / n
+    out["drift"] = {"mean_pct": round(mean_ret, 3),
+                    "median_pct": round(sorted(rets)[n // 2], 3),
+                    "share_up": round(share_up, 3)}
+
+    # Окно данных: сколько суток и недель покрыто. От этого зависит, можно ли
+    # вообще что-то заключать, поэтому считаем и выводим явно.
+    days, weeks = set(), set()
+    for r in ev:
+        c = r.get("created_at")
+        if isinstance(c, str):
+            try:
+                c = _dt.fromisoformat(c.replace("Z", "+00:00"))
+            except ValueError:
+                c = None
+        if c is not None:
+            days.add(c.strftime("%Y-%m-%d"))
+            y, w, _ = c.isocalendar()
+            weeks.add(f"{y}-W{w:02d}")
+    out["window"] = {"days": len(days), "weeks": len(weeks),
+                     "from": min(days) if days else None,
+                     "to": max(days) if days else None}
+
+    def _grp(rows_):
+        if not rows_:
+            return None
+        rr = [x["realized_return"] for x in rows_]
+        m = len(rr)
+        up = sum(1 for x in rr if x > 0)
+        se = math.sqrt(0.25 / m)
+        ts = [x["technical_score"] for x in rows_ if x.get("technical_score") is not None]
+        return {"n": m,
+                "mean_return_pct": round(sum(rr) / m, 3),
+                "median_return_pct": round(sorted(rr)[m // 2], 3),
+                "share_up": round(up / m, 3),
+                "sigma_from_random": round((up / m - 0.5) / se, 2) if se else None,
+                "mean_tech_score": round(sum(ts) / len(ts), 3) if ts else None}
+
+    # По метке режима — работает только если метка записана.
+    labelled = [r for r in ev if r.get("regime")]
+    out["regime_recorded_share"] = round(len(labelled) / n, 3)
+    if labelled:
+        by = {}
+        for r in labelled:
+            by.setdefault(str(r["regime"]), []).append(r)
+        for reg, rows_ in sorted(by.items(), key=lambda kv: -len(kv[1])):
+            g = _grp(rows_)
+            g["regime"] = reg
+            # Метка «боковик» при устойчивом одностороннем движении — признак
+            # того, что детектор не увидел тренд.
+            g["looks_mislabelled"] = bool(
+                reg in ("range", "боковик") and g["share_up"] is not None
+                and (g["share_up"] >= 0.70 or g["share_up"] <= 0.30))
+            out["by_regime"].append(g)
+    else:
+        out["caveats"].append(
+            "метка режима не записана ни у одного прогноза — прямой аудит "
+            "детектора невозможен, используется подпись technical_score")
+
+    # По силе технического сигнала — работает всегда, score заполнен.
+    for lo, hi, name in _SCORE_BUCKETS:
+        sel = [r for r in ev if r.get("technical_score") is not None
+               and lo <= r["technical_score"] < hi]
+        g = _grp(sel)
+        if g:
+            g["bucket"] = name
+            out["by_tech_score"].append(g)
+
+    # Подпись фейда верхней границы: сюда попадают именно шорты от хая боковика.
+    fade = [r for r in ev if r.get("technical_score") is not None
+            and -0.90 <= r["technical_score"] <= -0.50]
+    g = _grp(fade)
+    if g:
+        g["interpretation"] = (
+            "система шортила от верхней границы; доля роста показывает, как часто "
+            "она была неправа")
+        out["range_fade_signature"] = g
+
+    # Предупреждения о выборке — чтобы отчёт нельзя было прочесть как приговор.
+    if out["window"].get("days", 0) < 14:
+        out["caveats"].append(
+            f"окно всего {out['window'].get('days')} дн. — это ОДИН режим рынка; "
+            "фейд хаёв обязан терять в растущем рынке, поэтому вывод касается "
+            "метки режима, а НЕ качества стратегии")
+    if out["window"].get("weeks", 0) < 3:
+        out["caveats"].append(
+            "меньше трёх календарных недель — нужен хотя бы один нисходящий "
+            "отрезок, иначе сравнение односторонее")
+    out["caveats"].append(
+        "горизонты прогнозов перекрываются по времени и тикерам, поэтому "
+        "эффективная выборка МЕНЬШЕ n: считать сигмы буквально нельзя")
+    return out
+
+
+async def regime_audit_rows() -> list[dict]:
+    """Данные для аудита режима: метка на момент сигнала + фактическое движение."""
+    async with async_session() as session:
+        stmt = (select(Prediction)
+                .where(Prediction.realized_return.is_not(None))
+                .order_by(Prediction.created_at.asc()))
+        rows = (await session.execute(stmt)).scalars().all()
+
+    out = []
+    for p in rows:
+        ctx = {}
+        if p.context_json:
+            try:
+                import json as _json
+                ctx = _json.loads(p.context_json) or {}
+            except Exception:
+                ctx = {}
+        out.append({
+            "id": p.id, "ticker": p.ticker,
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+            "direction": p.direction, "confidence": p.confidence,
+            "technical_score": p.technical_score,
+            "realized_return": p.realized_return,
+            "realized_r": p.realized_r,
+            "correct": p.correct,
+            # Метка технического слоя пишется в снимок контекста; колонка
+            # predictions.regime хранит режим ОТ CLAUDE и для старых строк пуста.
+            "regime": ctx.get("regime") or p.regime,
+            "regime_claude": ctx.get("regime_claude"),
+            "range_position": ctx.get("range_position"),
+            "adx": ctx.get("adx"),
+            "strategy": ctx.get("strategy"),
+        })
+    return out
+
 
 def _position_from_context(p) -> dict:
     """Размер позиции из снимка контекста. Нужен, чтобы посчитать P&L в рублях:
