@@ -856,8 +856,38 @@ async def lesson_tag_stats() -> dict:
     }
 
 
+def _is_directional(p) -> bool:
+    """Был ли это НАПРАВЛЕННЫЙ прогноз, который вообще можно оценивать.
+
+    Запись с direction=flat или confidence=0 — это отказ от мнения, а не
+    прогноз. Считать её ошибкой, когда цена сдвинулась, некорректно:
+    предсказания не было.
+    """
+    return (p.direction or "").lower() in ("up", "down") and (p.confidence or 0) > 0
+
+
 async def accuracy_stats(ticker: Optional[str] = None) -> dict:
-    """Точность прогнозов: сколько всего, оценено, верных, доля."""
+    """Честная точность прогнозов: калибровка и ожидание в R.
+
+    ПОЧЕМУ ПЕРЕСЧИТАНО. Прежняя формула делила верные на ВСЕ оценённые записи,
+    включая flat и confidence=0. На выборке из 20 последних закрытых: 19 записей
+    flat, 11 с нулевой уверенностью, и 7 из них помечены correct=false. То есть
+    цифра «точность 25.5%» измеряла в основном, как часто запись «без мнения»
+    совпала со спокойным рынком, а не предсказательную способность.
+    Ровно этот класс бага уже был починен для open_count (легаси flat-строки
+    больше не считаются открытыми сигналами) — здесь он оставался.
+
+    Что считается авторитетным вердиктом: механический исход (флаг correct,
+    выставляемый по пути цены до цели или стопа). Теги пост-мортема (correct_read
+    и прочие) генерирует та же модель, чей прогноз оценивается, — это самооценка,
+    и метрикой она быть не может. Пост-мортем остаётся диагностикой «почему», но
+    не оценкой «верно ли».
+
+    Ключ accuracy теперь считается ТОЛЬКО по направленным прогнозам. Старая
+    формула сохранена как accuracy_legacy, чтобы разницу было видно, а не чтобы
+    ей пользоваться. Если направленных прогнозов нет, accuracy = None — это
+    честный ответ «оценивать пока нечего», а не ноль.
+    """
     async with async_session() as session:
         stmt = select(Prediction)
         if ticker:
@@ -867,13 +897,55 @@ async def accuracy_stats(ticker: Optional[str] = None) -> dict:
 
     total = len(preds)
     evaluated = [p for p in preds if p.correct is not None]
-    correct = [p for p in evaluated if p.correct]
-    accuracy = (len(correct) / len(evaluated)) if evaluated else None
+    directional = [p for p in evaluated if _is_directional(p)]
+    abstained = len(evaluated) - len(directional)
+
+    hits = [p for p in directional if p.correct]
+    accuracy = (len(hits) / len(directional)) if directional else None
+
+    legacy_correct = [p for p in evaluated if p.correct]
+    accuracy_legacy = (len(legacy_correct) / len(evaluated)) if evaluated else None
+
+    # ── КАЛИБРОВКА: значит ли что-нибудь заявленная уверенность ────────────────
+    # Главный вопрос к любой модели-прогнозисту: когда она говорит 0.7, попадает
+    # ли она в 70% случаев. gap > 0 — модель скромничает, gap < 0 — самоуверенна.
+    calibration = []
+    for lo, hi in ((0.0, 0.3), (0.3, 0.5), (0.5, 0.7), (0.7, 1.01)):
+        grp = [p for p in directional if lo <= (p.confidence or 0) < hi]
+        if not grp:
+            continue
+        hit_rate = sum(1 for p in grp if p.correct) / len(grp)
+        avg_conf = sum(p.confidence or 0 for p in grp) / len(grp)
+        calibration.append({
+            "bucket": f"{lo:.1f}-{min(hi, 1.0):.1f}",
+            "n": len(grp),
+            "avg_confidence": round(avg_conf, 3),
+            "hit_rate": round(hit_rate, 3),
+            "gap": round(hit_rate - avg_conf, 3),
+        })
+
+    # ── ОЖИДАНИЕ В R: метрика, которая относится к деньгам ────────────────────
+    # Можно попадать в 40% случаев и зарабатывать, если выигрыши крупнее
+    # проигрышей. Доля попаданий сама по себе ни о чём не говорит.
+    rs = [p.realized_r for p in directional if p.realized_r is not None]
+    wins = [r for r in rs if r > 0]
+    losses = [r for r in rs if r <= 0]
+    loss_sum = abs(sum(losses))
     return {
         "total": total,
         "evaluated": len(evaluated),
-        "correct": len(correct),
+        "directional": len(directional),
+        "abstained": abstained,
+        "correct": len(hits),
         "accuracy": round(accuracy, 3) if accuracy is not None else None,
+        "accuracy_legacy": round(accuracy_legacy, 3) if accuracy_legacy is not None else None,
+        "accuracy_basis": "только направленные прогнозы с уверенностью > 0",
+        "calibration": calibration,
+        "expectancy_r": round(sum(rs) / len(rs), 3) if rs else None,
+        "avg_win_r": round(sum(wins) / len(wins), 3) if wins else None,
+        "avg_loss_r": round(sum(losses) / len(losses), 3) if losses else None,
+        "profit_factor": round(sum(wins) / loss_sum, 3) if wins and loss_sum else None,
+        "r_sample": len(rs),
         "pending": total - len(evaluated),
     }
 
