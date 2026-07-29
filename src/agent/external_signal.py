@@ -199,6 +199,21 @@ async def submit(payload: dict) -> dict:
     except Exception as e:                    # noqa: BLE001
         logger.debug("external_signal: стакан недоступен для %s: %s", ticker, e)
 
+    # На каких данных построен сценарий: реалтайм Tinkoff или MOEX ISS с
+    # задержкой ~15 минут. Флаг существовал внутри интрадей-контекста и до записи
+    # сигнала не доходил — аналитик работал на запоздавших данных, не зная об
+    # этом. Для дневной структуры 15 минут терпимы, для интрадей-сетапа это всё.
+    data_source = None
+    data_delayed = None
+    try:
+        from src.agent import intraday_analyst as ia
+        ictx = await ia.build_intraday_context(ticker)
+        if ictx:
+            data_source = ictx.get("source")
+            data_delayed = ictx.get("delayed")
+    except Exception as e:                    # noqa: BLE001
+        logger.debug("external_signal: интрадей-контекст для %s: %s", ticker, e)
+
     cfg = risk.load_config()
     state = await risk.load_state(cfg)
     decision = risk.evaluate_trade(s["entry"], s["stop"], s["direction"],
@@ -249,6 +264,11 @@ async def submit(payload: dict) -> dict:
         "risk_binding": decision.binding_constraint,
         "spread_pct_at_signal": decision.spread_pct,
         "depth_near_mid_at_signal": decision.depth_near_mid,
+        # Происхождение данных — в журнал. Позже позволит замерить, отличается ли
+        # результативность сценариев на реалтайме и на задержке: ещё одна ось
+        # сравнения, которую без этого поля построить нельзя.
+        "data_source": data_source,
+        "data_delayed": data_delayed,
     }
 
     pred_id = await db.add_prediction({
@@ -279,4 +299,5 @@ async def submit(payload: dict) -> dict:
             "rr_planned": s["rr"], "confidence": s["confidence"],
             "horizon_hours": horizon, "price_at": price_at,
             "analyst": s["analyst"],
+            "data_source": data_source, "data_delayed": data_delayed,
             "position": decision.as_dict()}

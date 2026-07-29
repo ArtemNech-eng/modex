@@ -325,13 +325,15 @@ class ClaudeAgent:
                 f"rr{_s(b.get('rr'))} {_s(b.get('entry_status'))} ob:{_s(b.get('ob_pressure'))}"
                 f"/{_s(b.get('bid_ask'))}/{_s(b.get('liquidity'))} "
                 f"fl:{_s(b.get('flow'))}/{_s(b.get('delta'))}/{_s(b.get('buy_pct'))}% "
-                f"si{_s(b.get('si'))} set:{_s(b.get('setup'))}")
+                f"si{_s(b.get('si'))} set:{_s(b.get('setup'))} "
+                f"rv{_s(b.get('rvol'))}{'' if b.get('rt') is None else (' RT' if b.get('rt') else ' DLY')}")
         if not lines:
             return []
         legend = ("Формат строки: ТИКЕР p<цена> <позиция к VWAP> <режим> adx rsi atr "
                   "<волатильность> roc<скорость цены,%> v<объём×среднего> orb<низ-верх> "
                   "rr<R:R> <статус входа> ob:<давление стакана>/<bid-ask>/<ликвидность> "
-                  "fl:<поток>/<дельта,лот>/<%покупок> si<настроение> set:<сетап>")
+                  "fl:<поток>/<дельта,лот>/<%покупок> si<настроение> set:<сетап> "
+                  "rv<объём к среднему, ×> RT=реалтайм/DLY=данные с задержкой ~15мин")
         tickers_block = "\n".join(lines)
         system = (
             "Ты интрадей-скринер MOEX. По КРАТКИМ данным по каждому тикеру реши, есть ли "

@@ -167,6 +167,11 @@ async def screen_ticker(ticker: str, aggregator) -> Optional[dict]:
         # было, потому что объём выбрасывался при разборе свечей MOEX.
         "rvol": (technical or {}).get("rel_turnover") or (technical or {}).get("rel_volume"),
         "vlabel": (technical or {}).get("volume_label"),
+        # Реалтайм или задержка. Для интрадей-сетапа 15 минут это всё, а раньше
+        # флаг существовал внутри контекста и до решения не доходил: анализ шёл
+        # на запоздавших данных, не зная об этом.
+        "rt": (None if not intraday else (not intraday.get("delayed"))),
+        "src": (intraday or {}).get("source"),
         "setup": (intraday or {}).get("setup"),
         "orb_hi": _lv.get("or_high"),
         "orb_lo": _lv.get("or_low"),

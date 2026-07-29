@@ -172,6 +172,8 @@ class Prediction(Base):
                     "binding": _ctx.get("risk_binding"),
                     "spread_pct": _ctx.get("spread_pct_at_signal"),
                     "depth_near_mid": _ctx.get("depth_near_mid_at_signal"),
+                    "data_source": _ctx.get("data_source"),
+                    "data_delayed": _ctx.get("data_delayed"),
                 }
                 if _risk.get("shares") is None:
                     _risk = {}

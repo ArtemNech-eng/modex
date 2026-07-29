@@ -66,6 +66,7 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
                              msg_zscore: Optional[float] = None,
                              has_fresh_news: bool = False,
                              delayed: bool = False,
+                             source: Optional[str] = None,
                              opening_range_bars: int = 6,
                              spike_k: float = 2.5) -> Optional[dict]:
     """
@@ -171,6 +172,10 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
         "phase": phase,
         "event": event,
         "delayed": delayed,
+        # Какой источник дал свечи. Флаг задержки был, а ИМЕНИ источника
+        # не было — значит нельзя было понять, почему данные запоздали и по
+        # каким бумагам это систематически.
+        "source": source,
         "note": note,
         "levels": levels,
     }
@@ -255,7 +260,8 @@ async def build_intraday_context(ticker: str, tf_min: int = 5,
     minute = _minute_of_day_msk(last_ts)
     return compute_intraday_context(
         data, minute, msg_zscore=msg_zscore, has_fresh_news=has_fresh_news,
-        delayed=bool(data.get("_delayed")), opening_range_bars=opening_range_bars)
+        delayed=bool(data.get("_delayed")), source=data.get("_source"),
+        opening_range_bars=opening_range_bars)
 
 
 async def realized_price_after(ticker: str, start_iso: str, hours: float) -> Optional[float]:

@@ -87,6 +87,52 @@ def test_real_ozon_shape():
     assert r["volume_label"] != "всплеск объёма"
 
 
+
+# ─────────── происхождение данных: реалтайм или задержка ─────────────────────
+
+from src.agent.intraday_analyst import compute_intraday_context  # noqa: E402
+
+
+def _candles(n=30, price=100.0):
+    return {"dates": [f"2026-07-29 1{i//60}:{i%60:02d}:00" for i in range(n)],
+            "open": [price] * n, "high": [price * 1.01] * n,
+            "low": [price * 0.99] * n, "close": [price] * n,
+            "volume": [1000] * n}
+
+
+def test_source_recorded_in_context():
+    """Имя источника обязано доезжать до контекста: без него нельзя понять,
+    ПОЧЕМУ данные запоздали и по каким бумагам это систематически."""
+    ctx = compute_intraday_context(_candles(), minute_of_day=12 * 60,
+                                   delayed=True, source="moex_iss")
+    assert ctx is not None
+    assert ctx["source"] == "moex_iss"
+    assert ctx["delayed"] is True
+
+
+def test_realtime_source_recorded():
+    ctx = compute_intraday_context(_candles(), minute_of_day=12 * 60,
+                                   delayed=False, source="tinkoff")
+    assert ctx["source"] == "tinkoff" and ctx["delayed"] is False
+
+
+def test_source_absent_is_none_not_guess():
+    """Если источник не передан — None, а не догадка про Tinkoff."""
+    ctx = compute_intraday_context(_candles(), minute_of_day=12 * 60)
+    assert ctx["source"] is None
+    assert ctx["delayed"] is False
+
+
+def test_batch_line_and_legend_stay_in_sync():
+    """Строка batch-скрина и легенда должны меняться вместе: модель читает
+    сжатый формат, и рассинхрон превращает данные в шум."""
+    src = open(os.path.join(ROOT, "src", "agent", "claude_agent.py"),
+               encoding="utf-8").read()
+    assert "rv{_s(b.get('rvol'))}" in src, "объём не попал в строку batch"
+    assert "' RT' if b.get('rt') else ' DLY'" in src, "метка реалтайма не в строке"
+    assert "rv<объём к среднему" in src, "объём не описан в легенде"
+    assert "RT=реалтайм/DLY=" in src, "метка реалтайма не описана в легенде"
+
 if __name__ == "__main__":
     tests = [(n, o) for n, o in sorted(globals().items())
              if n.startswith("test_") and callable(o)]
