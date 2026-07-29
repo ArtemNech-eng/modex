@@ -148,14 +148,29 @@ def _default_horizon_hours(msk_now: Optional[datetime] = None) -> int:
     """
     now = msk_now or (datetime.now(timezone.utc) + timedelta(hours=3))
     mod = now.hour * 60 + now.minute
-    if mod < 10 * 60:                                  # раннее утро
-        due = now.replace(hour=23, minute=50, second=0, microsecond=0)
-    elif mod <= 18 * 60 + 40:                          # сессия идёт
-        due = (now + timedelta(days=1)).replace(hour=8, minute=0,
-                                               second=0, microsecond=0)
-    else:                                              # вечер, торгуем завтра
-        due = (now + timedelta(days=1)).replace(hour=23, minute=50,
-                                               second=0, microsecond=0)
+    try:
+        from config import settings as S
+        e_close = getattr(S, "SESSION_EVENING_CLOSE", 23 * 60 + 50)
+        low_liq = getattr(S, "SESSION_LOW_LIQUIDITY_AFTER", 22 * 60)
+    except Exception:                                  # noqa: BLE001
+        e_close, low_liq = 23 * 60 + 50, 22 * 60
+
+    def _at(day_shift, minute):
+        h, m = divmod(minute, 60)
+        return (now + timedelta(days=day_shift)).replace(
+            hour=h, minute=m, second=0, microsecond=0)
+
+    # ЗАПАС считаем по отсечке ликвидности, а НЕ по формальному закрытию.
+    # После low_liq новые входы не открываются, поэтому час между 22:00 и 23:50
+    # торгуемым временем не является. Раньше здесь стояло формальное закрытие, и
+    # сценарий, выданный в 21:00, получал горизонт 3 часа при одном часе реально
+    # доступного времени — заведомо неисполнимо.
+    min_runway_h = 2
+    runway_h = (low_liq - mod) / 60.0
+    if runway_h >= min_runway_h:
+        due = _at(0, e_close)          # успеваем в сегодняшний торговый день
+    else:
+        due = _at(1, e_close)          # переносим на следующий
     return max(1, int((due - now).total_seconds() // 3600) + 1)
 
 

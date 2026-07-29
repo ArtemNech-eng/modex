@@ -108,9 +108,28 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
 
     setup, plan, observe, note = "none", None, False, ""
 
-    # Режимные запреты на новый вход
+    # Режимные запреты на новый вход.
+    # УТРЕННЯЯ сессия (07:00-09:50) раньше попадала в фазу closed и входы в ней
+    # не открывались вообще — три часа реальных торгов пропадали. Теперь это
+    # отдельная фаза, и разрешение настраивается.
+    try:
+        from config import settings as _S
+        _allow_morning = getattr(_S, "SESSION_ALLOW_MORNING_ENTRY", True)
+        _low_liq_after = getattr(_S, "SESSION_LOW_LIQUIDITY_AFTER", 22 * 60)
+    except Exception:                       # noqa: BLE001
+        _allow_morning, _low_liq_after = True, 22 * 60
+
     if phase in ("pre", "break", "closed"):
         observe, note = True, f"фаза сессии: {phase} — вход не открываем"
+    elif phase == "morning" and not _allow_morning:
+        observe, note = True, "утренняя сессия — входы отключены настройкой"
+    elif minute_of_day >= _low_liq_after:
+        # Полагаться на часы нельзя, но поздний вечер систематически тоньше:
+        # фактическую торгуемость всё равно проверяет гейт ликвидности по спреду
+        # и глубине стакана, а это отсечка по расписанию.
+        h, m = divmod(_low_liq_after, 60)
+        observe, note = True, (f"после {h:02d}:{m:02d} ликвидность падает — "
+                               "новых входов не открываем")
     elif last_min:
         observe, note = True, "конец сессии — флэт к закрытию, новых входов нет"
 

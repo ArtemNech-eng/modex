@@ -66,10 +66,16 @@ def _quality_veto(direction: str, claude_result: dict, intraday_ctx,
     levels = (intraday_ctx or {}).get("levels") or {}
 
     # ── №1 ОКНО ТОРГОВЛИ ──────────────────────────────────────────────────────
-    open_main = 10 * 60  # 10:00 МСК — открытие основной сессии
+    # Открытие ТОЙ сессии, в которой мы сейчас. Раньше здесь было зашито 10:00,
+    # поэтому фильтр «первые N минут шума» не действовал на утреннее открытие в
+    # 07:00 и на вечернее в 19:00 — шум открытия этих сессий не отсекался вовсе.
+    from src.analysis.intraday import session_open_minute
+    sess_open = session_open_minute(mod_msk)
     first_min = getattr(S, "FILTER_NO_ENTRY_FIRST_MIN", 15)
-    if open_main <= mod_msk < open_main + first_min:
-        return f"первые {first_min} мин сессии — шум открытия, ждём"
+    if sess_open is not None and sess_open <= mod_msk < sess_open + first_min:
+        h, m = divmod(sess_open, 60)
+        return (f"первые {first_min} мин сессии (открытие {h:02d}:{m:02d}) — "
+                "шум открытия, ждём")
     if getattr(S, "FILTER_REQUIRE_ORB", True) and levels.get("or_high") is None:
         return "диапазон открытия (ORB) ещё не сформирован"
 

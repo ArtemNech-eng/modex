@@ -275,3 +275,26 @@ RISK_MAX_TRADES_DAY = int(os.getenv("RISK_MAX_TRADES_DAY", "3"))
 RISK_MAX_OPEN_POSITIONS = int(os.getenv("RISK_MAX_OPEN_POSITIONS", "2"))
 RISK_MAX_PER_SECTOR = int(os.getenv("RISK_MAX_PER_SECTOR", "1"))          # неактивно без справочника секторов
 RISK_KILL_SWITCH_DD_PCT = float(os.getenv("RISK_KILL_SWITCH_DD_PCT", "5"))
+
+
+# ─── РАСПИСАНИЕ ТОРГОВ MOEX (МСК, минуты от полуночи) ─────────────────────────
+# Зашитые границы были неполными: код знал только основную сессию 10:00-18:50 и
+# вечернюю 19:00-23:50, а УТРЕННЯЯ сессия 07:00-09:50 попадала в фазу "closed" —
+# почти три часа реальных торгов система считала нерабочим временем и не входила.
+# Выносим в конфиг: биржа меняет часы, и это не должно требовать правки кода.
+SESSION_MORNING_OPEN = int(os.getenv("SESSION_MORNING_OPEN", str(7 * 60)))        # 07:00
+SESSION_MORNING_CLOSE = int(os.getenv("SESSION_MORNING_CLOSE", str(9 * 60 + 50)))  # 09:50
+SESSION_MAIN_OPEN = int(os.getenv("SESSION_MAIN_OPEN", str(10 * 60)))            # 10:00
+SESSION_MAIN_CLOSE = int(os.getenv("SESSION_MAIN_CLOSE", str(18 * 60 + 50)))     # 18:50
+SESSION_EVENING_OPEN = int(os.getenv("SESSION_EVENING_OPEN", str(19 * 60)))      # 19:00
+SESSION_EVENING_CLOSE = int(os.getenv("SESSION_EVENING_CLOSE", str(23 * 60 + 50)))  # 23:50
+
+# Разрешать входы в утреннюю сессию. По опыту владельца активные торги идут с
+# 07:00 до 22:00, и ликвидность там рабочая. Но полагаться на часы нельзя:
+# фактическую торгуемость проверяет гейт ликвидности по спреду и глубине стакана,
+# а расписание отвечает только на вопрос «биржа открыта».
+SESSION_ALLOW_MORNING_ENTRY = os.getenv("SESSION_ALLOW_MORNING_ENTRY", "true").lower() == "true"
+
+# После этого времени ликвидность падает — новые входы не открываем даже при
+# формально открытой сессии (по умолчанию 22:00 МСК).
+SESSION_LOW_LIQUIDITY_AFTER = int(os.getenv("SESSION_LOW_LIQUIDITY_AFTER", str(22 * 60)))

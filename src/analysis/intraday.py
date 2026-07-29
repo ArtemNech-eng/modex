@@ -241,26 +241,60 @@ def news_whipsaw_plan(event_high: float, event_low: float, price: float,
 
 # ─── Фазы торговой сессии MOEX (время МСК) ────────────────────────────────────
 
+def _sched() -> dict:
+    """Границы сессий из конфига с безопасными значениями по умолчанию."""
+    try:
+        from config import settings as S
+        return {
+            "m_open": getattr(S, "SESSION_MORNING_OPEN", 7 * 60),
+            "m_close": getattr(S, "SESSION_MORNING_CLOSE", 9 * 60 + 50),
+            "open": getattr(S, "SESSION_MAIN_OPEN", 10 * 60),
+            "close": getattr(S, "SESSION_MAIN_CLOSE", 18 * 60 + 50),
+            "e_open": getattr(S, "SESSION_EVENING_OPEN", 19 * 60),
+            "e_close": getattr(S, "SESSION_EVENING_CLOSE", 23 * 60 + 50),
+        }
+    except Exception:                       # noqa: BLE001 — офлайн-тесты
+        return {"m_open": 7 * 60, "m_close": 9 * 60 + 50, "open": 10 * 60,
+                "close": 18 * 60 + 50, "e_open": 19 * 60, "e_close": 23 * 60 + 50}
+
+
 def session_phase(minute_of_day: int) -> str:
     """
-    Фаза сессии MOEX по минуте дня (МСК). Приблизительные границы:
-      • pre      09:50–10:00 (аукцион открытия)
-      • main     10:00–18:50 (основная сессия)
-      • break    18:50–19:00
-      • evening  19:00–23:50 (вечерняя сессия)
-      • closed   остальное
+    Фаза сессии MOEX по минуте дня (МСК). Границы берутся из конфига.
+
+    Фазы: morning (07:00-09:50), pre (аукцион открытия), main (10:00-18:50),
+    break, evening (19:00-23:50), closed.
+
+    УТРЕННЯЯ СЕССИЯ раньше отсутствовала: 07:00-09:50 попадало в "closed", и
+    почти три часа реальных торгов система считала нерабочим временем — входы в
+    это время не открывались вообще, хотя ликвидность там рабочая.
     """
-    def hm(h, m):
-        return h * 60 + m
-    if hm(9, 50) <= minute_of_day < hm(10, 0):
+    d = _sched()
+    if d["m_open"] <= minute_of_day < d["m_close"]:
+        return "morning"
+    if d["m_close"] <= minute_of_day < d["open"]:
         return "pre"
-    if hm(10, 0) <= minute_of_day < hm(18, 50):
+    if d["open"] <= minute_of_day < d["close"]:
         return "main"
-    if hm(18, 50) <= minute_of_day < hm(19, 0):
+    if d["close"] <= minute_of_day < d["e_open"]:
         return "break"
-    if hm(19, 0) <= minute_of_day < hm(23, 50):
+    if d["e_open"] <= minute_of_day < d["e_close"]:
         return "evening"
     return "closed"
+
+
+def session_open_minute(minute_of_day: int) -> Optional[int]:
+    """Минута открытия ТОЙ сессии, в которой мы находимся. Нужна фильтру «первые
+    N минут шума»: он был жёстко привязан к 10:00 и на утреннее открытие в 07:00
+    не действовал вообще."""
+    d = _sched()
+    if d["m_open"] <= minute_of_day < d["m_close"]:
+        return d["m_open"]
+    if d["open"] <= minute_of_day < d["close"]:
+        return d["open"]
+    if d["e_open"] <= minute_of_day < d["e_close"]:
+        return d["e_open"]
+    return None
 
 
 def is_last_minutes(minute_of_day: int, buffer_min: int = 10) -> bool:
@@ -268,9 +302,9 @@ def is_last_minutes(minute_of_day: int, buffer_min: int = 10) -> bool:
     True, если до конца текущей сессии осталось <= buffer_min минут — в это
     время новые интрадей-входы обычно не открываем (флэт к закрытию).
     """
-    def hm(h, m):
-        return h * 60 + m
-    for end in (hm(18, 50), hm(23, 50)):
+    d = _sched()
+    # Утренняя сессия тоже имеет конец: перед ним новые входы не открываем.
+    for end in (d["m_close"], d["close"], d["e_close"]):
         if 0 <= end - minute_of_day <= buffer_min:
             return True
     return False
