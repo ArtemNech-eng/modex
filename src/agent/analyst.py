@@ -129,12 +129,37 @@ def _quality_veto(direction: str, claude_result: dict, intraday_ctx,
     return None
 
 
+def _veto_code(reason) -> str:
+    """
+    Человеческую причину вето → КОД для агрегации в журнале попыток.
+    Коды живут в db.ATTEMPT_REASONS: по ним видно, какой именно фильтр съедает
+    сигналы, и какие пороги FILTER_* стоит калибровать.
+    """
+    r = (reason or "").lower()
+    if not r:
+        return "veto_other"
+    if "рынок закрыт" in r or "пауза" in r:
+        return "veto_session_closed"
+    if "конец сессии" in r:
+        return "veto_session_end"
+    if "мин сессии" in r or "orb" in r or "диапазон открытия" in r:
+        return "veto_window"
+    if "чейз" in r or "растянут" in r or "далеко от уровня" in r:
+        return "veto_chase"
+    if "конфлюенс" in r:
+        return "veto_confluence"
+    if "неполный план" in r:
+        return "no_plan"
+    return "veto_other"
+
+
 async def _load_weights() -> list[float]:
     raw = await db.get_setting(pred.WEIGHTS_KEY)
     return pred.weights_from_json(raw) if raw else pred.DEFAULT_WEIGHTS
 
 
-async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
+async def analyze(ticker: str, aggregator, save: bool = True,
+                  stage: str = "deep") -> dict:
     """
     Полный анализ тикера:
       - rubert → агрегатор → индекс настроения + топ-сообщения
@@ -184,6 +209,12 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
     confidence    = fallback_confidence
     narrative     = None
     intraday_ctx  = None
+    # Телеметрия вызова Claude для журнала попыток: живёт отдельно от
+    # claude_result, потому что при недоступности claude_result обнуляется, а
+    # знать цену вызова и причину отказа нужно именно тогда.
+    _call_meta: dict = {}
+    _claude_error = None
+    _claude_verdict = "unavailable"   # up|down|flat|unavailable|error
 
     try:
         from config.settings import MOEX_TICKERS
@@ -342,10 +373,15 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
         # (claude_result["ok"]). Если Claude недоступен (пустой баланс/ошибка) —
         # СИГНАЛА НЕТ: резервную модель не используем, в обучение ничего не пишем.
         signal_map = {"bullish": "up", "bearish": "down", "neutral": "flat"}
+        # Телеметрию забираем ДО обнуления claude_result — иначе цена вызова и
+        # причина отказа теряются, и мы опять не знаем, почему нет сигнала.
+        _call_meta = dict((claude_result or {}).get("_call") or {})
+        _claude_error = (claude_result or {}).get("_error")
         if claude_result and claude_result.get("ok"):
             direction  = signal_map.get(claude_result.get("signal", "neutral"), "flat")
             confidence = round((claude_result.get("confidence", 0) or 0) / 100, 3)
             narrative  = claude_result.get("summary", "")
+            _claude_verdict = direction
             # Метрики согласованы С РЕШЕНИЕМ CLAUDE:
             combined   = confidence if direction == "up" else (-confidence if direction == "down" else 0.0)
             logger.info(f"🤖 Claude → {ticker}: {direction} (уверенность {confidence})")
@@ -355,13 +391,17 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
             claude_result = None
             direction, confidence, combined = "flat", 0.0, 0.0
             narrative = "Claude недоступен — сигнала нет (сигналы формирует только Claude)."
-            logger.warning(f"⚠️ Claude недоступен для {ticker}: сигнала нет")
+            _claude_verdict = "unavailable"
+            logger.warning(f"⚠️ Claude недоступен для {ticker}: сигнала нет"
+                           f"{f' ({_claude_error})' if _claude_error else ''}")
 
     except Exception as e:
         logger.warning(f"Ошибка анализа {ticker} — сигнала нет: {e}")
         claude_result = None
         direction, confidence, combined = "flat", 0.0, 0.0
         narrative = "Ошибка анализа — сигнала нет."
+        _claude_verdict = "error"
+        _claude_error = _claude_error or str(e)[:300]
 
     recommendation = _recommendation(direction, confidence)
 
@@ -460,6 +500,19 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
             recommendation = f"⚪ Наблюдать — фильтр: {_veto}"
             result_veto_reason = _veto
             logger.info(f"🛑 {ticker}: сигнал отклонён фильтром качества — {_veto}")
+
+    # (целостность плана) направленный сигнал без ПОЛНОГО плана — не сигнал.
+    # Иначе строка сохранится с target=NULL: intraday_outcome её не оценивает
+    # (нужны entry+stop+target), correct остаётся NULL — и тикер блокируется как
+    # «открытый сигнал» НАВСЕГДА. Лучше честное «наблюдать» с причиной no_plan.
+    if direction != "flat" and claude_result and not (c_entry and c_stop and c_target):
+        _miss = [n for n, v in (("вход", c_entry), ("стоп", c_stop), ("цель", c_target))
+                 if not v]
+        direction, confidence, combined = "flat", 0.0, 0.0
+        claude_trade_plan = None
+        recommendation = f"⚪ Наблюдать — неполный план: нет {', '.join(_miss)}"
+        result_veto_reason = f"неполный план: нет {', '.join(_miss)}"
+        logger.info(f"🛑 {ticker}: {result_veto_reason} — сигнал не сохраняем")
 
     # ── 6. Обоснование ──────────────────────────────────────────────────────
     reasons: list[str] = []
@@ -635,6 +688,53 @@ async def analyze(ticker: str, aggregator, save: bool = True) -> dict:
             result["prediction_id"] = pred_id
         except Exception as e:
             logger.warning(f"Не удалось сохранить прогноз {ticker}: {e}")
+
+    # ── 8. ЖУРНАЛ ПОПЫТОК — пишем ВСЕГДА, даже когда сигнала нет ────────────────
+    # Раньше «neutral от Claude», вето и недоступность Claude не оставляли следа:
+    # в БД были только up/down. Из-за этого на вопрос «почему за день 0 сигналов»
+    # ответа не было вообще. Теперь у каждой попытки есть код причины и цена.
+    if save:
+        _saved_id = result.get("prediction_id")
+        if _saved_id:
+            _reason = "saved"
+        elif already_open:
+            _reason = "already_open"
+        elif result_veto_reason:
+            _reason = _veto_code(result_veto_reason)
+        elif _claude_verdict == "flat":
+            _reason = "claude_flat"
+        elif _claude_verdict == "error":
+            _reason = "analysis_error"
+        elif _claude_verdict == "unavailable":
+            _reason = ("budget" if "budget" in (_claude_error or "").lower()
+                       else "claude_unavailable")
+        else:
+            _reason = "veto_other"
+        _note = result_veto_reason or _claude_error or (narrative or "")[:200]
+        await db.add_signal_attempt({
+            # "deep" — из сканера (воронка), "manual" — открытие карточки руками:
+            # разделяем, чтобы ручные клики не искажали статистику сканера.
+            "stage": stage,
+            "ticker": ticker,
+            "phase": _phase,
+            "verdict": _claude_verdict,
+            "final": direction,
+            "saved": bool(_saved_id),
+            "prediction_id": _saved_id,
+            "reason": _reason,
+            "mode": mode,
+            "regime": (claude_result or {}).get("regime"),
+            "confluence": (claude_result or {}).get("confluence_score"),
+            "confidence": confidence,
+            "rr": c_rr,
+            "entry": c_entry,
+            "stop": c_stop,
+            "target": c_target,
+            "cost_rub": _call_meta.get("cost_rub"),
+            "tokens_in": _call_meta.get("tokens_in"),
+            "tokens_out": _call_meta.get("tokens_out"),
+            "note": _note,
+        })
 
     return result
 

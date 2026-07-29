@@ -97,6 +97,8 @@ class ClaudeAgent:
         self.provider = _PROVIDER
         self.base_url = _BASE_URL.rstrip("/")
         self.model = _MODEL
+        # Телеметрия последнего вызова (цена/токены/обрезка) — для журнала попыток.
+        self.last_call: dict = {}
 
     def _build_headers(self) -> dict:
         if self.provider == "anthropic":
@@ -138,26 +140,52 @@ class ClaudeAgent:
         _limit, p_in, p_out, _res = _prices()
         est_in = int((len(system) + len(user)) / 2.5)          # ~2.5 симв/токен (рус.)
         est_cost = (est_in * p_in + max_tokens * p_out) / 1000  # худший случай
+        # Телеметрия вызова для журнала попыток: цена и токены пишутся в БД, чтобы
+        # было видно «₽ за сигнал» и обрезку JSON (из-за неё раньше молча не было
+        # сигналов — max_tokens не хватало на ответ).
+        self.last_call = {"cost_rub": None, "tokens_in": None, "tokens_out": None,
+                          "max_tokens": max_tokens, "truncated": False, "error": None}
         left = await budget_left()
         if left < est_cost:
+            self.last_call["error"] = f"budget_guard: остаток {left:.2f}₽ < {est_cost:.2f}₽"
             raise RuntimeError(
                 f"AI budget guard: остаток {left:.2f}₽ < оценки вызова {est_cost:.2f}₽ "
                 f"(дневной лимит {_limit:.0f}₽) — вызов пропущен")
 
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(url, headers=headers, json=payload)
-            if resp.status_code != 200:
-                raise RuntimeError(f"AI API error {resp.status_code}: {resp.text[:300]}")
-            data = resp.json()
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+                if resp.status_code != 200:
+                    raise RuntimeError(f"AI API error {resp.status_code}: {resp.text[:300]}")
+                data = resp.json()
+        except Exception as e:
+            self.last_call["error"] = str(e)[:300]
+            raise
 
         # Фактический расход: из usage провайдера, иначе — по оценке.
         try:
             u = data.get("usage") or {}
             in_tok = int(u.get("prompt_tokens") or u.get("input_tokens") or est_in)
             out_tok = int(u.get("completion_tokens") or u.get("output_tokens") or 0)
-            await _budget_add((in_tok * p_in + out_tok * p_out) / 1000)
+            cost = (in_tok * p_in + out_tok * p_out) / 1000
+            self.last_call.update({"cost_rub": round(cost, 4),
+                                   "tokens_in": in_tok, "tokens_out": out_tok})
+            await _budget_add(cost)
         except Exception:
+            self.last_call["cost_rub"] = round(est_cost, 4)
             await _budget_add(est_cost)
+
+        # Обрезан ли ответ по лимиту токенов (главная причина «нет сигнала» ранее).
+        try:
+            if self.provider == "anthropic":
+                self.last_call["truncated"] = data.get("stop_reason") == "max_tokens"
+            else:
+                self.last_call["truncated"] = (
+                    ((data.get("choices") or [{}])[0].get("finish_reason") == "length"))
+            if self.last_call["truncated"]:
+                logger.warning(f"✂️ Ответ AI обрезан по max_tokens={max_tokens} — JSON неполный")
+        except Exception:
+            pass
 
         if self.provider == "anthropic":
             return data["content"][0]["text"]
@@ -318,13 +346,18 @@ class ClaudeAgent:
                 data["analyzed_at"] = datetime.now(timezone.utc).isoformat()
                 return data
         except Exception as e:
+            _err = str(e)[:200]
             logger.warning(f"Claude chart analysis failed for {ticker}: {e}")
+        else:
+            _err = "в ответе нет JSON"
 
+        # `e` вне блока except уже не существует (Python 3 её удаляет) — раньше
+        # здесь падал NameError вместо честного сообщения об ошибке.
         return {
             "ticker":          ticker,
             "chart_signal":    "neutral",
             "chart_confidence": 0,
-            "visual_insight":  f"Визуальный анализ недоступен: {e}",
+            "visual_insight":  f"Визуальный анализ недоступен: {_err}",
         }
 
     async def analyze_sentiment_batch(self, messages: list[str]) -> list[dict]:
@@ -503,6 +536,7 @@ B) mode="momentum" (режим trend_momentum): вход по ПРОДОЛЖЕН
 - mode=momentum (только в сильном тренде trend_momentum): структурный стоп ≤1% в поле stop, R:R ≥ 1.2, вход по продолжению; анти-чейз ослаблен, но НЕ входи при растяжении > ~2×ATR от VWAP.
 Против HTF-биаса нужен конфлюенс ≥ 5; фейд границ диапазона (range) — конфлюенс ≥ 4."""
 
+        _err = None
         try:
             # 1800 токенов: полный JSON плейбука реально ~900–1300 токенов (в 1300
             # обрезался). 1800 — с запасом, но втрое дешевле резерва 3000 → бюджет
@@ -516,8 +550,12 @@ B) mode="momentum" (режим trend_momentum): вход по ПРОДОЛЖЕН
                 data["ticker"]      = ticker
                 data["analyzed_at"] = datetime.now(timezone.utc).isoformat()
                 data["ok"]          = True   # Claude реально ответил (для честной деградации)
+                data["_call"]       = dict(self.last_call)   # цена/токены → журнал попыток
                 return data
+            _err = ("ответ обрезан по max_tokens — JSON неполный"
+                    if (self.last_call or {}).get("truncated") else "в ответе нет JSON")
         except Exception as e:
+            _err = str(e)[:300]
             logger.warning(f"Claude synthesis failed for {ticker}: {e}")
 
         return {
@@ -530,6 +568,8 @@ B) mode="momentum" (режим trend_momentum): вход по ПРОДОЛЖЕН
             "risk":           "Нет данных",
             "crowd_behavior": "неопределённость",
             "history_based":  False,
+            "_call":          dict(self.last_call or {}),
+            "_error":         _err,    # ПОЧЕМУ не ответил — в журнал попыток
         }
 
         system = """Ты опытный трейдер и аналитик Московской биржи.
@@ -837,9 +877,13 @@ B) mode="momentum" (режим trend_momentum): вход по ПРОДОЛЖЕН
             if start >= 0 and end > start:
                 return json.loads(result[start:end])
         except Exception as e:
+            _err = str(e)[:200]
             logger.warning(f"Claude correlation analysis failed: {e}")
+        else:
+            _err = "в ответе нет JSON"
 
-        return {"insights": [], "summary": f"Ошибка анализа: {e}"}
+        # То же, что и в analyze_chart: `e` вне except недоступна → был NameError.
+        return {"insights": [], "summary": f"Ошибка анализа: {_err}"}
 
     async def market_summary(
         self,

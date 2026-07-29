@@ -276,6 +276,83 @@ class SessionFootprint(Base):
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+class SignalAttempt(Base):
+    """
+    ЖУРНАЛ ПОПЫТОК (наблюдаемость воронки сигналов).
+
+    Проблема, которую решает: раньше в БД попадали ТОЛЬКО направленные сигналы
+    Claude (up/down). Всё остальное — «neutral» от Claude, вето фильтра качества,
+    недоступность Claude, занятый тикер — исчезало без следа. Итог: за понедельник
+    и вторник 0 сигналов, и НЕВОЗМОЖНО сказать, звали ли Claude, сколько раз и
+    почему сигнала не было. Деньги при этом тратились.
+
+    Теперь пишем КАЖДУЮ попытку с кодом причины и фактической ценой вызова в ₽.
+    Токенов это не стоит (пишем то, что уже посчитано), а даёт:
+      - воронку: сколько тикеров отсмотрено → сколько watch → сколько дошло до
+        глубокого разбора → сколько сохранено, и где именно всё отсекается;
+      - цену за сигнал (₽ на попытку и ₽ на сохранённый сигнал);
+      - материал для калибровки порогов FILTER_* по факту, а не на глаз.
+    """
+    __tablename__ = "signal_attempts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), index=True,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    msk: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)     # "HH:MM МСК"
+    stage: Mapped[str] = mapped_column(String(12), index=True, default="deep")  # batch|deep
+    ticker: Mapped[Optional[str]] = mapped_column(String(32), index=True, nullable=True)
+    phase: Mapped[Optional[str]] = mapped_column(String(12), nullable=True)   # pre|main|break|closed
+    # Что решил Claude и что вышло в итоге:
+    verdict: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)  # up|down|flat|unavailable|error
+    final: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)    # up|down|flat (после вето)
+    saved: Mapped[bool] = mapped_column(Boolean, default=False)
+    prediction_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    reason: Mapped[Optional[str]] = mapped_column(String(32), index=True, nullable=True)  # код причины
+    # Параметры сетапа (для калибровки порогов):
+    mode: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)     # pullback|momentum
+    regime: Mapped[Optional[str]] = mapped_column(String(24), nullable=True)
+    confluence: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    rr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    entry: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    stop: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    target: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # Цена наблюдаемости — фактический расход провайдера:
+    cost_rub: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    tokens_in: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    tokens_out: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    note: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "ts": self.ts.isoformat() if self.ts else None,
+            "msk": self.msk,
+            "stage": self.stage,
+            "ticker": self.ticker,
+            "phase": self.phase,
+            "verdict": self.verdict,
+            "final": self.final,
+            "saved": self.saved,
+            "prediction_id": self.prediction_id,
+            "reason": self.reason,
+            "mode": self.mode,
+            "regime": self.regime,
+            "confluence": self.confluence,
+            "confidence": self.confidence,
+            "rr": self.rr,
+            "entry": self.entry,
+            "stop": self.stop,
+            "target": self.target,
+            "cost_rub": round(self.cost_rub, 3) if self.cost_rub is not None else None,
+            "tokens_in": self.tokens_in,
+            "tokens_out": self.tokens_out,
+            "note": self.note,
+        }
+
+
 def _ensure_sqlite_dir():
     """Для SQLite создаём директорию под файл БД (иначе connect упадёт)."""
     if "sqlite" in DATABASE_URL:
@@ -1206,3 +1283,140 @@ async def regime_stats() -> dict:
     by_regime.sort(key=lambda x: x["trades"], reverse=True)
     return {"by_regime": by_regime,
             "total_trades": sum(x["trades"] for x in by_regime)}
+
+
+# ─── Журнал попыток (наблюдаемость воронки сигналов) ──────────────────────────
+
+# Единый словарь кодов причин: почему попытка НЕ стала сигналом. Держим его
+# здесь, чтобы агрегация по журналу и дашборд говорили на одном языке.
+ATTEMPT_REASONS = {
+    "saved":               "сигнал сохранён",
+    "claude_flat":         "Claude сам сказал neutral (нет перевеса)",
+    "claude_unavailable":  "Claude не ответил (баланс/ошибка/обрезка JSON)",
+    "analysis_error":      "ошибка анализа до Claude",
+    "no_plan":             "нет валидного плана (вход/стоп/цель)",
+    "already_open":        "по тикеру уже открыт сигнал",
+    "veto_window":         "вето: окно торговли (первые минуты / нет ORB)",
+    "veto_chase":          "вето: чейз (вход далеко от уровня / растянут от VWAP)",
+    "veto_confluence":     "вето: конфлюенс ниже порога",
+    "veto_session_closed": "вето: рынок закрыт / пауза / пре-аукцион",
+    "veto_session_end":    "вето: конец сессии (флэт к закрытию)",
+    "veto_other":          "вето: прочее",
+    "batch":               "batch-скрин (общая картина)",
+    "batch_no_watch":      "batch: ни одного тикера в watch",
+    "manual":              "ручной вызов карточки (вне воронки сканера)",
+    "budget":              "остановлено бюджет-гардом",
+}
+
+
+async def add_signal_attempt(data: dict) -> Optional[int]:
+    """
+    Записать ОДНУ попытку сигнала. Вызывается всегда — и когда сигнал сохранён,
+    и когда отклонён (вето / neutral / Claude недоступен / занятый тикер).
+    Никогда не роняет вызывающий код: журнал не должен ломать торговый цикл.
+    """
+    try:
+        msk = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%H:%M МСК")
+        row = SignalAttempt(
+            msk=data.get("msk") or msk,
+            stage=(data.get("stage") or "deep")[:12],
+            ticker=(data.get("ticker") or None),
+            phase=(data.get("phase") or None),
+            verdict=(data.get("verdict") or None),
+            final=(data.get("final") or None),
+            saved=bool(data.get("saved")),
+            prediction_id=data.get("prediction_id"),
+            reason=(data.get("reason") or None),
+            mode=(data.get("mode") or None),
+            regime=(data.get("regime") or None),
+            confluence=data.get("confluence"),
+            confidence=data.get("confidence"),
+            rr=data.get("rr"),
+            entry=data.get("entry"),
+            stop=data.get("stop"),
+            target=data.get("target"),
+            cost_rub=data.get("cost_rub"),
+            tokens_in=data.get("tokens_in"),
+            tokens_out=data.get("tokens_out"),
+            note=(data.get("note") or None),
+        )
+        if row.note:
+            row.note = str(row.note)[:500]
+        async with async_session() as session:
+            session.add(row)
+            await session.commit()
+            return row.id
+    except Exception as e:
+        logger.debug(f"add_signal_attempt: {e}")
+        return None
+
+
+async def recent_signal_attempts(hours: int = 24, limit: int = 200,
+                                 ticker: Optional[str] = None) -> list[dict]:
+    """Последние попытки (свежие сверху)."""
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    async with async_session() as session:
+        q = select(SignalAttempt).where(SignalAttempt.ts >= since)
+        if ticker:
+            q = q.where(SignalAttempt.ticker == ticker.upper())
+        q = q.order_by(SignalAttempt.ts.desc()).limit(limit)
+        rows = (await session.execute(q)).scalars().all()
+        return [r.to_dict() for r in rows]
+
+
+async def signal_attempt_stats(hours: int = 24) -> dict:
+    """
+    Воронка сигналов за период: где именно всё отсекается и сколько это стоило.
+
+    Возвращает:
+      funnel   — попытки, дошедшие до Claude, сохранённые сигналы;
+      reasons  — счётчик по кодам причин (с человеческой расшифровкой);
+      cost     — ₽ по стадиям, ₽ за попытку и ₽ за сохранённый сигнал;
+      by_hour  — попытки/сохранения по часу МСК (для оценки времени дня).
+    """
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    async with async_session() as session:
+        rows = (await session.execute(
+            select(SignalAttempt).where(SignalAttempt.ts >= since)
+        )).scalars().all()
+
+    reasons: dict[str, int] = {}
+    cost_by_stage: dict[str, float] = {}
+    by_hour: dict[str, dict] = {}
+    deep = saved = 0
+    tickers_seen: set[str] = set()
+    for r in rows:
+        reasons[r.reason or "?"] = reasons.get(r.reason or "?", 0) + 1
+        cost_by_stage[r.stage or "?"] = round(
+            cost_by_stage.get(r.stage or "?", 0.0) + (r.cost_rub or 0.0), 3)
+        if r.stage == "deep":
+            deep += 1
+            if r.ticker:
+                tickers_seen.add(r.ticker)
+        if r.saved:
+            saved += 1
+        h = (r.ts + timedelta(hours=3)).strftime("%H") if r.ts else "??"
+        b = by_hour.setdefault(h, {"attempts": 0, "saved": 0})
+        b["attempts"] += 1
+        if r.saved:
+            b["saved"] += 1
+
+    total_cost = round(sum(cost_by_stage.values()), 2)
+    return {
+        "hours": hours,
+        "funnel": {
+            "attempts_total": len(rows),
+            "deep_analyses": deep,
+            "unique_tickers": len(tickers_seen),
+            "saved_signals": saved,
+        },
+        "reasons": [{"code": k, "count": v, "label": ATTEMPT_REASONS.get(k, k)}
+                    for k, v in sorted(reasons.items(), key=lambda x: -x[1])],
+        "cost": {
+            "total_rub": total_cost,
+            "by_stage": cost_by_stage,
+            "per_attempt_rub": round(total_cost / len(rows), 2) if rows else None,
+            "per_saved_signal_rub": round(total_cost / saved, 2) if saved else None,
+        },
+        "by_hour_msk": dict(sorted(by_hour.items())),
+    }

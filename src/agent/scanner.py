@@ -199,6 +199,10 @@ async def scan_batch(aggregator, tickers=None, save: bool = True, max_deep: int 
                 "shortlist": [], "interesting": [], "budget": bud}
     if bud["left"] <= 0:
         logger.warning(f"💸 Дневной бюджет Claude исчерпан ({bud['rub']:.1f}/{bud['budget']:.0f}₽) — пропускаем")
+        await db.add_signal_attempt({
+            "stage": "batch", "verdict": "unavailable", "reason": "budget",
+            "note": f"дневной бюджет исчерпан: {bud['rub']:.1f}/{bud['budget']:.0f}₽",
+        })
         return {"screened": len(screened), "batch_watch": 0, "claude_confirmed": 0,
                 "shortlist": [], "interesting": [], "budget": bud,
                 "skipped": "бюджет исчерпан"}
@@ -212,9 +216,28 @@ async def scan_batch(aggregator, tickers=None, save: bool = True, max_deep: int 
     except Exception:
         pass
 
-    verdicts = await ClaudeAgent().batch_scan(market_ctx, briefs,
-                                              max_tokens=BATCH_SCAN_MAX_TOKENS)
+    agent = ClaudeAgent()
+    verdicts = await agent.batch_scan(market_ctx, briefs,
+                                      max_tokens=BATCH_SCAN_MAX_TOKENS)
     watch = [v for v in verdicts if v.get("watch")]
+
+    # Журнал попыток, стадия batch: фиксируем ВЕРХ воронки — сколько тикеров ушло
+    # Claude, сколько он взял в watch и сколько это стоило. Без этой строки «0
+    # сигналов за день» снова был бы необъясним.
+    _call = getattr(agent, "last_call", {}) or {}
+    await db.add_signal_attempt({
+        "stage": "batch",
+        "verdict": f"watch:{len(watch)}/{len(briefs)}",
+        "reason": "batch" if watch else "batch_no_watch",
+        "cost_rub": _call.get("cost_rub"),
+        "tokens_in": _call.get("tokens_in"),
+        "tokens_out": _call.get("tokens_out"),
+        "note": (("watch: " + ", ".join(f"{v.get('ticker')}/{v.get('regime') or '?'}"
+                                        for v in watch[:20])) if watch
+                 else (f"обрезка ответа по max_tokens={_call.get('max_tokens')}"
+                       if _call.get("truncated")
+                       else (_call.get("error") or "watch пуст — сетапов нет"))),
+    })
 
     try:
         open_tickers = await db.get_open_signal_tickers()
@@ -239,6 +262,11 @@ async def scan_batch(aggregator, tickers=None, save: bool = True, max_deep: int 
         if not await can_afford_deep():   # остатка мало → только дешёвый batch
             deep_skipped = "мало бюджета на глубокий разбор"
             logger.warning(f"💸 {t}: {deep_skipped} — пропуск")
+            await db.add_signal_attempt({
+                "stage": "deep", "ticker": t, "verdict": "unavailable",
+                "final": "flat", "reason": "budget",
+                "note": f"{deep_skipped} (остаток {bud['left']:.1f}₽)",
+            })
             break
         try:
             a = await analyst.analyze(t, aggregator, save=save)   # ← глубокий разбор + сохранение

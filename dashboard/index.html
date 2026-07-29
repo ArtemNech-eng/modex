@@ -335,6 +335,30 @@ header {
       <div style="font-size:10px;color:var(--dim);margin-top:6px;">⚠️ Каждый цикл делает реальные вызовы Claude и MOEX (расход токенов). Требуется настроенный API-ключ и доступ к MOEX ISS.</div>
     </div>
 
+    <!-- ВОРОНКА СИГНАЛОВ: почему сигналов нет и сколько это стоило -->
+    <div class="card" style="border:1px solid #d2992244;">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+        <div class="card-title" style="margin:0;">🔎 Воронка сигналов
+          <span id="funnelMeta" style="color:var(--dim);font-weight:400;font-size:11px;"></span>
+        </div>
+        <label style="font-size:12px;color:var(--dim);">За:
+          <select id="funnelHours" onchange="loadFunnel()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:3px;">
+            <option value="12">12 ч</option>
+            <option value="24" selected>сутки</option>
+            <option value="72">3 дня</option>
+            <option value="168">неделю</option>
+          </select>
+        </label>
+      </div>
+      <div style="font-size:11px;color:var(--dim);margin:6px 0 10px;line-height:1.5;">
+        Сигнал сохраняется, только если Claude дал направление И прошёл все фильтры. Здесь видно,
+        на каком шаге отсекается остальное — и сколько ₽ ушло на каждую попытку.
+      </div>
+      <div id="funnelCards" style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;"></div>
+      <div id="funnelReasons" style="margin-top:10px;"></div>
+      <div id="funnelRows" style="margin-top:10px;"></div>
+    </div>
+
     <!-- Сводка форвард-точности -->
     <div id="liveTrackSummary" style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;"></div>
 
@@ -1312,7 +1336,61 @@ function liveClosedRow(c) {
     <span style="color:${col};">${c.realized_return!=null?(c.realized_return>0?'+':'')+c.realized_return+'%':'—'}</span>
     <span>${ok?'✅':'❌'}</span></div>`;
 }
+// ── Воронка сигналов: где отсекается и сколько стоит ────────────────────────
+// Отвечает на вопрос «почему за день 0 сигналов»: каждая попытка Claude пишется
+// в журнал с кодом причины и фактической ценой вызова.
+const FUNNEL_COLORS = {
+  saved:'var(--green)', claude_flat:'var(--dim)', claude_unavailable:'var(--red)',
+  analysis_error:'var(--red)', budget:'var(--red)', no_plan:'var(--yellow)',
+  already_open:'var(--blue)', batch:'var(--blue)', batch_no_watch:'var(--dim)',
+};
+function funnelColor(code){
+  if (FUNNEL_COLORS[code]) return FUNNEL_COLORS[code];
+  return (code||'').startsWith('veto_') ? 'var(--yellow)' : 'var(--dim)';
+}
+async function loadFunnel() {
+  const hours = document.getElementById('funnelHours').value;
+  try {
+    const d = await (await fetch(`${API}/api/signal-attempts?hours=${hours}&limit=40`)).json();
+    const f = d.funnel||{}, c = d.cost||{};
+    document.getElementById('funnelMeta').textContent =
+      `· ${f.attempts_total||0} попыток · ${c.total_rub!=null?c.total_rub+'₽':'—'}`;
+    document.getElementById('funnelCards').innerHTML =
+      metricCard('Попыток', f.attempts_total||0, 'var(--text)') +
+      metricCard('Глубоких разборов', f.deep_analyses||0, 'var(--blue)') +
+      metricCard('Сигналов сохранено', f.saved_signals||0,
+                 (f.saved_signals>0)?'var(--green)':'var(--red)') +
+      metricCard('₽ за сигнал', c.per_saved_signal_rub!=null?c.per_saved_signal_rub+'₽':'—',
+                 c.per_saved_signal_rub!=null?'var(--yellow)':'var(--dim)');
+    // Причины — почему попытка не стала сигналом
+    const rs = d.reasons||[];
+    document.getElementById('funnelReasons').innerHTML = rs.length
+      ? `<div style="display:flex;flex-direction:column;gap:4px;">${rs.map(r=>
+          `<div style="display:grid;grid-template-columns:52px 1fr;gap:8px;font-size:12px;align-items:center;">
+             <b style="color:${funnelColor(r.code)};text-align:right;">${r.count}×</b>
+             <span style="color:var(--dim);">${r.label}</span>
+           </div>`).join('')}</div>`
+      : '<div style="color:var(--dim);font-size:12px;">Журнал пуст — сканер ещё не звал Claude в этом окне.</div>';
+    // Последние попытки построчно
+    const rows = d.attempts||[];
+    document.getElementById('funnelRows').innerHTML = rows.length
+      ? `<details><summary style="cursor:pointer;color:var(--dim);font-size:12px;">Последние попытки (${rows.length})</summary>
+         <div style="display:flex;flex-direction:column;gap:3px;margin-top:8px;">${rows.map(a=>
+          `<div style="display:grid;grid-template-columns:64px 62px 54px 1fr 52px;gap:6px;font-size:11px;align-items:center;padding:3px 0;border-bottom:1px solid var(--border);">
+             <span style="color:var(--dim);">${a.msk||''}</span>
+             <b>${a.ticker||(a.stage==='batch'?'ВСЕ':'—')}</b>
+             <span style="color:${funnelColor(a.reason)};">${a.saved?'✅':(a.verdict||'')}</span>
+             <span style="color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${(a.note||'').replace(/"/g,'&quot;')}">${a.note||a.reason||''}</span>
+             <span style="color:var(--dim);text-align:right;">${a.cost_rub!=null?a.cost_rub+'₽':''}</span>
+           </div>`).join('')}</div></details>`
+      : '';
+  } catch(e) {
+    document.getElementById('funnelReasons').innerHTML =
+      `<span style="color:var(--red);font-size:12px;">Ошибка загрузки воронки: ${e.message}</span>`;
+  }
+}
 async function loadLiveSignals() {
+  loadFunnel();
   try {
     const d = await (await fetch(`${API}/api/live-signals`)).json();
     renderLiveStatus(d.status||{});

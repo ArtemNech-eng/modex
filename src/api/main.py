@@ -746,7 +746,8 @@ async def get_agent_analysis(ticker: str, save: bool = True):
     ticker = ticker.upper()
     if ticker not in MOEX_TICKERS:
         raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
-    return await analyst.analyze(ticker, aggregator, save=save)
+    # stage="manual": ручной вызов не должен искажать воронку сканера в журнале.
+    return await analyst.analyze(ticker, aggregator, save=save, stage="manual")
 
 
 @app.get("/api/signals", summary="Лучшие торговые сетапы")
@@ -1389,6 +1390,23 @@ async def get_ai_budget():
     return st
 
 
+@app.get("/api/signal-attempts", summary="Журнал попыток: воронка сигналов и её цена")
+async def get_signal_attempts(hours: int = 24, limit: int = 200,
+                              ticker: Optional[str] = None):
+    """
+    ПОЧЕМУ нет сигналов — с точностью до фильтра.
+
+    Раньше в БД попадали только направленные сигналы Claude, поэтому «за день 0
+    сигналов» было необъяснимо: не видно, звали ли Claude, что он ответил и какой
+    фильтр всё съел. Здесь каждая попытка с кодом причины и фактической ценой
+    вызова в ₽ — плюс воронка и ₽ за сохранённый сигнал.
+    """
+    stats = await db.signal_attempt_stats(hours=hours)
+    stats["attempts"] = await db.recent_signal_attempts(
+        hours=hours, limit=limit, ticker=ticker)
+    return stats
+
+
 @app.get("/api/learning", summary="Статус контура обучения (always-on)")
 async def get_learning_status():
     """Оценка прогнозов идёт независимо от сканера — самообучение не прерывается,
@@ -1420,9 +1438,18 @@ async def get_live_signals(limit: int = 200):
     """
     from datetime import timedelta
     preds = await db.list_recent_predictions(limit=limit)
-    open_sig, closed_sig = [], []
+    open_sig, closed_sig, legacy_flat = [], [], 0
     for p in preds:
-        (open_sig if p.get("correct") is None else closed_sig).append(p)
+        if p.get("correct") is not None:
+            closed_sig.append(p)
+            continue
+        # «Открытый сигнал» = НАПРАВЛЕННЫЙ (up/down). Легаси-строки direction=flat
+        # сигналами никогда не были, тикер не блокируют (см. get_open_signal_tickers)
+        # и раньше врали в счётчике на дашборде — держим их отдельно.
+        if p.get("direction") in ("up", "down"):
+            open_sig.append(p)
+        else:
+            legacy_flat += 1
 
     for p in open_sig:
         a  = scanner.CACHE.results.get(p["ticker"]) or {}
@@ -1447,6 +1474,7 @@ async def get_live_signals(limit: int = 200):
         "status": _live_status,
         "open_signals": open_sig,
         "open_count": len(open_sig),
+        "legacy_flat_open": legacy_flat,   # старые не-сигналы (flat), в счёт не идут
         "evaluated_count": stats.get("evaluated", 0) if isinstance(stats, dict) else 0,
         "accuracy": stats.get("accuracy") if isinstance(stats, dict) else None,
         "recent_closed": closed_sig[:20],
