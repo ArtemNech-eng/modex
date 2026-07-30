@@ -1178,6 +1178,26 @@ async def post_signal_decision(pred_id: int, decision: str, note: Optional[str] 
     return {"status": "ok", "prediction": updated}
 
 
+@app.post("/api/signals/{pred_id}/correct-position",
+          summary="Пересчитать снимок позиции по записанным уровням")
+async def correct_signal_position(pred_id: int, payload: dict = Body(default={})):
+    """Привести рублёвый снимок позиции к записанным уровням. Работает и после оценки.
+
+    Уровни решения после оценки неприкосновенны — их правка переписывает историю.
+    Но снимок позиции (акции, рубли риска) — учётный факт об исполнении: он не
+    влияет ни на R, ни на признак correct, а только масштабирует рубли, и законно
+    может стать известен позже. У сигнала 664 снимок был посчитан от входа 39.00, и
+    журнал занижал убыток вдвое.
+
+    shares — если фактический объём отличался от расчётного.
+    """
+    res = await db.correct_prediction_position(
+        pred_id, shares=payload.get("shares"), note=str(payload.get("note") or ""))
+    if not res.get("ok"):
+        raise HTTPException(status_code=409, detail=res.get("reason"))
+    return res
+
+
 @app.post("/api/signals/{pred_id}/correct", summary="Исправить уровни сигнала до оценки")
 async def correct_signal_levels(pred_id: int, payload: dict = Body(...)):
     """Привести записанные уровни в соответствие с фактическим исполнением.

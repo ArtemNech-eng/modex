@@ -189,6 +189,94 @@ def test_real_function_recomputes_position():
     assert "position_after" in src and "size_position(" in src
     assert "risk_shares" in src.split("async def correct_prediction_levels")[1][:4000]
 
+
+# ───── снимок позиции: учётный факт, а не решение ─────────────────────────────
+
+def _apply_position(pred, shares=None, note=""):
+    """Чистое воспроизведение correct_prediction_position."""
+    import json
+    from datetime import datetime, timezone
+    from src.risk.engine import RiskConfig, size_position
+    if pred.entry is None or pred.stop is None:
+        return {"ok": False, "reason": "у прогноза нет уровней — считать нечего"}
+    ctx = json.loads(pred.context_json) if pred.context_json else {}
+    before = {k: ctx.get(k) for k in ("risk_shares", "risk_rub", "stop_pct")}
+    r_per_share = abs(pred.entry - pred.stop)
+    cfg = RiskConfig()
+    d = size_position(entry=pred.entry, stop=pred.stop,
+                      direction=("up" if getattr(pred, "direction", "up") == "up" else "down"),
+                      cfg=cfg, lot_size=1,
+                      spread_pct=ctx.get("spread_pct_at_signal"),
+                      depth_near_mid=ctx.get("depth_near_mid_at_signal"))
+    qty = int(shares) if shares else d.shares
+    after = {"risk_shares": qty, "risk_rub": round(qty * r_per_share, 2),
+             "stop_pct": round(r_per_share / pred.entry, 4)}
+    ctx.update(after)
+    trail = ctx.get("position_corrections") or []
+    trail.append({"at": datetime.now(timezone.utc).isoformat(), "before": before,
+                  "after": after, "after_evaluation": pred.correct is not None,
+                  "note": note or "снимок позиции приведён к записанным уровням"})
+    ctx["position_corrections"] = trail
+    pred.context_json = json.dumps(ctx, ensure_ascii=False)
+    return {"ok": True, "before": before, "after": after,
+            "r_per_share": round(r_per_share, 4),
+            "after_evaluation": pred.correct is not None}
+
+
+def test_position_correction_allowed_after_evaluation():
+    """ГЛАВНОЕ РАЗДЕЛЕНИЕ. Уровни после оценки неприкосновенны, а снимок позиции —
+    учётный факт: он не меняет ни R, ни correct, только масштабирует рубли.
+    Случай 664: оценка уже прошла (outcome=stop, realized_r=-1.0), а снимок остался
+    от входа 39.00 и занижал убыток вдвое."""
+    import json
+    p = _Pred(entry=39.40, stop=39.10, target=39.90, rr=1.67, correct=False,
+              realized=39.10,
+              ctx=json.dumps({"risk_shares": 1282, "risk_rub": 192.3,
+                              "spread_pct_at_signal": 0.0255,
+                              "depth_near_mid_at_signal": 231300}))
+    assert _apply(p, entry=39.50)["ok"] is False, "уровни после оценки менять нельзя"
+    r = _apply_position(p)
+    assert r["ok"] is True and r["after_evaluation"] is True
+    assert r["r_per_share"] == 0.30
+    assert r["after"]["risk_rub"] > r["before"]["risk_rub"] * 1.9, \
+        (r["before"]["risk_rub"], r["after"]["risk_rub"])
+
+
+def test_position_correction_does_not_touch_levels():
+    p = _Pred(entry=39.40, stop=39.10, target=39.90, rr=1.67, correct=False)
+    _apply_position(p)
+    assert (p.entry, p.stop, p.target, p.rr_planned) == (39.40, 39.10, 39.90, 1.67)
+
+
+def test_actual_shares_override():
+    """Фактический объём мог отличаться от расчётного — тогда берём факт."""
+    p = _Pred(entry=39.40, stop=39.10, correct=False)
+    r = _apply_position(p, shares=500)
+    assert r["after"]["risk_shares"] == 500
+    assert r["after"]["risk_rub"] == 150.0
+
+
+def test_position_correction_needs_levels():
+    p = _Pred(entry=None, stop=None)
+    assert _apply_position(p)["ok"] is False
+
+
+def test_position_trail_marks_post_evaluation():
+    import json
+    p = _Pred(entry=39.40, stop=39.10, correct=False)
+    _apply_position(p, note="приведено к фактическому исполнению")
+    tr = json.loads(p.context_json)["position_corrections"][0]
+    assert tr["after_evaluation"] is True and "фактическ" in tr["note"]
+
+
+def test_real_position_function_exists():
+    import pathlib
+    src = pathlib.Path(ROOT, "src", "db.py").read_text(encoding="utf-8")
+    assert "async def correct_prediction_position(" in src
+    body = src.split("async def correct_prediction_position")[1][:4000]
+    assert "position_corrections" in body
+    assert "pred.entry =" not in body and "pred.target =" not in body
+
 if __name__ == "__main__":
     tests = [(n, o) for n, o in sorted(globals().items())
              if n.startswith("test_") and callable(o)]

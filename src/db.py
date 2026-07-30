@@ -986,6 +986,80 @@ async def accuracy_stats(ticker: Optional[str] = None) -> dict:
     }
 
 
+async def correct_prediction_position(pred_id: int, shares: Optional[int] = None,
+                                      note: str = "") -> dict:
+    """Пересчитать снимок позиции по УЖЕ ЗАПИСАННЫМ уровням. Можно и после оценки.
+
+    Разделение важно по смыслу:
+      • уровни решения (entry/stop/target) после оценки НЕПРИКОСНОВЕННЫ — их правка
+        переписывает и решение, и посчитанный исход;
+      • снимок позиции (сколько акций, сколько рублей риска) — учётный ФАКТ об
+        исполнении. Он не влияет ни на R, ни на признак correct, а только
+        масштабирует рублёвые числа, и он законно может стать известен позже.
+
+    Сигнал 664: снимок был посчитан от входа 39.00 со стопом 38.85 (риск 0.15 на
+    акцию, 192₽). Записанные уровни — 39.40 и 39.10, риск 0.30 на акцию, то есть
+    385₽. Без этой правки журнал занижал убыток ровно вдвое, а вместе с ним и
+    рублёвое ожидание по счёту. При этом realized_r = -1.0 верен: R нормирован.
+
+    shares задаётся, если фактический объём отличался от расчётного. Иначе размер
+    берётся от Risk Engine по записанным уровням.
+    """
+    async with async_session() as session:
+        pred = await session.get(Prediction, pred_id)
+        if pred is None:
+            return {"ok": False, "reason": "прогноз не найден"}
+        if pred.entry is None or pred.stop is None:
+            return {"ok": False, "reason": "у прогноза нет уровней — считать нечего"}
+
+        ctx = {}
+        if pred.context_json:
+            try:
+                ctx = json.loads(pred.context_json) or {}
+            except Exception:
+                ctx = {}
+        before = {k: ctx.get(k) for k in
+                  ("risk_shares", "risk_rub", "risk_pct_of_account",
+                   "risk_notional_rub", "risk_binding", "stop_pct")}
+
+        r_per_share = abs(pred.entry - pred.stop)
+        after = None
+        try:
+            from src.risk.engine import RiskConfig, size_position
+            cfg = RiskConfig()
+            d = size_position(
+                entry=pred.entry, stop=pred.stop,
+                direction=("up" if pred.direction == "up" else "down"),
+                cfg=cfg, lot_size=int(ctx.get("lot_size") or 1),
+                spread_pct=ctx.get("spread_pct_at_signal"),
+                depth_near_mid=ctx.get("depth_near_mid_at_signal"))
+            qty = int(shares) if shares else d.shares
+            after = {
+                "risk_shares": qty,
+                "risk_rub": round(qty * r_per_share, 2),
+                "risk_pct_of_account": round(qty * r_per_share / cfg.account_rub * 100, 4),
+                "risk_notional_rub": round(qty * pred.entry, 2),
+                "risk_binding": ("fact" if shares else d.binding_constraint),
+                "stop_pct": round(r_per_share / pred.entry, 4),
+            }
+            ctx.update(after)
+        except Exception as e:                       # noqa: BLE001
+            return {"ok": False, "reason": f"пересчёт не удался: {str(e)[:120]}"}
+
+        trail = ctx.get("position_corrections") or []
+        trail.append({"at": datetime.now(timezone.utc).isoformat(),
+                      "before": before, "after": after,
+                      "levels": {"entry": pred.entry, "stop": pred.stop},
+                      "after_evaluation": pred.correct is not None,
+                      "note": note or "снимок позиции приведён к записанным уровням"})
+        ctx["position_corrections"] = trail
+        pred.context_json = json.dumps(ctx, ensure_ascii=False)
+        await session.commit()
+        return {"ok": True, "before": before, "after": after,
+                "r_per_share": round(r_per_share, 4),
+                "after_evaluation": pred.correct is not None}
+
+
 async def correct_prediction_levels(pred_id: int, entry: Optional[float] = None,
                                     stop: Optional[float] = None,
                                     target: Optional[float] = None,
