@@ -28,7 +28,7 @@ def test_intraday_atr_simple_mean_of_true_ranges():
 
 
 def test_opening_range_and_none_when_too_few_bars():
-    assert iv.opening_range([10, 11, 12, 9], [8, 9, 10, 7], bars=2) == {
+    assert iv.opening_range([10, 11, 12, 9], [8, 9, 10, 7], bars=2, assume_scoped=True) == {
         "or_high": 11, "or_low": 8, "bars": 2}
     assert iv.opening_range([10], [8], bars=6) is None
 

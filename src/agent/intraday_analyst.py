@@ -90,7 +90,10 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
     atr = iv.intraday_atr(h, l, c)
     vol = iv.volatility_state(h, l, c)
     vel = iv.velocity(c, v)   # скорость цены/объёма (ROC): движение ускоряется?
-    orr = iv.opening_range(h, l, bars=opening_range_bars)
+    # даты обязательны: без них диапазон открытия считался бы по первым свечам
+    # окна загрузки, то есть по утренней сессии вместо текущей
+    orr = iv.opening_range(h, l, bars=opening_range_bars,
+                           dates=candles.get("dates"))
     phase = iv.session_phase(minute_of_day)
     last_min = iv.is_last_minutes(minute_of_day)
 

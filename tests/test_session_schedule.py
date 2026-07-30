@@ -176,6 +176,91 @@ def test_context_computes_across_whole_trading_day():
             ctx = _ia.compute_intraday_context(_candles(), hm(h_, m_))
             assert ctx is None or "levels" in ctx, (h_, m_)
 
+
+# ───── диапазон открытия: только СВОЯ сессия ─────────────────────────────────
+
+from src.analysis.intraday import opening_range as _or  # noqa: E402
+
+
+def _bars(times, highs, lows):
+    """Свечи по временам МСК вида (час, минута) — как kwargs, чтобы даты не
+    попадали в позицию bars."""
+    return {"highs": highs, "lows": lows,
+            "dates": [f"2026-07-30T{h:02d}:{m:02d}:00+03:00" for h, m in times]}
+
+
+def test_opening_range_ignores_previous_session():
+    """ГЛАВНОЕ. Окно загрузки 8 часов, поэтому в 10:05 первыми свечами идёт
+    утренняя сессия. Раньше диапазон считался по ней, цена к основной сессии
+    почти всегда уходила за трёхчасовой давности границы, и пробой срабатывал
+    сам собой: 30.07 в 10:07 десять тикеров получили одинаковый orb 0.90-1.00.
+    Диапазон обязан строиться по свечам ТЕКУЩЕЙ сессии."""
+    times = [(7, 0), (7, 5), (7, 10), (7, 15), (7, 20), (7, 25),   # утренняя
+             (10, 0), (10, 5), (10, 10), (10, 15), (10, 20), (10, 25)]
+    highs = [92.6, 92.4, 92.4, 92.3, 92.3, 92.3] + [93.3] * 6
+    lows  = [92.1, 92.2, 92.2, 92.2, 92.2, 92.2] + [93.1] * 6
+    r = _or(**_bars(times, highs, lows), bars=6)
+    assert r is not None
+    # границы основной сессии, а не утренней 92.1..92.6
+    assert r["or_low"] == 93.1 and r["or_high"] == 93.3, r
+    assert r["session_open_min"] == 10 * 60
+
+
+def test_no_range_before_enough_bars():
+    """В первые 30 минут диапазона открытия ещё НЕТ — и ORB не существует.
+    Именно этот случай был в 10:05: два бара основной сессии."""
+    times = [(7, h) for h in (0, 5, 10, 15, 20, 25, 30, 35)] + [(10, 0), (10, 5)]
+    n = len(times)
+    r = _or(**_bars(times, [93.0] * n, [92.0] * n), bars=6)
+    assert r is None
+
+
+def test_range_appears_exactly_at_sixth_bar():
+    times = [(10, 5 * i) for i in range(6)]
+    r = _or(**_bars(times, [93.0] * 6, [92.0] * 6), bars=6)
+    assert r is not None and r["session_bars"] == 6
+
+
+def test_no_false_breakout_across_sessions():
+    """Цена ВЫШЕ утреннего хая, но ВНУТРИ диапазона основной сессии —
+    пробоя быть не должно. Раньше был."""
+    times = [(7, 5 * i) for i in range(6)] + [(10, 5 * i) for i in range(6)]
+    highs = [92.6] * 6 + [93.5] * 6
+    lows  = [92.1] * 6 + [93.0] * 6
+    r = _or(**_bars(times, highs, lows), bars=6)
+    price = 93.2                      # выше 92.6, но внутри 93.0..93.5
+    assert price > max(highs[:6]), "цена действительно выше утреннего хая"
+    assert not (price > r["or_high"] or price < r["or_low"]), "пробоя нет"
+
+
+def test_morning_session_has_its_own_range():
+    """Утренняя сессия торгуемая, у неё свой диапазон от 07:00."""
+    times = [(7, 5 * i) for i in range(6)]
+    r = _or(**_bars(times, [92.6] * 6, [92.1] * 6), bars=6)
+    assert r is not None and r["session_open_min"] == 7 * 60
+
+
+def test_evening_session_range_counts_from_1900():
+    times = [(14, 5 * i) for i in range(6)] + [(19, 5 * i) for i in range(6)]
+    highs = [100.0] * 6 + [105.0] * 6
+    lows = [99.0] * 6 + [104.0] * 6
+    r = _or(**_bars(times, highs, lows), bars=6)
+    assert r["session_open_min"] == 19 * 60
+    assert r["or_low"] == 104.0 and r["or_high"] == 105.0
+
+
+def test_no_dates_means_no_range():
+    """Без дат считать нельзя: молчаливый расчёт по чужой сессии и был багом."""
+    assert _or([93.0] * 10, [92.0] * 10, bars=6) is None
+
+
+def test_break_time_falls_back_to_last_traded_session():
+    """В перерыве 18:50-19:00 диапазон берём по сессии последней торговой свечи."""
+    times = [(10, 5 * i) for i in range(6)] + [(18, 55)]
+    n = len(times)
+    r = _or(**_bars(times, [93.0] * n, [92.0] * n), bars=6)
+    assert r is not None and r["session_open_min"] == 10 * 60
+
 if __name__ == "__main__":
     tests = [(n, o) for n, o in sorted(globals().items())
              if n.startswith("test_") and callable(o)]

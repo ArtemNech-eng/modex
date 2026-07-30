@@ -93,18 +93,82 @@ def candle_anatomy(o: float, h: float, l: float, c: float) -> dict:
 
 # ─── Диапазон открытия и его пробой (ORB) ─────────────────────────────────────
 
-def opening_range(highs: list[float], lows: list[float], bars: int = 6) -> Optional[dict]:
+def _minute_of_day(ts) -> Optional[int]:
+    """Минута дня по МСК из отметки свечи. None, если отметку не разобрать."""
+    from datetime import datetime, timedelta, timezone as _tz
+    if isinstance(ts, datetime):
+        dt = ts
+    else:
+        try:
+            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_tz.utc)
+    msk = dt.astimezone(_tz(timedelta(hours=3)))
+    return msk.hour * 60 + msk.minute
+
+
+def opening_range(highs: list[float], lows: list[float], bars: int = 6,
+                  dates: Optional[list] = None,
+                  assume_scoped: bool = False) -> Optional[dict]:
     """
-    Диапазон открытия: хай/лоу первых `bars` свечей.
-    Для 5-мин свечей bars=6 ≈ первые 30 минут сессии.
+    Диапазон открытия ТЕКУЩЕЙ сессии: хай/лоу первых `bars` её свечей.
+    Для 5-мин свечей bars=6 ≈ первые 30 минут.
+
+    ВАЖНО, почему нужны даты. Раньше брались просто highs[:bars] — первые свечи
+    ПРИСЛАННОГО ОКНА. Окно интрадей-загрузки 8 часов, поэтому в 10:05 МСК первыми
+    свечами оказывались 06:55-07:25 — открытие УТРЕННЕЙ сессии. К основной сессии
+    цена почти всегда уходила за этот трёхчасовой давности диапазон, и «пробой»
+    срабатывал сразу почти на каждой ликвидной бумаге: 30.07 в 10:07 сразу десять
+    тикеров получили одинаковый сетап orb с интересом 0.90-1.00.
+
+    Без дат возвращаем None: молча считать по чужой сессии хуже, чем не считать.
+    Пока с открытия сессии не набралось `bars` свечей — диапазона ещё нет,
+    и это тоже None (в первые 30 минут ORB не существует).
+
+    assume_scoped=True — вызывающий ЗАЯВЛЯЕТ, что серия уже принадлежит одной
+    сессии, и тогда даты не нужны. Флаг явный именно потому, что молчаливое
+    допущение «серия уже нарезана» и было причиной ложных пробоев.
     """
+    if assume_scoped:
+        n = min(len(highs), len(lows))
+        if bars <= 0 or n < bars:
+            return None
+        return {"or_high": round(max(highs[:bars]), 6),
+                "or_low": round(min(lows[:bars]), 6), "bars": bars}
     n = min(len(highs), len(lows))
-    if n < bars or bars <= 0:
+    if bars <= 0 or n < bars:
         return None
+    if not dates or len(dates) < n:
+        return None
+
+    mins = [_minute_of_day(d) for d in dates[:n]]
+    if mins[-1] is None:
+        return None
+    s_open = session_open_minute(mins[-1])
+    if s_open is None:
+        # Вне торгов (аукцион/перерыв/закрыто) — берём сессию последней свечи,
+        # которая была торговой, иначе диапазон не определён.
+        for m in reversed(mins):
+            if m is not None and session_open_minute(m) is not None:
+                s_open = session_open_minute(m)
+                break
+    if s_open is None:
+        return None
+
+    # Свечи текущей сессии: минута дня не раньше её открытия. Сравнение по минуте
+    # дня безопасно, потому что окно загрузки короче суток.
+    idx = [i for i, m in enumerate(mins) if m is not None and m >= s_open]
+    if len(idx) < bars:
+        return None
+    first = idx[:bars]
     return {
-        "or_high": round(max(highs[:bars]), 6),
-        "or_low": round(min(lows[:bars]), 6),
+        "or_high": round(max(highs[i] for i in first), 6),
+        "or_low": round(min(lows[i] for i in first), 6),
         "bars": bars,
+        "session_open_min": s_open,
+        "session_bars": len(idx),
     }
 
 
