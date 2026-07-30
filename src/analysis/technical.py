@@ -380,6 +380,10 @@ class TechnicalAnalysis:
     volume_label: Optional[str] = None      # всплеск / выше среднего / норма / ниже
     last_volume: Optional[float] = None
     last_turnover: Optional[float] = None
+    # На чём считана головная цифра объёма и каков ТЕМП незавершённого дня.
+    volume_basis: Optional[str] = None      # last_bar | last_completed_day
+    pace_rel: Optional[float] = None        # объём сегодня / ожидаемый к этому часу
+    pace_note: Optional[str] = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -393,7 +397,9 @@ class TechnicalAnalysis:
 
 
 def volume_stats(volumes: Optional[list], values: Optional[list] = None,
-                 lookback: int = 20) -> dict:
+                 lookback: int = 20,
+                 last_bar_complete: Optional[bool] = None,
+                 day_progress: Optional[float] = None) -> dict:
     """Относительный объём: последний бар против среднего предыдущих.
 
     Возвращает rel_volume, rel_turnover и словесную метку. Нужен для базовой
@@ -410,14 +416,21 @@ def volume_stats(volumes: Optional[list], values: Optional[list] = None,
     заниженным. Поле `last_bar_may_be_partial` предупреждает об этом, чтобы
     низкий rel_volume в середине дня не читался как отсутствие интереса.
     """
-    def _rel(series):
+    # Если последний бар НЕЗАВЕРШЁН, он не сравним с полными днями: утренний
+    # отрезок против полных суток всегда выглядит пустым. Поэтому головная цифра
+    # считается по ЗАВЕРШЁННЫМ барам, а незавершённый выносится в темп.
+    incomplete = (last_bar_complete is False)
+
+    def _rel(series, drop_last=False):
         if not series:
             return None
-        clean = [(i, v) for i, v in enumerate(series) if v is not None and v > 0]
+        clean = [v for v in series if v is not None and v > 0]
+        if drop_last:
+            clean = clean[:-1]
         if len(clean) < 3:
             return None
-        last = clean[-1][1]
-        prior = [v for _i, v in clean[:-1]][-lookback:]
+        last = clean[-1]
+        prior = clean[:-1][-lookback:]
         if not prior:
             return None
         avg = sum(prior) / len(prior)
@@ -425,8 +438,19 @@ def volume_stats(volumes: Optional[list], values: Optional[list] = None,
             return None
         return round(last / avg, 2)
 
-    rv = _rel(volumes)
-    rt = _rel(values)
+    def _avg_prior(series, skip_last=0):
+        if not series:
+            return None
+        clean = [v for v in series if v is not None and v > 0]
+        if skip_last:
+            clean = clean[:-skip_last]
+        prior = clean[-lookback:]
+        if not prior:
+            return None
+        return sum(prior) / len(prior)
+
+    rv = _rel(volumes, drop_last=incomplete)
+    rt = _rel(values, drop_last=incomplete)
     ref = rt if rt is not None else rv
     if ref is None:
         label = None
@@ -438,14 +462,36 @@ def volume_stats(volumes: Optional[list], values: Optional[list] = None,
         label = "норма"
     else:
         label = "ниже среднего"
-    return {
+
+    out = {
         "rel_volume": rv,
         "rel_turnover": rt,
         "volume_label": label,
         "last_volume": (volumes or [None])[-1] if volumes else None,
         "last_turnover": (values or [None])[-1] if values else None,
         "last_bar_may_be_partial": True,
+        # На чём считана головная цифра: если последний бар незавершён — на
+        # предыдущем ЗАВЕРШЁННОМ дне, и об этом надо знать при чтении.
+        "basis": ("last_completed_day" if incomplete else "last_bar"),
+        "pace_rel": None,
+        "pace_note": None,
     }
+
+    # ТЕМП незавершённого дня: сколько объёма набрано против того, сколько ожидалось
+    # бы к этому моменту при среднем дне. Ровно эту цифру и надо читать утром.
+    if incomplete and day_progress and day_progress > 0.02:
+        src = values if (values and any(values)) else volumes
+        avg_full = _avg_prior(src, skip_last=1)
+        today = None
+        if src:
+            today = src[-1] if src[-1] not in (None, 0) else None
+        if avg_full and today:
+            out["pace_rel"] = round(today / (avg_full * day_progress), 2)
+            out["pace_note"] = (
+                f"прошло {day_progress*100:.0f}% торгуемого дня; ПРИБЛИЖЁННО — "
+                "внутридневной объём распределён неравномерно (открытие и закрытие "
+                "тяжелее середины), поэтому утром темп систематически завышен")
+    return out
 
 
 def compute_from_series(
@@ -455,6 +501,8 @@ def compute_from_series(
     lows: Optional[list[float]] = None,
     volumes: Optional[list] = None,
     values: Optional[list] = None,
+    last_bar_complete: Optional[bool] = None,
+    day_progress: Optional[float] = None,
 ) -> TechnicalAnalysis:
     """
     Полный технический анализ по рядам цен, с учётом режима рынка.
@@ -540,10 +588,16 @@ def compute_from_series(
 
     trade_plan = compute_levels(closes, highs, lows, signal, s20, regime=regime, range_pos=rpos) if price else {}
 
-    vs = volume_stats(volumes, values)
+    vs = volume_stats(volumes, values, last_bar_complete=last_bar_complete,
+                      day_progress=day_progress)
     if vs.get("volume_label"):
         _ref = vs.get("rel_turnover") or vs.get("rel_volume")
-        reasons.append(f"Объём: {vs['volume_label']} ({_ref}× среднего)")
+        _basis = ("последний завершённый день"
+                  if vs.get("basis") == "last_completed_day" else "последний бар")
+        reasons.append(f"Объём: {vs['volume_label']} ({_ref}× среднего, {_basis})")
+    if vs.get("pace_rel") is not None:
+        reasons.append(f"Темп объёма сегодня: {vs['pace_rel']}× от ожидаемого "
+                       "к этому моменту (приближённо)")
 
     return TechnicalAnalysis(
         ticker=ticker, price=price, sma20=s20, sma50=s50, rsi14=r, macd_hist=hist,
@@ -554,6 +608,8 @@ def compute_from_series(
         rel_volume=vs.get("rel_volume"), rel_turnover=vs.get("rel_turnover"),
         volume_label=vs.get("volume_label"),
         last_volume=vs.get("last_volume"), last_turnover=vs.get("last_turnover"),
+        volume_basis=vs.get("basis"), pace_rel=vs.get("pace_rel"),
+        pace_note=vs.get("pace_note"),
     )
 
 
@@ -635,10 +691,26 @@ async def analyze_ticker(ticker: str, days: int = 120) -> Optional[TechnicalAnal
     if len(closes) < 30:
         logger.info(f"MOEX ISS: мало свечей для {ticker} ({len(closes)})")
         return None
+    # Завершён ли последний бар: если его дата — сегодняшняя МСК-дата и торговый
+    # день ещё не закончился, бар НЕЗАВЕРШЁН и с полными днями не сравним.
+    last_complete, progress = None, None
+    try:
+        from src.analysis.intraday import trading_day_progress
+        msk = datetime.now(timezone.utc) + timedelta(hours=3)
+        mod = msk.hour * 60 + msk.minute
+        progress = trading_day_progress(mod)
+        dates = full.get("dates") or []
+        last_date = str(dates[-1])[:10] if dates else ""
+        last_complete = not (last_date == msk.strftime("%Y-%m-%d") and progress < 1.0)
+    except Exception as e:                  # noqa: BLE001
+        logger.debug("определение завершённости бара %s: %s", ticker, e)
+
     return compute_from_series(ticker.upper(), closes,
                                full.get("high"), full.get("low"),
                                volumes=full.get("volume"),
-                               values=full.get("value"))
+                               values=full.get("value"),
+                               last_bar_complete=last_complete,
+                               day_progress=progress)
 
 
 # ─── Структура графика: свинги, S/R-пивоты, тренд, RSI-дивергенция ────────────

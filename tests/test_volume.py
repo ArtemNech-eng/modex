@@ -129,9 +129,101 @@ def test_batch_line_and_legend_stay_in_sync():
     src = open(os.path.join(ROOT, "src", "agent", "claude_agent.py"),
                encoding="utf-8").read()
     assert "rv{_s(b.get('rvol'))}" in src, "объём не попал в строку batch"
+    assert "pace{_s(b.get('pace'))}" in src, "темп не попал в строку batch"
+    assert "pace<темп объёма сегодня" in src, "темп не описан в легенде"
     assert "' RT' if b.get('rt') else ' DLY'" in src, "метка реалтайма не в строке"
-    assert "rv<объём к среднему" in src, "объём не описан в легенде"
+    assert "rv<объём последнего ЗАВЕРШЁННОГО дня" in src, "объём не описан в легенде"
     assert "RT=реалтайм/DLY=" in src, "метка реалтайма не описана в легенде"
+
+
+# ──────────── незавершённый бар: головная цифра и темп ───────────────────────
+
+def test_incomplete_bar_excluded_from_headline():
+    """ГЛАВНОЕ: незавершённый бар НЕ должен попадать в головную цифру.
+    Утренний отрезок против полных дней всегда выглядит пустым — именно так
+    всплеск объёма 2.81x читался как 0.83, то есть 'ниже среднего'."""
+    full = [100] * 20 + [280]        # вчера был всплеск 2.8x
+    today_partial = full + [30]      # сегодня набрано только 30 (утро)
+    bad = volume_stats(today_partial)                            # без признака
+    good = volume_stats(today_partial, last_bar_complete=False)   # с признаком
+    assert bad["rel_volume"] < 1.0, bad["rel_volume"]            # обманчиво низко
+    assert good["rel_volume"] == 2.8, good["rel_volume"]         # правда
+    assert good["basis"] == "last_completed_day"
+    assert good["volume_label"] == "всплеск объёма"
+
+
+def test_complete_bar_uses_last_bar():
+    r = volume_stats([100] * 20 + [250], last_bar_complete=True)
+    assert r["basis"] == "last_bar" and r["rel_volume"] == 2.5
+
+
+def test_pace_measures_today_against_expected():
+    """Темп: набрано против ожидаемого к этому моменту, а не против полного дня."""
+    v = [100] * 20 + [50]
+    r = volume_stats(v, last_bar_complete=False, day_progress=0.25)
+    # ожидалось 100*0.25=25, набрано 50 -> темп 2.0
+    assert r["pace_rel"] == 2.0
+
+
+def test_pace_normal_when_on_schedule():
+    v = [100] * 20 + [25]
+    r = volume_stats(v, last_bar_complete=False, day_progress=0.25)
+    assert r["pace_rel"] == 1.0
+
+
+def test_pace_absent_without_progress():
+    """Без доли прошедшего дня темп не выдумывается."""
+    r = volume_stats([100] * 20 + [50], last_bar_complete=False)
+    assert r["pace_rel"] is None and r["pace_note"] is None
+
+
+def test_pace_absent_at_session_start():
+    """В самом начале дня темп не считается: деление на почти ноль даёт мусор."""
+    r = volume_stats([100] * 20 + [1], last_bar_complete=False, day_progress=0.005)
+    assert r["pace_rel"] is None
+
+
+def test_pace_note_warns_about_uneven_distribution():
+    """Предупреждение о неравномерности обязательно: линейная модель утром
+    систематически завышает темп, и без оговорки её прочитают буквально."""
+    r = volume_stats([100] * 20 + [50], last_bar_complete=False, day_progress=0.25)
+    assert "ПРИБЛИЖЁННО" in r["pace_note"]
+    assert "неравномерно" in r["pace_note"]
+
+
+def test_turnover_priority_holds_for_incomplete_bar():
+    r = volume_stats([100] * 20 + [100] + [10],
+                     [100] * 20 + [300] + [10],
+                     last_bar_complete=False)
+    assert r["rel_turnover"] == 3.0 and r["volume_label"] == "всплеск объёма"
+
+
+# ─────────────────── прогресс торгового дня ──────────────────────────────────
+
+from src.analysis.intraday import trading_day_progress as _tp  # noqa: E402
+
+
+def test_day_progress_zero_before_open():
+    assert _tp(6 * 60) == 0.0
+    assert _tp(7 * 60) == 0.0
+
+
+def test_day_progress_grows_monotonically():
+    prev = -1.0
+    for h in range(7, 24):
+        cur = _tp(h * 60)
+        assert cur >= prev, h
+        prev = cur
+
+
+def test_day_progress_full_at_close():
+    assert _tp(23 * 60 + 50) == 1.0
+
+
+def test_day_progress_skips_breaks():
+    """Перерыв 18:50-19:00 не должен добавлять прогресс — он не торгуемый."""
+    assert _tp(18 * 60 + 50) == _tp(19 * 60)
+    assert _tp(9 * 60 + 50) == _tp(10 * 60)
 
 if __name__ == "__main__":
     tests = [(n, o) for n, o in sorted(globals().items())

@@ -297,6 +297,23 @@ def session_open_minute(minute_of_day: int) -> Optional[int]:
     return None
 
 
+
+def trading_day_progress(minute_of_day: int) -> float:
+    """Доля ТОРГУЕМЫХ минут дня, которая уже прошла (0..1).
+
+    Считается по фактическому расписанию: утро + основная + вечерняя, БЕЗ
+    перерывов и аукционов. Нужна, чтобы сравнивать ТЕМП объёма, а не абсолют:
+    незавершённый день против полных дней всегда выглядит пустым.
+    """
+    d = _sched()
+    spans = [(d["m_open"], d["m_close"]), (d["open"], d["close"]),
+             (d["e_open"], d["e_close"])]
+    total = sum(max(0, b - a) for a, b in spans)
+    if total <= 0:
+        return 1.0
+    done = sum(max(0, min(minute_of_day, b) - a) for a, b in spans)
+    return max(0.0, min(1.0, done / total))
+
 def is_last_minutes(minute_of_day: int, buffer_min: int = 10) -> bool:
     """
     True, если до конца текущей сессии осталось <= buffer_min минут — в это
