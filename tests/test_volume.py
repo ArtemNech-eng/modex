@@ -133,6 +133,7 @@ def test_batch_line_and_legend_stay_in_sync():
     assert "pace<темп объёма сегодня" in src, "темп не описан в легенде"
     assert "' RT' if b.get('rt') else ' DLY'" in src, "метка реалтайма не в строке"
     assert "rv<объём последнего ЗАВЕРШЁННОГО дня" in src, "объём не описан в легенде"
+    assert "age<возраст последней свечи" in src, "возраст данных не описан в легенде"
     assert "RT=реалтайм/DLY=" in src, "метка реалтайма не описана в легенде"
 
 

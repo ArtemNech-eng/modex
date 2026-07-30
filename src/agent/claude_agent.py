@@ -307,6 +307,13 @@ class ClaudeAgent:
         """
         import json
 
+        def _age_s(a):
+
+            """Возраст свечи для строки batch: пусто, если неизвестен."""
+
+            return "" if a is None else f" age{a:.0f}м"
+
+
         def _s(v, dash="-"):
             return dash if v in (None, "") else v
 
@@ -327,7 +334,9 @@ class ClaudeAgent:
                 f"fl:{_s(b.get('flow'))}/{_s(b.get('delta'))}/{_s(b.get('buy_pct'))}% "
                 f"si{_s(b.get('si'))} set:{_s(b.get('setup'))} "
                 f"rv{_s(b.get('rvol'))} pace{_s(b.get('pace'))}"
-                f"{'' if b.get('rt') is None else (' RT' if b.get('rt') else ' DLY')}")
+                f"{'' if b.get('rt') is None else (' RT' if b.get('rt') else ' DLY')}"
+                f"{_age_s(b.get('age'))}"
+                f"{' УСТАРЕЛО' if b.get('stale') else ''}")
         if not lines:
             return []
         legend = ("Формат строки: ТИКЕР p<цена> <позиция к VWAP> <режим> adx rsi atr "
@@ -336,7 +345,9 @@ class ClaudeAgent:
                   "fl:<поток>/<дельта,лот>/<%покупок> si<настроение> set:<сетап> "
                   "rv<объём последнего ЗАВЕРШЁННОГО дня к среднему, ×> "
                   "pace<темп объёма сегодня к ожидаемому на этот час, ×> "
-                  "RT=реалтайм/DLY=данные с задержкой ~15мин")
+                  "RT=реалтайм/DLY=с задержкой "
+                  "age<возраст последней свечи, мин> "
+                  "УСТАРЕЛО=данные старее порога, сетапы по ним не строятся")
         tickers_block = "\n".join(lines)
         system = (
             "Ты интрадей-скринер MOEX. По КРАТКИМ данным по каждому тикеру реши, есть ли "

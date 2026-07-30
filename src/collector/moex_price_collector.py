@@ -15,6 +15,27 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# Часовой пояс биржи: ISS публикует время свечей по Москве.
+_MSK = timezone(timedelta(hours=3))
+
+
+def parse_iss_timestamp(ts_str: str) -> Optional[datetime]:
+    """Отметка свечи ISS -> момент в UTC.
+
+    ISS публикует время ПО МОСКВЕ. Раньше стояло replace(tzinfo=utc), и каждая
+    свеча уезжала на +3 часа. Проверено на живых данных 30.07: ISS begin=06:59
+    close=92.41 — тот же бар, что Tinkoff 03:55Z (06:59 МСК) H=92.41; ISS
+    begin=10:08 close=93.28 = Tinkoff 07:20Z close=93.28.
+
+    Из-за сдвига утренние свечи 07:00-09:50 выглядели как основная сессия, и по
+    ним строился «диапазон открытия» уже начавшегося дня.
+    """
+    try:
+        dt = datetime.strptime(str(ts_str), "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+    return dt.replace(tzinfo=_MSK).astimezone(timezone.utc)
+
 MOEX_ISS = "https://iss.moex.com/iss"
 
 
@@ -96,11 +117,8 @@ class MOEXPriceCollector:
                 col_map = {col: i for i, col in enumerate(columns)}
 
                 for row in rows:
-                    ts_str = row[col_map["begin"]]
-                    try:
-                        ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-                        ts = ts.replace(tzinfo=timezone.utc)
-                    except Exception:
+                    ts = parse_iss_timestamp(row[col_map["begin"]])
+                    if ts is None:
                         continue
 
                     candles.append(Candle(

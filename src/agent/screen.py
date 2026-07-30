@@ -176,6 +176,11 @@ async def screen_ticker(ticker: str, aggregator) -> Optional[dict]:
         # на запоздавших данных, не зная об этом.
         "rt": (None if not intraday else (not intraday.get("delayed"))),
         "src": (intraday or {}).get("source"),
+        # Возраст последней свечи в минутах. Пометка «задержка ~15 мин» врала:
+        # 30.07 под ней приходила серия за ВЧЕРА. Показываем фактический возраст,
+        # чтобы решение принималось с честным представлением о свежести данных.
+        "age": (intraday or {}).get("age_min"),
+        "stale": (intraday or {}).get("stale"),
         "setup": (intraday or {}).get("setup"),
         "orb_hi": _lv.get("or_high"),
         "orb_lo": _lv.get("or_low"),

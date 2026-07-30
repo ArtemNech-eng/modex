@@ -227,6 +227,24 @@ def _summary_text(price, vwap_last, vwap_rel, atr, vol, phase, setup, plan,
 
 # ─── I/O ──────────────────────────────────────────────────────────────────────
 
+def _msk_today():
+    """Сегодняшняя торговая дата по Москве."""
+    return (datetime.now(timezone.utc) + timedelta(hours=3)).date()
+
+
+def _last_bar_age_min(dates: list) -> Optional[float]:
+    """Возраст последней свечи в минутах по стенным часам. None — не разобрать."""
+    if not dates:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(dates[-1]).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
+
+
 async def fetch_intraday(ticker: str, tf_min: int = 5, hours: int = 8) -> Optional[dict]:
     """
     Интрадей-свечи с пометкой источника/задержки.
@@ -251,9 +269,13 @@ async def fetch_intraday(ticker: str, tf_min: int = 5, hours: int = 8) -> Option
     try:
         from src.collector.moex_price_collector import MOEXPriceCollector
         base_interval = 1 if tf_min in (1, 5) else (10 if tf_min in (10, 15, 30) else 60)
+        # Только СЕГОДНЯ. Раньше стояло from_date=вчера: ISS отдаёт ответ порциями
+        # (~500 строк), поэтому минутный запрос за двое суток обрывался внутри
+        # вчерашнего дня и до сегодня не доходил вообще. 30.07 в 10:20 по OZON
+        # приходила вся серия за 29.07, помеченная как свежая, и по вчерашней
+        # сессии строился сетап против сегодняшней цены.
         raw = await MOEXPriceCollector().get_candles(
-            ticker, interval=base_interval,
-            from_date=date.today() - timedelta(days=1))
+            ticker, interval=base_interval, from_date=_msk_today())
         if not raw:
             return None
         data = {
@@ -281,10 +303,32 @@ async def build_intraday_context(ticker: str, tf_min: int = 5,
         return None
     last_ts = data["dates"][-1] if data.get("dates") else datetime.now(timezone.utc)
     minute = _minute_of_day_msk(last_ts)
-    return compute_intraday_context(
+    ctx = compute_intraday_context(
         data, minute, msg_zscore=msg_zscore, has_fresh_news=has_fresh_news,
         delayed=bool(data.get("_delayed")), source=data.get("_source"),
         opening_range_bars=opening_range_bars)
+    if not ctx:
+        return ctx
+
+    # ЗАСЛОН ПО СВЕЖЕСТИ. Источник может молча отдать старую серию: 30.07 по
+    # пятнадцати тикерам приходили свечи за 29.07 с пометкой «задержка ~15 мин»,
+    # и система строила по ним сетапы против сегодняшней цены. Возраст считаем
+    # по стенным часам, а не по данным — данные о своей несвежести не сообщат.
+    try:
+        from config.settings import INTRADAY_MAX_AGE_MIN as _max_age
+    except Exception:
+        _max_age = 40
+    age = _last_bar_age_min(data.get("dates") or [])
+    ctx["age_min"] = None if age is None else round(age, 1)
+    ctx["stale"] = False
+    if age is not None and age > _max_age:
+        ctx["stale"] = True
+        ctx["observe"], ctx["setup"], ctx["signal"], ctx["plan"] = True, "none", "observe", None
+        h_, m_ = divmod(int(age), 60)
+        ctx["note"] = (f"свечи устарели на {h_}ч {m_:02d}мин — сетапы не строим "
+                       f"(источник {data.get('_source')})")
+        ctx["summary"] = ctx["note"]
+    return ctx
 
 
 async def realized_price_after(ticker: str, start_iso: str, hours: float) -> Optional[float]:

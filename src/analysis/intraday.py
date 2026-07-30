@@ -109,6 +109,21 @@ def _minute_of_day(ts) -> Optional[int]:
     return msk.hour * 60 + msk.minute
 
 
+def _msk_date(ts):
+    """Календарная дата по МСК из отметки свечи. None, если не разобрать."""
+    from datetime import datetime, timedelta, timezone as _tz
+    if isinstance(ts, datetime):
+        dt = ts
+    else:
+        try:
+            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_tz.utc)
+    return dt.astimezone(_tz(timedelta(hours=3))).date()
+
+
 def opening_range(highs: list[float], lows: list[float], bars: int = 6,
                   dates: Optional[list] = None,
                   assume_scoped: bool = False) -> Optional[dict]:
@@ -144,7 +159,8 @@ def opening_range(highs: list[float], lows: list[float], bars: int = 6,
         return None
 
     mins = [_minute_of_day(d) for d in dates[:n]]
-    if mins[-1] is None:
+    days = [_msk_date(d) for d in dates[:n]]
+    if mins[-1] is None or days[-1] is None:
         return None
     s_open = session_open_minute(mins[-1])
     if s_open is None:
@@ -157,9 +173,13 @@ def opening_range(highs: list[float], lows: list[float], bars: int = 6,
     if s_open is None:
         return None
 
-    # Свечи текущей сессии: минута дня не раньше её открытия. Сравнение по минуте
-    # дня безопасно, потому что окно загрузки короче суток.
-    idx = [i for i, m in enumerate(mins) if m is not None and m >= s_open]
+    # Свечи текущей сессии: та же КАЛЕНДАРНАЯ дата и минута дня не раньше открытия.
+    # Дата обязательна: сравнение по одной минуте дня подхватывало бары ВЧЕРАШНЕЙ
+    # сессии, если источник прислал окно длиннее суток, и «диапазоном открытия»
+    # становилось вчерашнее открытие.
+    today = days[-1]
+    idx = [i for i, m in enumerate(mins)
+           if m is not None and m >= s_open and days[i] == today]
     if len(idx) < bars:
         return None
     first = idx[:bars]
