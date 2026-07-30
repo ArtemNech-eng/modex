@@ -4,6 +4,7 @@ MOODEX — Sentiment Analyzer
 Используем rubert-tiny-sentiment-balanced (быстрая, 45MB).
 """
 import logging
+import re
 import asyncio
 from typing import Literal
 from dataclasses import dataclass
@@ -172,15 +173,58 @@ BEARISH_WORDS = [
 ]
 
 
+
+# ── Сопоставление слов ────────────────────────────────────────────────────────
+# Раньше стояло `w in text_lower`, то есть поиск по ПОДСТРОКЕ без границ слова.
+# Последствия, проверенные на живых фразах:
+#   «выгодно покупать»  -> nutral: «выгодно» давало бычий плюс, а «дно» внутри
+#                          того же слова — медвежий, и фраза схлопывалась;
+#   «support level»     -> positive: внутри «support» находилось «up»;
+#   «upside limited»    -> positive по той же причине.
+# Для букв и цифр требуем границы слова, для эмодзи оставляем подстроку: у
+# символов вроде 🚀 границ слова не существует.
+_WORDISH = re.compile(r"^[\w\-]+$", re.UNICODE)
+
+
+def _hit(word: str, text: str) -> bool:
+    if _WORDISH.match(word):
+        return re.search(r"(?<!\w)" + re.escape(word) + r"(?!\w)", text) is not None
+    return word in text
+
+
+def _count_hits(words, text: str) -> int:
+    return sum(1 for w in words if _hit(w, text))
+
+
+# Оговорки, снимающие утверждение. Держим отдельно от словарей тональности:
+# это не «настроение», а признак того, что утверждения нет.
+HEDGE_PATTERNS = (
+    r"не\s+ожида", r"не\s+грозит", r"не\s+вижу", r"не\s+будет",
+    r"маловероятн", r"вряд\s+ли", r"сомнева", r"под\s+вопросом",
+    r"не\s+подтвер", r"опроверг",
+)
+
+
+def _has_hedge(text: str) -> bool:
+    return any(re.search(p, text) for p in HEDGE_PATTERNS)
+
+
 def keyword_sentiment(text: str) -> SentimentResult:
     """
     Простой словарный анализ тональности (без нейросети).
     Используется для быстрого демо или как fallback.
     """
     text_lower = text.lower()
-    
-    bull_count = sum(1 for w in BULLISH_WORDS if w in text_lower)
-    bear_count = sum(1 for w in BEARISH_WORDS if w in text_lower)
+
+    bull_count = _count_hits(BULLISH_WORDS, text_lower)
+    bear_count = _count_hits(BEARISH_WORDS, text_lower)
+
+    # Оговорки вида «маловероятно», «не грозит» переворачивают смысл всей фразы,
+    # а словарь считал их обычными словами: «падение маловероятно» -> negative,
+    # «обвал не грозит» -> negative. Инвертировать наугад опаснее, чем признать
+    # неопределённость, поэтому такие фразы объявляем нейтральными.
+    if _has_hedge(text_lower):
+        return SentimentResult(text=text, label="neutral", score=0.5)
 
     if bull_count == 0 and bear_count == 0:
         return SentimentResult(text=text, label="neutral", score=0.5)
