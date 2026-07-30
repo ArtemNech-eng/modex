@@ -148,6 +148,56 @@ def test_venue_rule_is_declarative():
     from src.nlp.ticker_extractor import VENUE_CONTEXT
     assert "MOEX" in VENUE_CONTEXT and VENUE_CONTEXT["MOEX"]
 
+
+# ───── псевдонимы, совпадающие с обычными словами ─────────────────────────────
+
+def test_common_word_aliases_need_capital():
+    """НАЙДЕНО В ЖИВОЙ ЛЕНТЕ 30.07. Из 120 новостей пять были привязаны ложно:
+        «Мишустин выделил 2,6 млрд на достройку трёх самолетов Ил-114-300» -> SMLT
+        «Иран призывает Болгарию и Кипр отменить размещение самолётов»     -> SMLT
+        «Mizuho выделил топ-пик в биотехе»                                 -> PIKK
+        «Martin Marietta отчитается: поможет ли сезон пик?»                -> PIKK
+    Первое — прямое следствие правки того же дня: терпимость к падежам превратила
+    «самолет» в «самолетов». Второе — дефис режет слово, и граница находит «пик»
+    внутри «топ-пик»."""
+    for t in ("Мишустин выделил 2,6 млрд на достройку трёх самолетов Ил-114-300",
+              "Иран призывает отменить решение о размещении самолётов",
+              "Mizuho выделил топ-пик в биотехе",
+              "поможет ли сезон пик",
+              "полёт на самолете",
+              "магнит на холодильник",
+              "северный полюс",
+              "пик нагрузки в энергосистеме"):
+        assert set(ex(t)) == set(), (t, ex(t))
+
+
+def test_company_with_capital_still_found():
+    """Компанию терять нельзя: она пишется с большой буквы."""
+    assert set(ex("Самолет отчитался за полугодие")) == {"SMLT"}
+    assert set(ex("ПИК запускает новый проект")) == {"PIKK"}
+    assert set(ex("Магнит открыл сто магазинов")) == {"MGNT"}
+    assert set(ex("Полюс нарастил добычу золота")) == {"PLZL"}
+    assert set(ex("Акции Самолет выросли на 5%")) == {"SMLT"}
+
+
+def test_ambiguous_does_not_break_others():
+    assert set(ex("Сбер и Магнит отчитались")) == {"SBER", "MGNT"}
+    assert set(ex("Газпром нефть отчиталась")) == {"SIBN"}
+    assert set(ex("Сбера акции упали")) == {"SBER"}
+
+
+def test_ambiguous_list_is_declarative():
+    """Список должен быть данными, чтобы его можно было пополнить."""
+    from src.nlp.ticker_extractor import AMBIGUOUS_ALIASES
+    for a in ("пик", "самолет", "магнит", "полюс"):
+        assert a in AMBIGUOUS_ALIASES
+
+
+def test_hyphen_compound_not_matched():
+    """Дефис не должен создавать границу слова для этих псевдонимов."""
+    assert set(ex("топ-пик")) == set()
+    assert set(ex("пик-нагрузка")) == set()
+
 if __name__ == "__main__":
     tests = [(n, o) for n, o in sorted(globals().items())
              if n.startswith("test_") and callable(o)]
