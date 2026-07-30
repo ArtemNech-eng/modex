@@ -91,9 +91,11 @@ def test_refuses_below_vwap():
 
 
 def test_refuses_without_breakout():
+    """Цена внутри сжатия — сетапа нет. Формулировка изменилась вместе с добавлением
+    шортовой стороны: раньше проверялся только верх, теперь обе границы."""
     h, l, c, v = _bars(38.01, 38.29, 38.20)
     r = iv.consolidation_breakout(h, l, c, v, atr=0.24, vwap=37.9)
-    assert r["signal"] == "none" and "не вышла" in r["reason"]
+    assert r["signal"] == "none" and "внутри консолидации" in r["reason"]
 
 
 def test_refuses_excessive_risk():
@@ -199,6 +201,92 @@ def test_observation_carries_full_plan():
     obs = ia.compute_intraday_context(c, 14 * 60)["breakout_observation"]
     for k in ("entry", "stop_loss", "take_profit", "risk_reward", "width_atr", "vol_x"):
         assert obs.get(k) is not None, k
+
+
+# ───── шортовая сторона и разрешение по фазам ─────────────────────────────────
+
+def test_morning_short_fires():
+    """ГЛАВНАЯ НАХОДКА ДНЯ. Разбивка по сессиям на 181 торговом дне: утренняя
+    сессия 07:00-09:50 ведёт себя ПРОТИВОПОЛОЖНО основной.
+
+        утро,     лонг (1.2):  68 входов, -0.402R
+        утро,     ШОРТ (1.5): 275 входов, +0.302R -> +0.210R после издержек
+        основная, лонг (1.2): 242 входа,  +0.076R -> -0.074R
+        основная, шорт (1.2): 316 входов, -0.089R
+
+    Утренний шорт проверен отдельно: половины выборки +0.200R и +0.204R, 6 месяцев
+    из 7 положительны, 10 бумаг из 12 положительны. КЛЮЧЕВОЕ: лучший месяц —
+    январь (+0.600R), когда рынок РОС, значит это не эффект падающего рынка."""
+    import src.agent.intraday_analyst as ia
+    n = 29
+    h = [38.60] * 20 + [38.20] * 8 + [38.05]
+    l = [38.40] * 20 + [38.05] * 8 + [37.80]
+    c = [38.50] * 20 + [38.12] * 8 + [37.85]
+    v = [100] * 28 + [400]
+    dates = [f"2026-07-30T{7 + i // 12:02d}:{(i * 5) % 60:02d}:00+03:00" for i in range(n)]
+    cc = {"open": c[:], "high": h, "low": l, "close": c, "volume": v, "dates": dates}
+    ctx = ia.compute_intraday_context(cc, 8 * 60)
+    assert ctx["phase"] == "morning"
+    obs = ctx["breakout_observation"]
+    assert obs and obs["signal"] == "short", ctx.get("breakout_blocked")
+    assert obs["stop_loss"] > obs["entry"] > obs["take_profit"], "стоп выше входа, цель ниже"
+    assert obs["risk_reward"] == 2.0
+
+
+def test_main_session_short_blocked():
+    """В основной сессии шорт даёт -0.089R — сторона выключена по проверке."""
+    import src.agent.intraday_analyst as ia
+    n = 29
+    h = [38.60] * 20 + [38.20] * 8 + [38.05]
+    l = [38.40] * 20 + [38.05] * 8 + [37.80]
+    c = [38.50] * 20 + [38.12] * 8 + [37.85]
+    v = [100] * 28 + [400]
+    dates = [f"2026-07-30T{13 + i // 12:02d}:{(i * 5) % 60:02d}:00+03:00" for i in range(n)]
+    cc = {"open": c[:], "high": h, "low": l, "close": c, "volume": v, "dates": dates}
+    ctx = ia.compute_intraday_context(cc, 14 * 60)
+    assert ctx.get("breakout_observation") is None
+    assert "шорты в этой фазе выключены" in (ctx.get("breakout_blocked") or "")
+
+
+def test_evening_both_sides_blocked():
+    """Вечером обе стороны в минусе — не торгуем ни одной."""
+    import src.agent.intraday_analyst as ia
+    n = 29
+    h = [38.60] * 20 + [38.20] * 8 + [38.05]
+    l = [38.40] * 20 + [38.05] * 8 + [37.80]
+    c = [38.50] * 20 + [38.12] * 8 + [37.85]
+    v = [100] * 28 + [400]
+    dates = [f"2026-07-30T{19 + i // 12:02d}:{(i * 5) % 60:02d}:00+03:00" for i in range(n)]
+    cc = {"open": c[:], "high": h, "low": l, "close": c, "volume": v, "dates": dates}
+    ctx = ia.compute_intraday_context(cc, 20 * 60)
+    assert ctx.get("breakout_observation") is None
+    assert "обе стороны выключены" in (ctx.get("breakout_blocked") or "")
+
+
+def test_short_width_threshold_is_wider():
+    """У шорта устойчивое преимущество на пороге 1.5, у лонга — 1.2. Один общий
+    порог означал бы либо потерять проверенный шорт, либо впустить непроверенный
+    лонг."""
+    from config.settings import (BREAKOUT_MAX_WIDTH_ATR,
+                                 BREAKOUT_MAX_WIDTH_ATR_SHORT)
+    assert BREAKOUT_MAX_WIDTH_ATR == 1.2
+    assert BREAKOUT_MAX_WIDTH_ATR_SHORT == 1.5
+
+
+def test_phases_come_from_evidence():
+    from config.settings import BREAKOUT_LONG_PHASES, BREAKOUT_SHORT_PHASES
+    assert BREAKOUT_SHORT_PHASES == "morning"
+    assert BREAKOUT_LONG_PHASES == "main"
+
+
+def test_short_vwap_agreement():
+    """Пробой вниз при цене ВЫШЕ средней дня — покупатель контролирует день."""
+    import src.analysis.intraday as iv
+    h = [38.20] * 8 + [38.05]; l = [38.05] * 8 + [37.80]
+    c = [38.12] * 8 + [37.85]; v = [100] * 8 + [400]
+    r = iv.consolidation_breakout(h, l, c, v, atr=0.20, vwap=37.00,
+                                  allow=("short",), max_width_atr_short=1.5)
+    assert r["signal"] == "none" and "VWAP" in r["reason"]
 
 if __name__ == "__main__":
     tests = [(n, o) for n, o in sorted(globals().items())

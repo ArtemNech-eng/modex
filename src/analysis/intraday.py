@@ -229,8 +229,10 @@ def consolidation_breakout(highs: list[float], lows: list[float], closes: list[f
                            volumes: list[float], atr: Optional[float],
                            vwap: Optional[float], window: int = 6,
                            max_width_atr: float = 1.2, vol_mult: float = 1.5,
+                           max_width_atr_short: Optional[float] = None,
                            target_r: float = 2.0, max_risk_pct: float = 3.0,
-                           min_rr: Optional[float] = None) -> dict:
+                           min_rr: Optional[float] = None,
+                           allow: tuple = ("long", "short")) -> dict:
     """Пробой внутридневной консолидации по тренду.
 
     ЗАЧЕМ. Единственной техникой входа был пробой диапазона открытия, а он живёт
@@ -258,6 +260,27 @@ def consolidation_breakout(highs: list[float], lows: list[float], closes: list[f
         ширина <=1.2 ATR:  55 входов, +0.264R; по половинам +0.381R и +0.220R,
                           после издержек +0.291R и +0.149R.
 
+    РАЗБИВКА ПО СЕССИЯМ (6 месяцев, 181 день) — главное, что нашлось. Утренняя
+    сессия 07:00-09:50 ведёт себя ПРОТИВОПОЛОЖНО основной:
+
+        утро,     лонг  (шир 1.2):  68 входов, -0.402R
+        утро,     ШОРТ  (шир 1.5): 275 входов, +0.302R -> +0.210R после издержек
+        основная, лонг  (шир 1.2): 242 входа,  +0.076R -> -0.074R
+        основная, шорт  (шир 1.2): 316 входов, -0.089R
+        вечер, обе стороны: отрицательно
+
+    Утренний шорт проверен отдельно и держится: половины выборки дали +0.200R и
+    +0.204R (почти одинаково), 6 месяцев из 7 положительны, 10 бумаг из 12
+    положительны. КЛЮЧЕВОЕ: лучший месяц — январь (+0.600R), когда рынок РОС, то
+    есть это не эффект падающего рынка.
+
+    Объяснение механизмом: утренняя сессия тонкая, за ночь накапливаются новости и
+    гэпы. Пробой вверх в тонкой ликвидности не находит продолжения — покупателя за
+    ним нет; пробой вниз идёт дальше, потому что заявок на покупку меньше.
+
+    Поэтому стороны разрешаются по фазам через allow: параметр говорит, какие
+    направления вообще рассматривать в текущей фазе.
+
     Поэтому по умолчанию 1.2. ЧЕГО ПРОВЕРКА НЕ ДОКАЗЫВАЕТ: выборка 55 входов, один
     режим рынка (июль 2026, рынок рос), 12 бумаг из 48, тест на 10-мин свечах, а
     вживую сетап смотрит 5-мин. Это измеряемая гипотеза, а не установленное
@@ -270,13 +293,30 @@ def consolidation_breakout(highs: list[float], lows: list[float], closes: list[f
     seg = slice(n - 1 - window, n - 1)          # бары ДО пробойного
     c_high, c_low = max(highs[seg]), min(lows[seg])
     width_atr = (c_high - c_low) / atr
-    if width_atr > max_width_atr:
+    # Порог ширины РАЗНЫЙ для сторон. У утреннего шорта устойчивое преимущество на
+    # пороге 1.5 (275 входов, половины выборки +0.200R и +0.204R), у лонга лучший
+    # из плохих вариантов — 1.2. Держать один порог значило бы либо потерять
+    # проверенный шорт, либо впустить непроверенный лонг.
+    up_pre = price > c_high
+    lim = (max_width_atr if up_pre
+           else (max_width_atr_short if max_width_atr_short else max_width_atr))
+    if width_atr > lim:
         return {"signal": "none",
                 "reason": (f"диапазон {width_atr:.2f}xATR шире предела "
-                           f"{max_width_atr} — это не сжатие, а коридор"),
+                           f"{lim} — это не сжатие, а коридор"),
                 "width_atr": round(width_atr, 2)}
-    if price <= c_high:
-        return {"signal": "none", "reason": "цена не вышла за верх консолидации",
+    up = price > c_high
+    down = price < c_low
+    if not (up or down):
+        return {"signal": "none", "reason": "цена внутри консолидации",
+                "width_atr": round(width_atr, 2)}
+    if up and "long" not in allow:
+        return {"signal": "none",
+                "reason": f"пробой вверх, но лонги в этой фазе выключены ({allow})",
+                "width_atr": round(width_atr, 2)}
+    if down and "short" not in allow:
+        return {"signal": "none",
+                "reason": f"пробой вниз, но шорты в этой фазе выключены ({allow})",
                 "width_atr": round(width_atr, 2)}
 
     vols = [v for v in volumes[seg] if v]
@@ -290,23 +330,29 @@ def consolidation_breakout(highs: list[float], lows: list[float], closes: list[f
                 "width_atr": round(width_atr, 2)}
 
     # Согласие с VWAP: пробой вверх при цене ниже средней дня — это отскок внутри
-    # снижения, а не продолжение. Тот же принцип, что и для диапазона открытия.
-    if vwap and price < vwap:
+    # снижения, а не продолжение. Для шорта зеркально.
+    if vwap and up and price < vwap:
         return {"signal": "none",
                 "reason": "пробой вверх при цене ниже VWAP — продавец контролирует день"}
+    if vwap and down and price > vwap:
+        return {"signal": "none",
+                "reason": "пробой вниз при цене выше VWAP — покупатель контролирует день"}
 
-    entry, stop = price, c_low
-    risk = entry - stop
+    side = "long" if up else "short"
+    entry = price
+    stop = c_low if up else c_high
+    risk = (entry - stop) if up else (stop - entry)
     if risk <= 0:
-        return {"signal": "none", "reason": "стоп не ниже входа"}
+        return {"signal": "none", "reason": "стоп не с той стороны от входа"}
     if risk / entry * 100 > max_risk_pct:
         return {"signal": "none",
                 "reason": f"риск {risk / entry * 100:.2f}% выше предела {max_risk_pct}%"}
-    target = round(entry + target_r * risk, 6)
-    plan = _plan("long", entry, stop, target, risk,
+    target = round(entry + target_r * risk, 6) if up else round(entry - target_r * risk, 6)
+    plan = _plan(side, entry, stop, target, risk,
                  (f"пробой сжатия {c_low}-{c_high} ({width_atr:.2f}xATR) "
-                  f"на объёме {last_v / avg_v:.1f}x"), min_rr=min_rr)
-    if plan.get("signal") == "long":
+                  f"{'вверх' if up else 'вниз'} на объёме {last_v / avg_v:.1f}x"),
+                 min_rr=min_rr)
+    if plan.get("signal") in ("long", "short"):
         plan["width_atr"] = round(width_atr, 2)
         plan["vol_x"] = round(last_v / avg_v, 2)
         plan["consolidation"] = {"low": round(c_low, 6), "high": round(c_high, 6),

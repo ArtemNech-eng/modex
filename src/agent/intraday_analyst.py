@@ -271,12 +271,28 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
             BREAKOUT_MAX_WIDTH_ATR, BREAKOUT_VOL_MULT = 1.2, 1.5
             BREAKOUT_TARGET_R, BREAKOUT_MAX_RISK_PCT = 2.0, 3.0
         if BREAKOUT_ENABLED:
-            cb = iv.consolidation_breakout(
+            # Стороны разрешаются ПО ФАЗЕ: утренняя сессия ведёт себя противоположно
+            # основной. Утром работает шорт (+0.302R на 275 входах), лонг проваливается
+            # (-0.402R); в основной наоборот, но слабее. Вечером обе стороны в минусе.
+            try:
+                from config.settings import (BREAKOUT_LONG_PHASES as _lp,
+                                             BREAKOUT_SHORT_PHASES as _sp,
+                                             BREAKOUT_MAX_WIDTH_ATR_SHORT as _ws)
+            except Exception:                        # noqa: BLE001
+                _lp, _sp, _ws = "main", "morning", 1.5
+            allow = tuple(x for x, ph in (("long", _lp), ("short", _sp))
+                          if phase in [p.strip() for p in ph.split(",")])
+            if not allow:
+                breakout_blocked = f"фаза {phase}: обе стороны выключены по проверке"
+                allow = ()
+            cb = (iv.consolidation_breakout(
                 h, l, c, v, atr, vwap_last,
                 window=BREAKOUT_WINDOW_BARS, max_width_atr=BREAKOUT_MAX_WIDTH_ATR,
                 vol_mult=BREAKOUT_VOL_MULT, target_r=BREAKOUT_TARGET_R,
-                max_risk_pct=BREAKOUT_MAX_RISK_PCT)
-            if cb.get("signal") == "long":
+                max_risk_pct=BREAKOUT_MAX_RISK_PCT, allow=allow,
+                max_width_atr_short=_ws)
+                  if allow else {"signal": "none", "reason": breakout_blocked})
+            if cb.get("signal") in ("long", "short"):
                 try:
                     from config.settings import BREAKOUT_MODE as _mode
                 except Exception:                    # noqa: BLE001
