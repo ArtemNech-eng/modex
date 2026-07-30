@@ -307,6 +307,21 @@ class ClaudeAgent:
         """
         import json
 
+        def _state_s(st, conf, vol):
+
+            """Единое состояние рынка по бумаге."""
+
+            if not st:
+
+                return ""
+
+            c = "" if conf is None else "(" + str(conf) + ")"
+
+            v = "" if vol in (None, "NORMAL") else "/vol:" + str(vol)
+
+            return " ST:" + str(st) + c + v
+
+
         def _news_s(n, lag):
 
             """Новости по бумаге: сколько и за сколько минут до выноса."""
@@ -356,7 +371,8 @@ class ClaudeAgent:
                 f"{'' if b.get('rt') is None else (' RT' if b.get('rt') else ' DLY')}"
                 f"{_age_s(b.get('age'))}"
                 f"{' УСТАРЕЛО' if b.get('stale') else ''}"
-                f"{_sb_s(b.get('sbasis'))}{_news_s(b.get('news'), b.get('nlag'))}")
+                f"{_sb_s(b.get('sbasis'))}{_news_s(b.get('news'), b.get('nlag'))}"
+                f"{_state_s(b.get('state'), b.get('state_conf'), b.get('state_vol'))}")
         if not lines:
             return []
         legend = ("Формат строки: ТИКЕР p<цена> <позиция к VWAP> <режим> adx rsi atr "
@@ -374,7 +390,8 @@ class ClaudeAgent:
                   "nws<новостей по бумаге>/<минут между новостью и свечой выноса: "
                   "плюс — новость РАНЬШЕ выноса и объясняет его, минус — новость "
                   "позже, лента опередила заголовок; без числа — новости есть, но "
-                  "рядом с выносом ни одной>")
+                  "рядом с выносом ни одной> "
+                  "ST:<СОСТОЯНИЕ РЫНКА: TREND_UP / TREND_DOWN / RANGE / NEWS_EVENT / ILLIQUID>(<уверенность 0-1>)/vol:<HIGH или LOW, если не обычная>. ILLIQUID это ВЕТО: данные негодны или ликвидности нет, торговать нельзя")
         tickers_block = "\n".join(lines)
         system = (
             "Ты интрадей-скринер MOEX. По КРАТКИМ данным по каждому тикеру реши, есть ли "

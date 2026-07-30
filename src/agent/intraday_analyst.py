@@ -362,6 +362,18 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
         "spike_low": round(l[spike_idx], 6) if spike_idx is not None else None,
     }
 
+    # структура дня для классификатора: растут ли минимумы, падают ли максимумы
+    _struct = None
+    if len(c) >= 36:
+        _lows = [min(l[-36:-24]), min(l[-24:-12]), min(l[-12:])]
+        _highs = [max(h[-36:-24]), max(h[-24:-12]), max(h[-12:])]
+        if _lows[2] >= _lows[1] >= _lows[0] and _highs[2] >= _highs[1]:
+            _struct = "вверх"
+        elif _lows[2] <= _lows[1] <= _lows[0] and _highs[2] <= _highs[1]:
+            _struct = "вниз"
+        else:
+            _struct = "боковик"
+
     return {
         "summary": summary,
         "signal": signal,
@@ -379,6 +391,12 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
         # Основание, по которому момент назван новостным. Голого флага мало:
         # решение надо уметь проверить постфактум, поэтому отдаём и запас по
         # времени между новостью и выносом, и сколько новостей нашлось.
+        # ЕДИНОЕ СОСТОЯНИЕ РЫНКА. Куски существовали по отдельности — regime в
+        # дневной технике, volatility_state здесь, event в детекторе новостей,
+        # ликвидность внутри риск-контура — и потребитель должен был держать
+        # четыре поля в голове. Здесь состояние одно, признаки записаны рядом.
+        "market_state": None,
+        "day_structure": _struct,
         # Почему сетап ORB не выдан, если диапазон есть: срок годности, R/R или
         # несогласие с VWAP. Молчаливый отказ не отличить от «нечего торговать».
         "orb_blocked": orb_block,
@@ -519,6 +537,33 @@ async def build_intraday_context(ticker: str, tf_min: int = 5,
         opening_range_bars=opening_range_bars)
     if not ctx:
         return ctx
+    # Единое состояние рынка — считаем здесь, где известны и свежесть, и сверка
+    # с дневной ценой, и новости. Внутри чистой функции этих данных нет.
+    try:
+        from src.analysis.market_state import classify_market_state
+        from src.analysis import technical as _ta
+        _t = None
+        try:
+            _t = await _ta.analyze_ticker(ticker)
+        except Exception:                            # noqa: BLE001
+            _t = None
+        ctx["market_state"] = classify_market_state(
+            price=ctx.get("price"),
+            sma20=(getattr(_t, "sma20", None) if _t else None),
+            sma50=(getattr(_t, "sma50", None) if _t else None),
+            adx=(getattr(_t, "adx", None) if _t else None),
+            vwap=ctx.get("vwap"),
+            intraday_structure=ctx.get("day_structure"),
+            volatility_state=ctx.get("volatility_state"),
+            news_event=bool((ctx.get("event") or {}).get("event")),
+            news_lag_min=ctx.get("news_lag_min"),
+            spread_pct=None,
+            stale=bool(ctx.get("stale")),
+            mismatch=bool(ctx.get("mismatch")),
+            age_min=ctx.get("age_min"))
+    except Exception as e:                           # noqa: BLE001
+        logger.debug(f"market_state {ticker}: {e}")
+
     # Заголовки — чтобы основание решения читалось человеком, а не только кодом.
     if news_items:
         ctx["news_titles"] = [str(n.get("text") or "")[:120] for n in news_items[:3]]

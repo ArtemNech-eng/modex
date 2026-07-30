@@ -206,6 +206,13 @@ async def screen_ticker(ticker: str, aggregator) -> Optional[dict]:
         # причина отказа сетапа пробоя консолидации — чтобы «нечего торговать»
         # отличалось от «сжатие есть, но объём не подтвердил»
         "bblock": (intraday or {}).get("breakout_blocked"),
+        # ЕДИНОЕ СОСТОЯНИЕ рынка по бумаге. Раньше потребитель собирал его сам из
+        # четырёх разрозненных полей: regime, vol, event и ликвидности.
+        "state": ((intraday or {}).get("market_state") or {}).get("state"),
+        "state_conf": ((intraday or {}).get("market_state") or {}).get("confidence"),
+        "state_vol": ((intraday or {}).get("market_state") or {}).get("volatility"),
+        "tradeable": ((intraday or {}).get("market_state") or {}).get("tradeable"),
+        "struct": (intraday or {}).get("day_structure"),
         "entry_status": _tp.get("entry_status"),
         "si": (sentiment or {}).get("sentiment_index"),
         # производные «реальных денег» (спек Data Engine):
