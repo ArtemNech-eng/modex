@@ -209,7 +209,13 @@ async def screen_ticker(ticker: str, aggregator) -> Optional[dict]:
         "price_roc": _vel.get("price_roc"),
         "vol_ratio": _vel.get("vol_ratio"),
         "ob_pressure": ob.get("pressure"),
+        # ВНИМАНИЕ на имена. bid_ask — это отношение ОБЪЁМОВ заявок (bid/ask),
+        # а не спред: значение 1.7 означает перевес покупателей 1.7:1. Настоящий
+        # спред живёт в spread_pct и в brief раньше не попадал вовсе. Я сам принял
+        # 1.7 за «спред 1.70%» и получил ложный отказ риск-контура, хотя реальный
+        # спред по ликвидным бумагам 0.004-0.10%.
         "bid_ask": ob.get("bid_ask_ratio"),
+        "spread": ob.get("spread_pct"),
         "liquidity": ob.get("liquidity"),
         "flow": fl.get("order_flow"),
         "delta": fl.get("delta"),
