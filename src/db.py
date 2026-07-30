@@ -1494,6 +1494,37 @@ except Exception:                                   # noqa: BLE001
     NEWS_EXCLUDE_SOURCES = ("tinkoff", "pulse_deal")
 
 
+async def known_news_guids(since_hours: int = 48, limit: int = 4000) -> set:
+    """Идентификаторы уже сохранённых новостей — для дедупликации при старте.
+
+    Дедупликация коллектора жила в памяти процесса (_seen_ids) и обнулялась при
+    каждом перезапуске. 30.07 замер показал: из 200 новостных записей 132 (66%)
+    были повторами, один заголовок вставлен ЧЕТЫРНАДЦАТЬ раз — по одному разу на
+    каждый цикл опроса после деплоя.
+    """
+    out: set = set()
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+        async with async_session() as session:
+            stmt = (select(MarketEvent.payload)
+                    .where(MarketEvent.kind.in_(NEWS_KINDS))
+                    .where(MarketEvent.ts >= cutoff)
+                    .order_by(MarketEvent.ts.desc())
+                    .limit(min(limit, 10000)))
+            for (pl,) in (await session.execute(stmt)).all():
+                if not pl:
+                    continue
+                try:
+                    g = json.loads(pl).get("guid")
+                except Exception:
+                    continue
+                if g:
+                    out.add(str(g))
+    except Exception as e:
+        logger.debug(f"known_news_guids failed: {e}")
+    return out
+
+
 async def fresh_news(ticker: str, since_minutes: int = 90,
                      limit: int = 20) -> list[dict]:
     """Свежие ТЕКСТОВЫЕ новости по бумаге: RSS, чаты, Пульс.

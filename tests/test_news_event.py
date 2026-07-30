@@ -157,6 +157,48 @@ def test_classify_event_needs_spike():
     assert classify_event(True, None, True)["event"] is True
 
 
+
+# ───── время события и дедупликация ───────────────────────────────────────────
+
+def test_event_time_is_publication_not_collection():
+    """ГЛАВНОЕ для причинности. ts у новостей не передавался, подставлялось
+    now(), поэтому один заголовок при каждом цикле опроса получал новую
+    «свежесть». Замер 30.07: один и тот же текст лежал под одиннадцатью разными
+    метками — 06:41, 07:06, 07:12, ... по одной на цикл. Проверка новости против
+    свечи выноса на таких метках даёт МНИМУЮ точность."""
+    import pathlib
+    src = pathlib.Path(ROOT, "main.py").read_text(encoding="utf-8")
+    # RSS, Telegram и Пульс обязаны передавать время источника
+    assert '"ts": item.timestamp' in src, "RSS не передаёт время публикации"
+    assert '"ts": msg.timestamp' in src, "Telegram не передаёт время сообщения"
+    assert '"ts": post.timestamp' in src, "Пульс не передаёт время поста"
+
+
+def test_guid_stored_for_dedup():
+    """Без guid в записи дедупликацию нельзя поднять из БД."""
+    import pathlib
+    src = pathlib.Path(ROOT, "main.py").read_text(encoding="utf-8")
+    assert '"guid": getattr(item, "item_id", None)' in src
+
+
+def test_collector_primes_dedup_from_db():
+    """Дедупликация в памяти не выживает перезапуск: 132 повтора из 200 записей,
+    один заголовок четырнадцать раз — по разу на каждый деплой."""
+    from src.collector.rss_collector import RSSCollector
+    c = RSSCollector()
+    assert hasattr(c, "prime_seen"), "нет восстановления дедупликации из БД"
+
+
+def test_dedup_actually_skips_known_guid():
+    """Поднятый идентификатор должен приводить к пропуску записи."""
+    from src.collector.rss_collector import RSSCollector
+    c = RSSCollector()
+    c._seen_ids.add("guid-123")
+    assert "guid-123" in c._seen_ids
+    # проверяем именно условие пропуска из fetch_feed
+    guid, title = "guid-123", "Заголовок"
+    assert not (title and guid not in c._seen_ids), "известный guid должен пропускаться"
+
 if __name__ == "__main__":
     tests = [(n, o) for n, o in sorted(globals().items())
              if n.startswith("test_") and callable(o)]

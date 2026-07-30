@@ -202,9 +202,26 @@ class RSSCollector:
 
                 await asyncio.sleep(self.poll_interval)
 
+    async def prime_seen(self) -> int:
+        """Поднять дедупликацию из БД: в памяти она не выживает перезапуск.
+
+        Без этого каждый деплой заново вставлял все заголовки из лент. Замер
+        30.07: 132 повтора из 200 записей, один заголовок четырнадцать раз.
+        """
+        try:
+            from src import db
+            guids = await db.known_news_guids()
+            self._seen_ids |= guids
+            return len(guids)
+        except Exception as e:                       # noqa: BLE001
+            logger.warning(f"RSS: не удалось поднять дедупликацию из БД: {e}")
+            return 0
+
     async def start(self):
         self._running = True
-        logger.info(f"📰 RSS коллектор запущен ({len(self.sources)} источников)")
+        primed = await self.prime_seen()
+        logger.info(f"📰 RSS коллектор запущен ({len(self.sources)} источников), "
+                    f"дедупликация поднята из БД: {primed} идентификаторов")
         asyncio.create_task(self._poll_loop())
 
     async def stop(self):

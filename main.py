@@ -114,6 +114,10 @@ async def process_message(msg, analyzer: SentimentAnalyzer):
             "channel": msg.channel, "text": msg.text,
             "label": sentiment.label, "score": sentiment.score,
             "signal": sentiment.signal,
+            # Время СООБЩЕНИЯ, а не обработки: детектор новостных событий
+            # сверяет текст со свечой выноса, и время обработки даёт мнимую
+            # точность. В агрегатор timestamp сообщения уже передавался.
+            "ts": msg.timestamp,
         })
 
     stats["messages_processed"] += 1
@@ -252,6 +256,7 @@ async def pulse_pipeline():
                     "channel": getattr(post, "author", "") or "pulse", "text": post.text,
                     "label": sentiment.label, "score": sentiment.score,
                     "signal": sentiment.signal,
+                    "ts": post.timestamp,     # время поста, не время обработки
                 })
             stats["messages_processed"] += 1
         except Exception as e:
@@ -292,12 +297,22 @@ async def rss_pipeline():
                     text=item.full_text[:200],
                     timestamp=item.timestamp,
                 )
+                # ts = ВРЕМЯ ПУБЛИКАЦИИ, а не время сбора. Раньше ts не
+                # передавался и подставлялось now(), поэтому один и тот же
+                # заголовок при каждом цикле опроса получал новую «свежесть».
+                # Детектор новостных событий сверяет новость со свечой выноса —
+                # на времени сбора эта проверка давала мнимую точность.
+                # guid нужен для дедупликации, которая переживает перезапуск.
                 await db.add_event({
                     "source": "rss", "kind": "news", "ticker": ticker,
                     "channel": item.source, "text": item.full_text[:500],
                     "label": sentiment.label, "score": sentiment.score,
                     "signal": max(-1, min(1, weighted_signal)),
-                    "payload": {"published": item.timestamp.isoformat() if hasattr(item.timestamp, 'isoformat') else str(item.timestamp)},
+                    "ts": item.timestamp,
+                    "payload": {
+                        "published": item.timestamp.isoformat() if hasattr(item.timestamp, 'isoformat') else str(item.timestamp),
+                        "guid": getattr(item, "item_id", None),
+                    },
                 })
             stats["messages_processed"] += 1
         except Exception as e:
