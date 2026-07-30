@@ -136,6 +136,46 @@ def test_horizon_near_close_rolls_forward():
     assert due >= datetime(2026, 7, 31, 18, 40, tzinfo=MSK), due
 
 
+
+# ──────────── окно низкой ликвидности: контекст должен СЧИТАТЬСЯ ──────────────
+
+import src.agent.intraday_analyst as _ia  # noqa: E402
+
+_N = 40
+
+
+def _candles():
+    return {"open": [10.0] * _N, "high": [10.1] * _N, "low": [9.9] * _N,
+            "close": [10.0] * _N, "volume": [100] * _N,
+            "dates": ["2026-07-30T12:00:00+03:00"] * _N}
+
+
+def test_low_liquidity_window_does_not_crash():
+    """РЕГРЕССИЯ: в ветке «после 22:00 ликвидность падает» переменная h
+    затирала список high целым числом (divmod), и построение уровней падало
+    с TypeError: 'int' object is not iterable. Ломался КАЖДЫЙ расчёт
+    контекста после 22:00 МСК, а не только тест."""
+    ctx = _ia.compute_intraday_context(_candles(), hm(22, 30))
+    assert ctx is not None
+    assert ctx["observe"] is True
+    # уровни обязаны быть посчитаны — именно на них падало
+    assert ctx["levels"]["session_high"] == 10.1
+    assert ctx["levels"]["session_low"] == 9.9
+
+
+def test_low_liquidity_note_shows_cutoff_time():
+    """Время отсечки должно попадать в текст, а не потеряться при переименовании."""
+    ctx = _ia.compute_intraday_context(_candles(), hm(22, 30))
+    assert ":" in (ctx.get("note") or ""), ctx.get("note")
+
+
+def test_context_computes_across_whole_trading_day():
+    """Ни один торгуемый час не должен падать."""
+    for h_ in range(7, 24):
+        for m_ in (0, 30):
+            ctx = _ia.compute_intraday_context(_candles(), hm(h_, m_))
+            assert ctx is None or "levels" in ctx, (h_, m_)
+
 if __name__ == "__main__":
     tests = [(n, o) for n, o in sorted(globals().items())
              if n.startswith("test_") and callable(o)]
