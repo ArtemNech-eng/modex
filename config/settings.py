@@ -373,3 +373,7 @@ SETUP_WATCH_ENABLED = os.getenv("SETUP_WATCH_ENABLED", "false").lower() == "true
 SETUP_WATCH_INTERVAL_MIN = int(os.getenv("SETUP_WATCH_INTERVAL_MIN", "5"))
 SETUP_WATCH_DEDUP_MIN = int(os.getenv("SETUP_WATCH_DEDUP_MIN", "30"))
 SETUP_WATCH_PACING_SEC = float(os.getenv("SETUP_WATCH_PACING_SEC", "0.2"))
+# Пауза перед ПЕРВЫМ проходом. Проход — это 48 бумаг и около двух сотен запросов за
+# 18 секунд; в момент старта контейнера он конкурирует с healthcheck (curl
+# /api/stats, таймаут 10 сек, три попытки) и с подъёмом FIGI по всем бумагам.
+SETUP_WATCH_WARMUP_SEC = int(os.getenv("SETUP_WATCH_WARMUP_SEC", "45"))

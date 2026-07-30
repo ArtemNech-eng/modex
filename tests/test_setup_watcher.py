@@ -147,6 +147,20 @@ def test_interval_is_one_bar():
         "опрос чаще одного бара ничего не добавляет, кроме расхода лимитов"
 
 
+
+def test_warmup_before_first_pass():
+    """Первый проход не должен идти в момент старта контейнера: это 48 бумаг и
+    около двух сотен запросов за 18 секунд, конкурирующих с healthcheck (curl
+    /api/stats, таймаут 10 сек) и с подъёмом FIGI по всем бумагам."""
+    from config.settings import SETUP_WATCH_WARMUP_SEC
+    assert SETUP_WATCH_WARMUP_SEC >= 30, "паузы мало, чтобы приложение встало"
+    import pathlib
+    src = pathlib.Path(ROOT, "src", "agent", "setup_watcher.py").read_text(encoding="utf-8")
+    body = src.split("async def _loop")[1]
+    warm = body.find("SETUP_WATCH_WARMUP_SEC")
+    loop = body.find("while _status[\"enabled\"]")
+    assert 0 < warm < loop, "пауза обязана быть ДО цикла проходов"
+
 if __name__ == "__main__":
     tests = [(n, o) for n, o in sorted(globals().items())
              if n.startswith("test_") and callable(o)]

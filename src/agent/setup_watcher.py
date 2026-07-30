@@ -150,6 +150,24 @@ async def one_pass() -> list:
 async def _loop() -> None:
     interval, *_ = _cfg()
     _status["interval_min"] = interval
+
+    # ЗАДЕРЖКА ПЕРЕД ПЕРВЫМ ПРОХОДОМ. Проход — это 48 бумаг и около двух сотен
+    # исходящих запросов за 18 секунд. Если запустить его в момент старта
+    # контейнера, он конкурирует с healthcheck (curl /api/stats, таймаут 10 сек,
+    # три попытки), а также с наполнением снимков рынка. Коллектор в это время и
+    # без того поднимает FIGI по 48 бумагам, потому что рукописную таблицу мы
+    # убрали. Ждём, пока приложение встанет.
+    try:
+        from config.settings import SETUP_WATCH_WARMUP_SEC as _warm
+    except Exception:                                # noqa: BLE001
+        _warm = 45
+    if _warm > 0:
+        _status["next_pass"] = (datetime.now(timezone.utc)
+                                + timedelta(seconds=_warm)).isoformat()
+        logger.info(f"⚡ наблюдатель ждёт {_warm} сек до первого прохода, "
+                    f"чтобы не мешать старту приложения")
+        await asyncio.sleep(_warm)
+
     while _status["enabled"]:
         try:
             from src.analysis.intraday import session_phase
