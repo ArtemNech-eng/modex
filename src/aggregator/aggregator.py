@@ -34,6 +34,11 @@ ORDERBOOK_CHANNEL = "orderbook"
 # прямой сигнал реальных денег и обновляется регулярно, поэтому оживает быстрее.
 ORDERBOOK_MIN_POINTS = 3
 
+# Замеры базы для z-score сообщений: не чаще раза в столько минут и не меньше
+# столько замеров, иначе z-score считает собственный разогрев (см. _volume_zscore).
+BASELINE_SAMPLE_MIN = 10
+BASELINE_MIN_SAMPLES = 20
+
 
 @dataclass
 class SentimentPoint:
@@ -78,6 +83,13 @@ class TickerIndex:
     source_diversity: float      # 0-1, 1 = много разных каналов
     volume_zscore:   float       # насколько активность отличается от нормы
     confidence:      float       # итоговая уверенность сигнала 0-1
+    # Из чего посчитан индекс. Снимки стакана кладутся в тот же агрегатор, чтобы
+    # сетка тикеров жила без чатов, — но потребитель обязан видеть, что перед ним
+    # давление стакана, а не настроение чатов. Иначе Claude получает один и тот же
+    # сигнал дважды: как «настроение» и как отдельный блок по стакану.
+    text_count:      int = 0     # сообщений из чатов/новостей/Пульса
+    orderbook_count: int = 0     # снимков стакана
+    basis:           str = "text"   # text / orderbook / mixed
 
     @property
     def label(self) -> str:
@@ -110,6 +122,9 @@ class TickerIndex:
             "source_diversity": round(self.source_diversity, 2),
             "volume_zscore":    round(self.volume_zscore, 2),
             "confidence":       round(self.confidence, 2),
+            "text_count":       self.text_count,
+            "orderbook_count":  self.orderbook_count,
+            "basis":            self.basis,
             "updated_at":       self.updated_at.isoformat(),
             "top_channels":     self.top_channels,
         }
@@ -172,6 +187,7 @@ class SentimentAggregator:
         self._history: dict[str, deque[SentimentPoint]] = defaultdict(
             lambda: deque(maxlen=50_000)
         )
+        self._baseline_last: dict[str, datetime] = {}
         self._baseline_counts: dict[str, deque[int]] = defaultdict(
             lambda: deque(maxlen=168)   # 7 дней по часам
         )
@@ -269,10 +285,35 @@ class SentimentAggregator:
 
     def _volume_zscore(self, ticker: str, current_count: int) -> float:
         """
-        Z-score текущего объёма сообщений относительно исторической нормы.
+        Z-score объёма СООБЩЕНИЙ относительно исторической нормы.
+
+        Раньше показывал 1.9-2.5 у всех тикеров одновременно и 18 из 26 держались
+        выше порога новостного события 2.0 — при том что сообщений не было вовсе.
+        Причины:
+
+          1) в счёт шли точки стакана (2157 снимков в час против 21 новости), то
+             есть мерился темп снимков, а не поток сообщений;
+          2) база пополнялась при КАЖДОМ обращении к индексу, а счётчик после
+             перезапуска монотонно растёт по мере набора окна: база [1,2,3,4,5]
+             при счётчике 6 даёт ровно z=1.90. Считался собственный разогрев.
+
+        Отсюда «аномальный объём сообщений» в classify_event, а новостная ветка
+        имеет приоритет над пробоем диапазона — то есть ложная аномалия
+        перехватывала выбор сетапа.
+
+        Теперь: замеры базы делаются НЕ ЧАЩЕ раза в BASELINE_SAMPLE_MIN минут,
+        нужно минимум BASELINE_MIN_SAMPLES замеров, и монотонная база не считается.
+
+        Частота замеров важна отдельно: база на 168 значений задумывалась как
+        неделя часовых замеров, но пополнялась при КАЖДОМ обращении к индексу —
+        то есть её горизонт определялся трафиком запросов, а не временем.
         """
         history = list(self._baseline_counts[ticker])
-        if len(history) < 5:
+        if len(history) < BASELINE_MIN_SAMPLES:
+            return 0.0            # база ещё набирается — молчим, а не выдумываем
+        # Монотонный рост означает разогрев окна, а не аномалию.
+        if all(b <= a for a, b in zip(history, history[1:])) or \
+           all(b >= a for a, b in zip(history, history[1:])):
             return 0.0
         mean = statistics.mean(history)
         std  = statistics.stdev(history) if len(history) > 1 else 0.0
@@ -305,9 +346,21 @@ class SentimentAggregator:
         # 3. Разнообразие источников
         diversity = self._source_diversity(points)
 
-        # 4. Z-score объёма
-        vol_z = self._volume_zscore(ticker, len(points))
-        self._baseline_counts[ticker].append(len(points))
+        # 4. Z-score объёма — ТОЛЬКО по текстовым точкам. Снимки стакана идут
+        # 2157 в час против 21 новости, и на них z-score мерил темп опроса.
+        text_points = [p for p in points if p.channel != ORDERBOOK_CHANNEL]
+        vol_z = self._volume_zscore(ticker, len(text_points))
+        # Замер базы по расписанию, а не на каждый запрос: иначе горизонт базы
+        # зависит от того, как часто дёргают API.
+        now_ts = datetime.now(timezone.utc)
+        last_ts = self._baseline_last.get(ticker)
+        if last_ts is None or (now_ts - last_ts) >= timedelta(minutes=BASELINE_SAMPLE_MIN):
+            self._baseline_counts[ticker].append(len(text_points))
+            self._baseline_last[ticker] = now_ts
+        n_text = len(text_points)
+        n_ob = len(points) - n_text
+        basis = ("mixed" if n_text and n_ob else
+                 ("orderbook" if n_ob else "text"))
 
         # 5. Итоговая уверенность сигнала
         # Учитываем: разнообразие источников + количество сообщений (насыщение)
@@ -351,6 +404,9 @@ class SentimentAggregator:
             momentum_label=momentum_label,
             source_diversity=round(diversity, 3),
             volume_zscore=vol_z,
+            text_count=n_text,
+            orderbook_count=n_ob,
+            basis=basis,
             confidence=confidence,
         )
 

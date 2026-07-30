@@ -183,6 +183,10 @@ async def screen_ticker(ticker: str, aggregator) -> Optional[dict]:
         # чтобы решение принималось с честным представлением о свежести данных.
         "age": (intraday or {}).get("age_min"),
         "stale": (intraday or {}).get("stale"),
+        # Из чего посчитано настроение. Снимки стакана лежат в том же агрегаторе,
+        # поэтому без этой пометки давление стакана уходит Клоду ДВАЖДЫ: как
+        # «настроение» и отдельным блоком по стакану.
+        "sbasis": (sentiment or {}).get("basis"),
         "setup": (intraday or {}).get("setup"),
         "orb_hi": _lv.get("or_high"),
         "orb_lo": _lv.get("or_low"),
