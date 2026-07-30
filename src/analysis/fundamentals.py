@@ -60,8 +60,10 @@ async def get_fundamentals(ticker: str, tinkoff_token: str = None) -> dict:
     # Пробуем получить актуальные данные из Tinkoff
     if token:
         try:
-            from src.collector.tinkoff_client import TICKER_TO_FIGI
-            figi = TICKER_TO_FIGI.get(ticker)
+            # Через get_figi, а не напрямую из кэша: кэш стартует пустым и
+            # заполняется только подтверждёнными API значениями.
+            from src.collector.tinkoff_client import TinkoffClient
+            figi = await TinkoffClient().get_figi(ticker)
             if figi:
                 async with httpx.AsyncClient(timeout=10) as client:
                     resp = await client.post(

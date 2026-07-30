@@ -20,52 +20,21 @@ logger = logging.getLogger(__name__)
 
 TINKOFF_BASE = "https://invest-public-api.tinkoff.ru/rest"
 
-# FIGI основных тикеров MOEX (Financial Instrument Global Identifier)
-TICKER_TO_FIGI: dict[str, str] = {
-    "SBER":  "BBG004730N88",
-    "GAZP":  "BBG004730RP0",
-    "LKOH":  "BBG004731032",
-    "GMKN":  "BBG004731489",
-    "NVTK":  "BBG00475KKY8",
-    "ROSN":  "BBG004731354",
-    "TATN":  "BBG004RVFFC0",
-    "MTSS":  "BBG004S681B4",
-    "MGNT":  "BBG004ZVJECK",
-    "ALRS":  "BBG004S68B31",
-    "PLZL":  "BBG000R607Y3",
-    "VTBR":  "BBG004730ZJ9",
-    "AFLT":  "BBG004S683W7",
-    "MAGN":  "BBG004S686W0",
-    "NLMK":  "BBG004S681M2",
-    "CHMF":  "BBG005D0XH17",
-    "PHOR":  "BBG004S689R0",
-    "IRAO":  "BBG004S68473",
-    "RUAL":  "BBG008F2T3T2",
-    "SNGS":  "BBG004S686N0",
-    "HYDR":  "BBG00475JZZ6",
-    "OZON":  "BBG00Y91R9T3",
-    "MOEX":  "BBG004730JJ5",
-    "SIBN":  "BBG004731SV2",
-    "FLOT":  "BBG000LNHHJ9",
-    "SMLT":  "BBG00F6NKQX3",
-    "VKCO":  "BBG00178PGX3",
-    "POSI":  "BBG0134B4V73",
-    "ASTR":  "BBG016RTGJG2",
-    "HEAD":  "BBG00KHGQ0H4",
-    "WUSH":  "BBG00Y6FBGG4",
-    "AFKS":  "BBG004S68614",
-    "PIKK":  "BBG004S68BH6",
-    "CBOM":  "BBG009GSYN76",
-    "BSPB":  "BBG000QJW156",
-    "MTLR":  "BBG004S68598",
-    "LSRG":  "BBG0030S3MX5",
-    "UPRO":  "BBG004S68829",
-    "MSNG":  "BBG004S689B4",
-    "TRNFP": "BBG00475KXX1",
-    "DIAS":  "BBG0165B2XH5",
-    "NKNC":  "BBG004S681N1",
-    "EUTR":  "BBG004S6873G",
-}
+# Кэш соответствия тикер -> FIGI. ЗАПОЛНЯЕТСЯ ТОЛЬКО ИЗ API, вручную не ведём.
+#
+# Здесь была рукописная таблица на 43 записи. 30.07 сверка с FindInstrument
+# показала, что 22 из них указывали на ЧУЖИЕ инструменты, а кэш проверялся
+# ДО обращения к API — то есть подмена была постоянной и тихой:
+#   HYDR РусГидро    <- данные FEES ФСК Россети   (0.05 руб вместо 0.32)
+#   MAGN ММК         <- данные UPRO Юнипро        (1.11 руб вместо 20.89)
+#   MTSS МТС         <- данные NLMK
+#   NLMK             <- данные SNGSP
+#   и ещё 18 тикеров получали инструменты вне списка наблюдения
+# По этим тикерам чужими были ВСЕ реалтайм-данные: свечи (а значит VWAP, ATR,
+# диапазон открытия, состояние волатильности), стакан, поток заявок, цена.
+# Диагностика /api/health/figi существовала и резолвила верно, но её вывод
+# никогда не сверяли с таблицей.
+TICKER_TO_FIGI: dict[str, str] = {}
 
 
 class TinkoffClient:
@@ -110,10 +79,14 @@ class TinkoffClient:
             return None
         instruments = data.get("instruments", [])
         for inst in instruments:
+            # Только ТОЧНОЕ совпадение тикера. Кэшируем лишь то, что подтвердил
+            # API: любой другой путь в кэш и был причиной подмены данных.
             if inst.get("ticker", "").upper() == ticker:
                 figi = inst.get("figi")
-                TICKER_TO_FIGI[ticker] = figi   # кэшируем
-                return figi
+                if figi:
+                    TICKER_TO_FIGI[ticker] = figi
+                    return figi
+        logger.warning(f"FIGI для {ticker} не подтверждён API — реалтайм недоступен")
         return None
 
     async def resolve_live(self, ticker: str) -> Optional[dict]:

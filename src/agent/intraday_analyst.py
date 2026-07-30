@@ -296,7 +296,8 @@ async def fetch_intraday(ticker: str, tf_min: int = 5, hours: int = 8) -> Option
 async def build_intraday_context(ticker: str, tf_min: int = 5,
                                  msg_zscore: Optional[float] = None,
                                  has_fresh_news: bool = False,
-                                 opening_range_bars: int = 6) -> Optional[dict]:
+                                 opening_range_bars: int = 6,
+                                 reference_price: Optional[float] = None) -> Optional[dict]:
     """Скачать интрадей-свечи и посчитать контекст/сетап."""
     data = await fetch_intraday(ticker, tf_min=tf_min)
     if not data or not data.get("close"):
@@ -328,6 +329,35 @@ async def build_intraday_context(ticker: str, tf_min: int = 5,
         ctx["note"] = (f"свечи устарели на {h_}ч {m_:02d}мин — сетапы не строим "
                        f"(источник {data.get('_source')})")
         ctx["summary"] = ctx["note"]
+        return ctx
+
+    # СВЕРКА ПРИНАДЛЕЖНОСТИ СЕРИИ. Reference — цена из независимого источника
+    # (дневные свечи ISS). Если интрадей-серия расходится с ней в разы, значит
+    # пришли данные ДРУГОГО инструмента.
+    #
+    # 30.07 так и было: рукописная таблица FIGI указывала 22 тикера на чужие
+    # инструменты, и MAGN получал свечи UPRO (диапазон 1.10-1.12 при цене 20.89),
+    # HYDR — свечи FEES (0.052 при цене 0.323). Ни один слой этого не замечал,
+    # потому что каждый по отдельности выглядел непротиворечиво.
+    if reference_price and reference_price > 0:
+        last = (ctx.get("levels") or {}).get("vwap") or ctx.get("price")
+        try:
+            from config.settings import INTRADAY_PRICE_MISMATCH_PCT as _lim
+        except Exception:
+            _lim = 15.0
+        if last and last > 0:
+            diff = abs(last - reference_price) / reference_price * 100
+            ctx["price_mismatch_pct"] = round(diff, 2)
+            if diff > _lim:
+                ctx["mismatch"] = True
+                ctx["observe"], ctx["setup"] = True, "none"
+                ctx["signal"], ctx["plan"] = "observe", None
+                ctx["note"] = (f"интрадей-цена {last} против {reference_price} по дневным "
+                               f"данным — расхождение {diff:.0f}%; похоже на свечи другого "
+                               f"инструмента, сетапы не строим")
+                ctx["summary"] = ctx["note"]
+                logger.warning(f"{ticker}: интрадей-серия не сходится с дневной ценой "
+                               f"({last} vs {reference_price}, {diff:.0f}%)")
     return ctx
 
 

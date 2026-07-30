@@ -103,6 +103,18 @@ def _ctx_with(series):
         ia.fetch_intraday = orig
 
 
+
+def _ctx_ref(series, reference_price):
+    orig = ia.fetch_intraday
+    async def fake(ticker, tf_min=5, hours=8):
+        return series
+    ia.fetch_intraday = fake
+    try:
+        return asyncio.get_event_loop().run_until_complete(
+            ia.build_intraday_context("TEST", tf_min=5, reference_price=reference_price))
+    finally:
+        ia.fetch_intraday = orig
+
 def test_stale_series_blocks_setups():
     """Серия за вчера обязана быть помечена stale и НЕ давать сетапов."""
     yesterday = datetime.now(MSK).replace(hour=18, minute=14) - timedelta(days=1)
@@ -146,6 +158,46 @@ def test_opening_range_uses_today_when_complete():
     r = opening_range(highs, lows, bars=6, dates=dates)
     assert r["or_low"] == 93.0 and r["or_high"] == 93.5, r
 
+
+
+# ───────── 5) серия принадлежит своему тикеру ─────────────────────────────────
+
+def test_foreign_series_blocked_by_price_mismatch():
+    """MAGN получал свечи UPRO: диапазон 1.10-1.12 при цене 20.89. Сверка с
+    независимой дневной ценой обязана это отсечь."""
+    series = _series(datetime.now(MSK) - timedelta(minutes=5))
+    ctx = _ctx_ref(series, reference_price=20.89)   # серия по 10.0
+    assert ctx["mismatch"] is True
+    assert ctx["setup"] == "none" and ctx["plan"] is None
+    assert "другого инструмента" in ctx["note"]
+
+
+def test_matching_series_passes():
+    series = _series(datetime.now(MSK) - timedelta(minutes=5))
+    ctx = _ctx_ref(series, reference_price=10.02)   # серия по 10.0
+    assert not ctx.get("mismatch")
+    assert ctx["price_mismatch_pct"] < 1
+
+
+def test_honest_intraday_move_not_blocked():
+    """Настоящее внутридневное движение на несколько процентов проходит:
+    порог отсекает разы, а не проценты."""
+    series = _series(datetime.now(MSK) - timedelta(minutes=5))
+    ctx = _ctx_ref(series, reference_price=10.6)    # ~6% расхождение
+    assert not ctx.get("mismatch"), ctx.get("price_mismatch_pct")
+
+
+def test_no_reference_no_check():
+    """Без независимой цены сверку не выдумываем."""
+    ctx = _ctx_ref(_series(datetime.now(MSK) - timedelta(minutes=5)), reference_price=None)
+    assert "price_mismatch_pct" not in ctx
+
+
+def test_hardcoded_figi_table_is_empty():
+    """Рукописной таблицы FIGI быть не должно: 22 из 43 записей указывали на
+    чужие инструменты, и кэш проверялся ДО обращения к API."""
+    from src.collector.tinkoff_client import TICKER_TO_FIGI
+    assert TICKER_TO_FIGI == {}, f"таблица снова заполнена вручную: {len(TICKER_TO_FIGI)}"
 
 if __name__ == "__main__":
     tests = [(n, o) for n, o in sorted(globals().items())

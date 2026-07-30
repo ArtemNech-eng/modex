@@ -125,7 +125,9 @@ async def screen_ticker(ticker: str, aggregator) -> Optional[dict]:
             msg_z = (sentiment or {}).get("volume_zscore")
             intraday = await ia.build_intraday_context(
                 ticker, tf_min=INTRADAY_TF_MIN, msg_zscore=msg_z,
-                opening_range_bars=INTRADAY_OPENING_RANGE_BARS)
+                opening_range_bars=INTRADAY_OPENING_RANGE_BARS,
+                # дневная цена как независимая сверка: ловит чужие свечи
+                reference_price=(technical or {}).get("price"))
         except Exception:
             intraday = None
 

@@ -306,6 +306,8 @@ async def analyze(ticker: str, aggregator, save: bool = True,
                     ticker, tf_min=INTRADAY_TF_MIN,
                     msg_zscore=(sentiment_block or {}).get("volume_zscore"),
                     opening_range_bars=INTRADAY_OPENING_RANGE_BARS,
+                    # дневная цена как независимая сверка: ловит чужие свечи
+                    reference_price=(technical_block or {}).get("price"),
                 )
         except Exception as e:
             logger.debug(f"intraday context failed for {ticker}: {e}")
