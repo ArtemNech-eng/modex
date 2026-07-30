@@ -161,6 +161,63 @@ def test_warmup_before_first_pass():
     loop = body.find("while _status[\"enabled\"]")
     assert 0 < warm < loop, "пауза обязана быть ДО цикла проходов"
 
+
+# ───── наблюдения против сигналов ─────────────────────────────────────────────
+
+def test_observation_marked_as_observation():
+    """Наблюдения и сигналы обязаны различаться. Иначе через месяц нельзя отделить
+    «что система предлагала торговать» от «что она просто заметила», и статистика
+    смешает два разных вопроса."""
+    ctx = {"setup": "none", "stale": False, "mismatch": False, "price": 38.34,
+           "breakout_observation": {"signal": "long", "entry": 38.34,
+                                    "stop_loss": 38.05, "take_profit": 38.92,
+                                    "risk_reward": 2.0, "reason": "пробой сжатия",
+                                    "width_atr": 1.07, "vol_x": 4.0,
+                                    "mode": "observe", "validated": False}}
+    f = _run_check(ctx)
+    assert f is not None and f["kind"] == "observation"
+    assert f["setup"] == "consolidation_breakout" and f["rr"] == 2.0
+
+
+def test_signal_marked_as_signal():
+    f = _run_check(_fake_ctx(setup="news_resolution"))
+    assert f is not None and f["kind"] == "signal"
+
+
+def test_observation_written_as_separate_event_kind():
+    import pathlib
+    src = pathlib.Path(ROOT, "src", "agent", "setup_watcher.py").read_text(encoding="utf-8")
+    assert "setup_observation" in src and "setup_outcome" in src
+
+
+def test_outcome_evaluation_exists_and_is_idempotent():
+    """Без оценки исходов «копить месяц и решить по факту» невыполнимо. Повторный
+    прогон не должен дублировать исход."""
+    import pathlib
+    src = pathlib.Path(ROOT, "src", "agent", "setup_watcher.py").read_text(encoding="utf-8")
+    assert "async def evaluate_observations(" in src
+    body = src.split("async def evaluate_observations")[1][:5000]
+    assert "ref in seen" in body, "нет защиты от повторного подсчёта"
+    assert "setup_outcome" in body
+
+
+def test_outcome_counts_stop_first_on_ambiguous_bar():
+    """Если стоп и цель попали в одну свечу, считаем стоп — осторожная сторона."""
+    import pathlib
+    src = pathlib.Path(ROOT, "src", "agent", "setup_watcher.py").read_text(encoding="utf-8")
+    body = src.split("async def evaluate_observations")[1]
+    i_stop = body.find("res, hit = -1.0")
+    i_tgt = body.find('res, hit = round(')
+    assert 0 < i_stop < i_tgt, "проверка стопа обязана идти ПЕРЕД проверкой цели"
+
+
+def test_stats_carries_caveat():
+    """Статистика без оговорки читается как приговор."""
+    import pathlib
+    src = pathlib.Path(ROOT, "src", "agent", "setup_watcher.py").read_text(encoding="utf-8")
+    body = src.split("async def stats")[1][:3000]
+    assert "оговорка" in body and "-0.113R" in body
+
 if __name__ == "__main__":
     tests = [(n, o) for n, o in sorted(globals().items())
              if n.startswith("test_") and callable(o)]

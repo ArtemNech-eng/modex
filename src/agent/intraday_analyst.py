@@ -225,6 +225,7 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
     # среза: покупатель контролирует день, а сетап предлагает продавать.
     orb_block = None
     breakout_blocked = None
+    breakout_observation = None
     if not observe and setup == "none" and orr:
         try:
             from config.settings import ORB_VALID_MIN as _orb_valid
@@ -276,7 +277,22 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
                 vol_mult=BREAKOUT_VOL_MULT, target_r=BREAKOUT_TARGET_R,
                 max_risk_pct=BREAKOUT_MAX_RISK_PCT)
             if cb.get("signal") == "long":
-                setup, plan, note = "consolidation_breakout", cb, cb["reason"]
+                try:
+                    from config.settings import BREAKOUT_MODE as _mode
+                except Exception:                    # noqa: BLE001
+                    _mode = "observe"
+                if _mode == "signal":
+                    setup, plan, note = "consolidation_breakout", cb, cb["reason"]
+                else:
+                    # РЕЖИМ НАБЛЮДЕНИЯ. Проверка на 181 торговом дне показала, что
+                    # лонговая сторона убыточна во всех конфигурациях после
+                    # издержек (лучшая -0.113R). Те +0.264R на 18 днях июля были
+                    # эффектом режима. Сетап считаем и записываем, но сделкой не
+                    # называем: выключить целиком значит потерять данные, а
+                    # считать сигналом значит торговать без преимущества.
+                    breakout_observation = dict(cb)
+                    breakout_observation["mode"] = _mode
+                    breakout_observation["validated"] = False
             else:
                 # причина отказа — данные, а не тишина: иначе не отличить
                 # «сжатия не было» от «сжатие есть, но объём не подтвердил»
@@ -327,6 +343,9 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
         # несогласие с VWAP. Молчаливый отказ не отличить от «нечего торговать».
         "orb_blocked": orb_block,
         "breakout_blocked": breakout_blocked,
+        # Наблюдение, а не сигнал: план посчитан, но преимущество не подтверждено.
+        # Отдаём отдельным полем, чтобы никакой потребитель не принял его за сетап.
+        "breakout_observation": breakout_observation,
         "news_lag_min": news_near,
         "news_count": len(news_ts or []),
         "delayed": delayed,

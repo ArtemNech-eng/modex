@@ -1201,6 +1201,26 @@ async def setup_watch_status():
     return setup_watcher.status()
 
 
+@app.get("/api/setup-stats", summary="Живая статистика наблюдений по сетапам")
+async def setup_stats(days: int = 30):
+    """Что сетапы дали НА ЖИВЫХ данных, а не в бэктесте.
+
+    Сетап пробоя работает в режиме наблюдения: проверка на 181 торговом дне
+    (январь-июль 2026) показала, что лонговая сторона убыточна во всех
+    конфигурациях после издержек, лучшая -0.113R. Те +0.264R на 18 днях июля были
+    эффектом режима. Решение включать его сигналом должно опираться на эти живые
+    числа, а не на историю одного режима.
+    """
+    from src.agent import setup_watcher
+    return await setup_watcher.stats(days)
+
+
+@app.post("/api/setup-watch/evaluate", summary="Посчитать исходы наблюдений")
+async def setup_watch_evaluate(after_min: Optional[int] = None):
+    from src.agent import setup_watcher
+    return await setup_watcher.evaluate_observations(after_min)
+
+
 @app.post("/api/setup-watch/start", summary="Запустить наблюдателя сетапов")
 async def setup_watch_start(interval_min: Optional[int] = None):
     from src.agent import setup_watcher

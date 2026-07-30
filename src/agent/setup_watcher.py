@@ -88,15 +88,25 @@ async def check_ticker(ticker: str) -> Optional[dict]:
     ctx = await ia.build_intraday_context(
         ticker, tf_min=INTRADAY_TF_MIN,
         opening_range_bars=INTRADAY_OPENING_RANGE_BARS, reference_price=ref)
-    if not ctx or ctx.get("setup") not in WATCHED_SETUPS:
-        return None
     if ctx.get("stale") or ctx.get("mismatch"):
         return None                                  # данные не годятся — не сигналим
-    plan = ctx.get("plan") or {}
+
+    # НАБЛЮДЕНИЕ или СИГНАЛ. Сетап пробоя в режиме observe приходит отдельным полем
+    # и сделкой не является: проверка на 181 торговом дне показала, что лонговая
+    # сторона убыточна во всех конфигурациях после издержек. Записываем, чтобы через
+    # месяц решать по живым числам, но не называем сигналом.
+    obs = ctx.get("breakout_observation")
+    if obs and obs.get("signal") in ("long", "short"):
+        plan, kind, name = obs, "observation", "consolidation_breakout"
+    elif ctx.get("setup") in WATCHED_SETUPS:
+        plan = ctx.get("plan") or {}
+        kind, name = "signal", ctx["setup"]
+    else:
+        return None
     if plan.get("signal") not in ("long", "short"):
         return None
     return {
-        "ticker": ticker, "setup": ctx["setup"], "signal": plan["signal"],
+        "ticker": ticker, "setup": name, "kind": kind, "signal": plan["signal"],
         "entry": plan.get("entry"), "stop": plan.get("stop_loss"),
         "target": plan.get("take_profit"), "rr": plan.get("risk_reward"),
         "reason": plan.get("reason") or ctx.get("note"),
@@ -108,16 +118,156 @@ async def check_ticker(ticker: str) -> Optional[dict]:
 
 
 async def _record(fire: dict) -> None:
-    """Положить срабатывание в базу знаний: событие должно быть проверяемым."""
+    """Положить срабатывание в базу знаний: событие должно быть проверяемым.
+
+    Наблюдения и сигналы пишутся РАЗНЫМИ видами событий. Иначе через месяц нельзя
+    будет отделить «что система предлагала торговать» от «что она просто заметила»,
+    и статистика смешает два разных вопроса.
+    """
     try:
         from src import db
+        kind = ("setup_observation" if fire.get("kind") == "observation" else "setup")
         await db.add_event({
-            "source": "setup_watch", "kind": "setup", "ticker": fire["ticker"],
+            "source": "setup_watch", "kind": kind, "ticker": fire["ticker"],
             "channel": fire["setup"], "text": fire.get("reason"),
             "payload": fire,
         })
     except Exception as e:                           # noqa: BLE001
         logger.debug(f"setup_watch add_event: {e}")
+
+
+async def evaluate_observations(after_min: Optional[int] = None) -> dict:
+    """Посчитать исход наблюдений, которым уже пора разрешиться.
+
+    Без этого пункт «копить месяц и решить по факту» невыполним: наблюдения лежали бы
+    в базе как записи о моменте, но без результата. Считаем так же, как в бэктесте —
+    путём по свечам: сначала стоп или сначала цель, при попадании обоих в одну свечу
+    считаем стоп (осторожная сторона).
+
+    Идемпотентно: наблюдение с уже посчитанным исходом пропускается.
+    """
+    from src import db
+    from src.agent import intraday_analyst as ia
+    if after_min is None:
+        try:
+            from config.settings import SETUP_OUTCOME_AFTER_MIN as after_min
+        except Exception:                            # noqa: BLE001
+            after_min = 90
+
+    obs = await db.recent_events(source="setup_watch", kind="setup_observation",
+                                since_minutes=7 * 24 * 60, limit=500)
+    done = await db.recent_events(source="setup_watch", kind="setup_outcome",
+                                  since_minutes=7 * 24 * 60, limit=500)
+    seen = set()
+    for e in done:
+        pl = e.get("payload") or {}
+        if isinstance(pl, str):
+            try:
+                import json as _j
+                pl = _j.loads(pl)
+            except Exception:
+                pl = {}
+        if pl.get("ref"):
+            seen.add(pl["ref"])
+
+    now = datetime.now(timezone.utc)
+    counted = 0
+    for e in obs:
+        pl = e.get("payload") or {}
+        if isinstance(pl, str):
+            try:
+                import json as _j
+                pl = _j.loads(pl)
+            except Exception:
+                continue
+        ref = f"{pl.get('ticker')}:{pl.get('at')}"
+        if not pl.get("at") or ref in seen:
+            continue
+        try:
+            born = datetime.fromisoformat(str(pl["at"]).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if (now - born) < timedelta(minutes=after_min):
+            continue                                 # ещё рано, пусть разрешится
+
+        entry, stop, target = pl.get("entry"), pl.get("stop"), pl.get("target")
+        if not all(isinstance(x, (int, float)) for x in (entry, stop, target)):
+            continue
+        data = await ia.fetch_intraday(pl["ticker"], tf_min=5)
+        if not data or not data.get("close"):
+            continue
+        H, L, D = data["high"], data["low"], data["dates"]
+        up = pl.get("signal") == "long"
+        risk = abs(entry - stop)
+        if risk <= 0:
+            continue
+        res, hit = None, "open"
+        for i, ts in enumerate(D):
+            try:
+                t = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if t <= born:
+                continue
+            if (up and L[i] <= stop) or (not up and H[i] >= stop):
+                res, hit = -1.0, "stop"
+                break
+            if (up and H[i] >= target) or (not up and L[i] <= target):
+                res, hit = round(abs(target - entry) / risk, 2), "target"
+                break
+        if res is None:
+            last = data["close"][-1]
+            res = round(((last - entry) if up else (entry - last)) / risk, 2)
+            hit = "open"
+        await db.add_event({
+            "source": "setup_watch", "kind": "setup_outcome",
+            "ticker": pl["ticker"], "channel": pl.get("setup"),
+            "text": f"{hit}: {res:+.2f}R",
+            "payload": {"ref": ref, "setup": pl.get("setup"), "signal": pl.get("signal"),
+                        "r": res, "hit": hit, "entry": entry, "stop": stop,
+                        "target": target, "observed_at": pl.get("at"),
+                        "evaluated_at": now.isoformat()},
+        })
+        counted += 1
+    return {"evaluated": counted}
+
+
+async def stats(days: int = 30) -> dict:
+    """Живая статистика наблюдений: ради этого они и копятся.
+
+    Бэктест на 181 дне дал лонговой стороне -0.113R после издержек. Живые числа
+    нужны, чтобы решение включать сетап сигналом опиралось на факт, а не на историю
+    одного режима.
+    """
+    from src import db
+    rows = await db.recent_events(source="setup_watch", kind="setup_outcome",
+                                  since_minutes=days * 24 * 60, limit=2000)
+    by: dict = {}
+    for e in rows:
+        pl = e.get("payload") or {}
+        if isinstance(pl, str):
+            try:
+                import json as _j
+                pl = _j.loads(pl)
+            except Exception:
+                continue
+        key = f"{pl.get('setup')}/{pl.get('signal')}"
+        b = by.setdefault(key, {"n": 0, "sum_r": 0.0, "target": 0, "stop": 0, "open": 0})
+        b["n"] += 1
+        b["sum_r"] += float(pl.get("r") or 0)
+        b[pl.get("hit", "open")] = b.get(pl.get("hit", "open"), 0) + 1
+    out = {}
+    for k, b in by.items():
+        n = b["n"]
+        out[k] = {"наблюдений": n,
+                  "ожидание_R": round(b["sum_r"] / n, 3) if n else None,
+                  "цель": b.get("target", 0), "стоп": b.get("stop", 0),
+                  "не_разрешилось": b.get("open", 0),
+                  "доля_успеха": (round(b.get("target", 0) /
+                                        max(1, b.get("target", 0) + b.get("stop", 0)), 2))}
+    return {"окно_дней": days, "по_сетапам": out,
+            "оговорка": ("бэктест на 181 дне дал лонговой стороне -0.113R после "
+                         "издержек; живые числа нужны для решения по факту")}
 
 
 async def one_pass() -> list:
@@ -175,6 +325,12 @@ async def _loop() -> None:
             phase = session_phase(msk.hour * 60 + msk.minute)
             if phase in ("morning", "main", "evening"):
                 await one_pass()
+                # Исходы считаем тем же проходом: это тоже бесплатно, а без них
+                # «копить месяц и решить по факту» невыполнимо.
+                try:
+                    await evaluate_observations()
+                except Exception as e:               # noqa: BLE001
+                    logger.debug(f"оценка наблюдений: {e}")
             else:
                 _status["last_pass"] = None
                 _status["next_pass"] = (datetime.now(timezone.utc)
