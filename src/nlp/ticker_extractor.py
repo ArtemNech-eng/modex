@@ -127,6 +127,43 @@ STOPWORDS = {
 }
 
 
+# ── Имя эмитента совпадает с названием ПЛОЩАДКИ или индекса ───────────────────
+# Русский трейдер говорит «на Мосбирже» в смысле «на бирже», а «индекс Мосбиржи»
+# это рынок целиком — ни то, ни другое не новость об эмитенте MOEX. Замер 30.07:
+# из семи новостей, привязанных к MOEX, пять (71%) были указанием места или
+# упоминанием индекса, и одна из них подняла ложное новостное событие news_observe.
+# Настоящих новостей эмитента было две: про запуск вечных фьючерсов.
+#
+# Привязку оставляем, только если в тексте есть упоминание ВНЕ такого контекста.
+VENUE_CONTEXT: dict[str, tuple[str, ...]] = {
+    "MOEX": (
+        r"(?:на|в|с|со|для)\s+(?:мосбирж\w*|московской\s+бирж\w*)",
+        r"индекс\w*\s+(?:мосбирж\w*|московской\s+бирж\w*|мб\b)",
+        r"(?:мосбирж\w*|московской\s+бирж\w*)\s+индекс\w*",
+    ),
+}
+
+
+def _venue_only(ticker: str, text_lower: str) -> bool:
+    """Все упоминания тикера — про площадку или индекс, а не про эмитента."""
+    pats = VENUE_CONTEXT.get(ticker)
+    if not pats:
+        return False
+    stripped = text_lower
+    for pat in pats:
+        stripped = re.sub(pat, lambda m: " " * len(m.group(0)), stripped)
+    # осталось ли упоминание вне «площадочного» контекста
+    for alias, tk in RUSSIAN_ALIASES.items():
+        if tk != ticker:
+            continue
+        stem = alias[:-1] if (len(alias) >= MIN_ALIAS_FOR_SUFFIX
+                              and alias[-1] in "ьйяоеа") else alias
+        tail = r"[а-яё]{0,3}" if len(alias) >= MIN_ALIAS_FOR_SUFFIX else ""
+        if re.search(r"\b" + re.escape(stem) + tail + r"\b", stripped):
+            return False
+    return True
+
+
 def extract_tickers(text: str) -> list[str]:
     """
     Извлечь все упомянутые тикеры Мосбиржи из текста.
@@ -190,6 +227,11 @@ def extract_tickers(text: str) -> list[str]:
         ticker = match.group(1).upper()
         if ticker in ALL_TICKERS and ticker not in STOPWORDS:
             found.add(ticker)
+
+    # Снимаем привязку, если бумага упомянута только как площадка или индекс.
+    for tk in list(found):
+        if tk in VENUE_CONTEXT and _venue_only(tk, text_lower):
+            found.discard(tk)
 
     return sorted(found)
 

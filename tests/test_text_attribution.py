@@ -113,6 +113,41 @@ def test_emoji_still_matched():
     assert ks("🚀 полетели").label == "positive"
 
 
+
+# ───── имя эмитента совпадает с названием площадки или индекса ────────────────
+
+def test_venue_mention_is_not_company_news():
+    """ГЛАВНОЕ. «На Мосбирже» по-русски значит «на бирже» — это указание места,
+    а не новость об эмитенте MOEX. Замер на живых новостях 30.07: из семи
+    привязок к MOEX пять были указанием места или упоминанием индекса, и одна
+    подняла ложное новостное событие news_observe (запас 9.7 мин до выноса)."""
+    assert set(ex("На Мосбирже очередные чудеса — Элемент растёт")) == set()
+    assert set(ex("Сижу, смотрю на график индекса Мосбиржи")) == set()
+    assert set(ex("Механизм роста индекса Мосбиржи после 20 июля")) == set()
+
+
+def test_real_issuer_news_kept():
+    """Настоящие новости эмитента терять нельзя: их было две из семи."""
+    assert set(ex("Мосбиржа 4 августа запускает вечные фьючерсы")) == {"MOEX"}
+    assert set(ex("Мосбиржа начнет торги вечными фьючерсами на ETF")) == {"MOEX"}
+
+
+def test_mixed_mention_keeps_ticker():
+    """Если есть упоминание ВНЕ площадочного контекста — привязка остаётся."""
+    assert "MOEX" in ex("Мосбиржа отчиталась, а на Мосбирже тихо")
+
+
+def test_venue_context_does_not_hide_other_tickers():
+    """Отмена по контексту касается только своей бумаги."""
+    assert set(ex("Индекс Мосбиржи вырос, Сбер отчитался")) == {"SBER"}
+
+
+def test_venue_rule_is_declarative():
+    """Правило описано данными, а не зашито в алгоритм: так его видно и можно
+    добавить другую бумагу с тем же свойством."""
+    from src.nlp.ticker_extractor import VENUE_CONTEXT
+    assert "MOEX" in VENUE_CONTEXT and VENUE_CONTEXT["MOEX"]
+
 if __name__ == "__main__":
     tests = [(n, o) for n, o in sorted(globals().items())
              if n.startswith("test_") and callable(o)]
