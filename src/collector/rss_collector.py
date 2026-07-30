@@ -82,6 +82,7 @@ class RSSCollector:
     ):
         self.sources = sources or RSS_SOURCES
         self.poll_interval = poll_interval
+        self.source_health: dict[str, dict] = {}
         self._seen_ids: set[str] = set()
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
         self._running = False
@@ -98,6 +99,15 @@ class RSSCollector:
                 follow_redirects=True,
             )
             if resp.status_code != 200:
+                self._note(source, "error", f"HTTP {resp.status_code}")
+                return []
+
+            # Анти-бот отдаёт HTML вместо RSS: БКС Экспресс 30.07 возвращал
+            # страницу с загрузчиком servicepipe и редиректом через JS. Раньше это
+            # падало в ET как «mismatched tag» и глушилось в debug-лог.
+            head = resp.text.lstrip()[:200].lower()
+            if head.startswith("<!doctype html") or "<html" in head:
+                self._note(source, "blocked", "вместо RSS пришёл HTML (анти-бот)")
                 return []
 
             root = ET.fromstring(resp.text)
@@ -135,11 +145,40 @@ class RSSCollector:
                 ))
                 self._seen_ids.add(guid)
 
+            self._note(source, "ok", None, len(items))
             return items
 
         except Exception as e:
-            logger.debug(f"RSS fetch error for {source['name']}: {e}")
+            self._note(source, "error", f"{type(e).__name__}: {str(e)[:80]}")
+            logger.warning(f"RSS {source['name']}: {type(e).__name__}: {str(e)[:120]}")
             return []
+
+    def _note(self, source: dict, status: str, msg: Optional[str] = None,
+              items: int = 0) -> None:
+        """Записать исход обращения к источнику.
+
+        Раньше отказ возвращал пустой список молча (status != 200 -> return []),
+        а исключения уходили в debug. 30.07 из пяти источников два были мертвы —
+        Финам отдавал HTTP 403, БКС страницу анти-бота — и об этом никто не знал:
+        коллектор продолжал работать на трёх, а health показывал только общее
+        число событий.
+        """
+        self.source_health[source["name"]] = {
+            "status": status, "message": msg, "items": items,
+            "url": source.get("url"),
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    async def _persist_health(self) -> None:
+        """Выложить состояние источников в БД: коллектор и API — разные процессы,
+        поэтому через память здоровье не увидеть."""
+        try:
+            import json as _j
+            from src import db
+            await db.set_setting("rss_source_health", _j.dumps(self.source_health,
+                                                              ensure_ascii=False))
+        except Exception:
+            pass
 
     async def _poll_loop(self):
         async with httpx.AsyncClient() as client:
@@ -154,6 +193,12 @@ class RSSCollector:
 
                 if total > 0:
                     logger.info(f"📰 RSS: +{total} новых новостей")
+                dead = [n for n, h in self.source_health.items()
+                        if h.get("status") != "ok"]
+                if dead:
+                    logger.warning(f"📰 RSS: источников не отвечает {len(dead)}"
+                                   f"/{len(self.sources)}: {', '.join(dead)}")
+                await self._persist_health()
 
                 await asyncio.sleep(self.poll_interval)
 

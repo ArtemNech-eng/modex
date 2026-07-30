@@ -415,7 +415,35 @@ async def health_sources():
         out["session_phase_msk"] = "?"
 
     # Что реально попало в базу знаний за 60 минут
-    out["events_60m"] = (await db.event_source_stats(60)).get("counts", {})
+    counts = (await db.event_source_stats(60)).get("counts", {})
+    out["events_60m"] = counts
+
+    # Состояние RSS-источников по последнему обходу. Раньше отказ был невидим:
+    # коллектор возвращал пустой список молча, и 30.07 два источника из пяти были
+    # мертвы (Финам HTTP 403, БКС страница анти-бота), а health показывал только
+    # суммарное число событий.
+    try:
+        import json as _j
+        raw = await db.get_setting("rss_source_health")
+        health = _j.loads(raw) if raw else {}
+    except Exception:
+        health = {}
+    if health:
+        dead = [n for n, h in health.items() if h.get("status") != "ok"]
+        out["rss"] = {"sources": health, "total": len(health),
+                      "dead_count": len(dead), "dead": dead}
+    else:
+        out["rss"] = {"note": "обход RSS ещё не выполнялся в этом процессе"}
+
+    # НАСТРОЕН и ПРОИЗВОДИТ — разные вещи. Telegram может иметь ключи и сессию и
+    # при этом не давать ни одного события: 30.07 было 0 при 21 активном канале.
+    out["telegram"]["events_60m"] = counts.get("telegram", 0)
+    out["telegram"]["producing"] = counts.get("telegram", 0) > 0
+    out["pulse"] = {"events_60m": counts.get("pulse", 0) + counts.get("pulse_deal", 0),
+                    "producing": (counts.get("pulse", 0) + counts.get("pulse_deal", 0)) > 0}
+    silent = [k for k in ("telegram", "pulse") if not out[k]["producing"]]
+    if silent:
+        out["silent_sources"] = silent
     return out
 
 
