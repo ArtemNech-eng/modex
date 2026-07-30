@@ -277,20 +277,37 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
             try:
                 from config.settings import (BREAKOUT_LONG_PHASES as _lp,
                                              BREAKOUT_SHORT_PHASES as _sp,
-                                             BREAKOUT_MAX_WIDTH_ATR_SHORT as _ws)
+                                             BREAKOUT_MAX_WIDTH_ATR_SHORT as _ws,
+                                             BREAKOUT_MODE as _mode0,
+                                             BREAKOUT_OBSERVE_MAX_WIDTH_ATR as _ow,
+                                             BREAKOUT_OBSERVE_VOL_MULT as _ov,
+                                             BREAKOUT_OBSERVE_PHASES as _op)
             except Exception:                        # noqa: BLE001
-                _lp, _sp, _ws = "main", "morning", 1.5
-            allow = tuple(x for x, ph in (("long", _lp), ("short", _sp))
-                          if phase in [p.strip() for p in ph.split(",")])
+                _lp, _sp, _ws, _mode0 = "main", "morning", 1.5, "observe"
+                _ow, _ov, _op = 2.0, 1.5, "morning,main,evening"
+
+            # НАБЛЮДЕНИЯ ШИРЕ СИГНАЛОВ. Сигнальные пороги узкие — только
+            # проверенное. Но при них за день не набирается ни одного наблюдения, и
+            # решать через месяц будет не по чему. Наблюдение — строка в базе, а не
+            # сделка: оно ничего не стоит. Поэтому в режиме observe сеть шире по
+            # ширине сжатия и по фазам, а стороны разрешены обе.
+            observing = (_mode0 != "signal")
+            if observing:
+                allow = tuple(x for x in ("long", "short")
+                              if phase in [q.strip() for q in _op.split(",")])
+                _w_long, _w_short, _vm = _ow, _ow, _ov
+            else:
+                allow = tuple(x for x, ph in (("long", _lp), ("short", _sp))
+                              if phase in [q.strip() for q in ph.split(",")])
+                _w_long, _w_short, _vm = BREAKOUT_MAX_WIDTH_ATR, _ws, BREAKOUT_VOL_MULT
             if not allow:
-                breakout_blocked = f"фаза {phase}: обе стороны выключены по проверке"
-                allow = ()
+                breakout_blocked = f"фаза {phase}: стороны выключены по проверке"
             cb = (iv.consolidation_breakout(
                 h, l, c, v, atr, vwap_last,
-                window=BREAKOUT_WINDOW_BARS, max_width_atr=BREAKOUT_MAX_WIDTH_ATR,
-                vol_mult=BREAKOUT_VOL_MULT, target_r=BREAKOUT_TARGET_R,
+                window=BREAKOUT_WINDOW_BARS, max_width_atr=_w_long,
+                vol_mult=_vm, target_r=BREAKOUT_TARGET_R,
                 max_risk_pct=BREAKOUT_MAX_RISK_PCT, allow=allow,
-                max_width_atr_short=_ws)
+                max_width_atr_short=_w_short)
                   if allow else {"signal": "none", "reason": breakout_blocked})
             if cb.get("signal") in ("long", "short"):
                 try:
@@ -309,6 +326,13 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
                     breakout_observation = dict(cb)
                     breakout_observation["mode"] = _mode
                     breakout_observation["validated"] = False
+                    # Отмечаем, попадает ли наблюдение в ПРОВЕРЕННУЮ конфигурацию
+                    # (утренний шорт при ширине до 1.5). Так в статистике можно
+                    # будет сравнить проверенный срез с остальными на живых данных.
+                    _side = cb.get("signal")
+                    _wa = cb.get("width_atr") or 99
+                    breakout_observation["in_validated_set"] = bool(
+                        _side == "short" and phase == "morning" and _wa <= _ws)
             else:
                 # причина отказа — данные, а не тишина: иначе не отличить
                 # «сжатия не было» от «сжатие есть, но объём не подтвердил»

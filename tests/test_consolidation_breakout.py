@@ -233,34 +233,37 @@ def test_morning_short_fires():
     assert obs["risk_reward"] == 2.0
 
 
-def test_main_session_short_blocked():
-    """В основной сессии шорт даёт -0.089R — сторона выключена по проверке."""
+def test_signal_mode_gates_phases():
+    """Фазовые запреты относятся к СИГНАЛЬНОМУ режиму. В режиме наблюдения сеть
+    шире намеренно: наблюдение это строка в базе, а не сделка, и без него через
+    месяц решать будет не по чему.
+
+    Проверяем саму функцию с явным allow — так же, как её вызывает сигнальный
+    режим."""
+    import src.analysis.intraday as iv
+    n = 29
+    h = [38.60] * 20 + [38.20] * 8 + [38.05]
+    l = [38.40] * 20 + [38.05] * 8 + [37.80]
+    c = [38.50] * 20 + [38.12] * 8 + [37.85]
+    v = [100] * 28 + [400]
+    r = iv.consolidation_breakout(h, l, c, v, atr=0.20, vwap=38.40,
+                                  allow=("long",), max_width_atr_short=1.5)
+    assert r["signal"] == "none" and "шорты в этой фазе выключены" in r["reason"]
+
+
+def test_observation_mode_does_not_gate_phases():
+    """В режиме наблюдения обе стороны видны во всех торговых фазах."""
     import src.agent.intraday_analyst as ia
     n = 29
     h = [38.60] * 20 + [38.20] * 8 + [38.05]
     l = [38.40] * 20 + [38.05] * 8 + [37.80]
     c = [38.50] * 20 + [38.12] * 8 + [37.85]
     v = [100] * 28 + [400]
-    dates = [f"2026-07-30T{13 + i // 12:02d}:{(i * 5) % 60:02d}:00+03:00" for i in range(n)]
-    cc = {"open": c[:], "high": h, "low": l, "close": c, "volume": v, "dates": dates}
-    ctx = ia.compute_intraday_context(cc, 14 * 60)
-    assert ctx.get("breakout_observation") is None
-    assert "шорты в этой фазе выключены" in (ctx.get("breakout_blocked") or "")
-
-
-def test_evening_both_sides_blocked():
-    """Вечером обе стороны в минусе — не торгуем ни одной."""
-    import src.agent.intraday_analyst as ia
-    n = 29
-    h = [38.60] * 20 + [38.20] * 8 + [38.05]
-    l = [38.40] * 20 + [38.05] * 8 + [37.80]
-    c = [38.50] * 20 + [38.12] * 8 + [37.85]
-    v = [100] * 28 + [400]
-    dates = [f"2026-07-30T{19 + i // 12:02d}:{(i * 5) % 60:02d}:00+03:00" for i in range(n)]
-    cc = {"open": c[:], "high": h, "low": l, "close": c, "volume": v, "dates": dates}
-    ctx = ia.compute_intraday_context(cc, 20 * 60)
-    assert ctx.get("breakout_observation") is None
-    assert "обе стороны выключены" in (ctx.get("breakout_blocked") or "")
+    for HH, mod in ((13, 14 * 60), (19, 20 * 60)):
+        dates = [f"2026-07-30T{HH + i // 12:02d}:{(i * 5) % 60:02d}:00+03:00" for i in range(n)]
+        cc = {"open": c[:], "high": h, "low": l, "close": c, "volume": v, "dates": dates}
+        obs = ia.compute_intraday_context(cc, mod).get("breakout_observation")
+        assert obs and obs["signal"] == "short", (HH, mod)
 
 
 def test_short_width_threshold_is_wider():
@@ -287,6 +290,47 @@ def test_short_vwap_agreement():
     r = iv.consolidation_breakout(h, l, c, v, atr=0.20, vwap=37.00,
                                   allow=("short",), max_width_atr_short=1.5)
     assert r["signal"] == "none" and "VWAP" in r["reason"]
+
+
+# ───── наблюдения шире сигналов ───────────────────────────────────────────────
+
+def test_validated_slice_is_marked():
+    """Проверенный срез — утренний шорт при ширине до 1.5 — помечается отдельно,
+    чтобы в живой статистике сравнить его с остальными наблюдениями."""
+    import src.agent.intraday_analyst as ia
+    n = 29
+    h = [38.60] * 20 + [38.20] * 8 + [38.05]
+    l = [38.40] * 20 + [38.05] * 8 + [37.80]
+    c = [38.50] * 20 + [38.12] * 8 + [37.85]
+    v = [100] * 28 + [400]
+    for HH, mod, expect in ((7, 8 * 60, True), (13, 14 * 60, False), (19, 20 * 60, False)):
+        dates = [f"2026-07-30T{HH + i // 12:02d}:{(i * 5) % 60:02d}:00+03:00" for i in range(n)]
+        cc = {"open": c[:], "high": h, "low": l, "close": c, "volume": v, "dates": dates}
+        obs = ia.compute_intraday_context(cc, mod)["breakout_observation"]
+        assert obs["in_validated_set"] is expect, (HH, obs["in_validated_set"])
+
+
+def test_long_never_in_validated_set():
+    """Лонг не прошёл проверку нигде — в проверенный срез попасть не может."""
+    import src.agent.intraday_analyst as ia
+    n = 29
+    h = [37.50] * 20 + [38.20] * 8 + [38.36]
+    l = [37.30] * 20 + [38.05] * 8 + [38.24]
+    c = [37.40] * 20 + [38.12] * 8 + [38.34]
+    v = [100] * 28 + [400]
+    HH = 7
+    dates = [f"2026-07-30T{HH + i // 12:02d}:{(i * 5) % 60:02d}:00+03:00" for i in range(n)]
+    cc = {"open": c[:], "high": h, "low": l, "close": c, "volume": v, "dates": dates}
+    obs = ia.compute_intraday_context(cc, 8 * 60)["breakout_observation"]
+    assert obs["signal"] == "long" and obs["in_validated_set"] is False
+
+
+def test_observe_thresholds_wider_than_signal():
+    from config.settings import (BREAKOUT_MAX_WIDTH_ATR, BREAKOUT_MAX_WIDTH_ATR_SHORT,
+                                 BREAKOUT_OBSERVE_MAX_WIDTH_ATR, BREAKOUT_OBSERVE_PHASES)
+    assert BREAKOUT_OBSERVE_MAX_WIDTH_ATR > BREAKOUT_MAX_WIDTH_ATR
+    assert BREAKOUT_OBSERVE_MAX_WIDTH_ATR > BREAKOUT_MAX_WIDTH_ATR_SHORT
+    assert len(BREAKOUT_OBSERVE_PHASES.split(",")) == 3
 
 if __name__ == "__main__":
     tests = [(n, o) for n, o in sorted(globals().items())
