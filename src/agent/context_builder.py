@@ -619,10 +619,15 @@ async def build_levels_context(ticker: str) -> str:
     lines = [f"📐 УРОВНИ {ticker} (интрадей):"]
     have = False
 
-    # Профиль объёма + VWAP-полосы из интрадей-свечей (5-мин текущей сессии)
+    # Профиль объёма + VWAP-полосы из интрадей-свечей (5-мин текущей сессии).
+    # Окно считается от утреннего аукциона, а не фиксированными 9 часами:
+    # с константой профиль объёма после ~16:00 МСК строился по огрызку дня и
+    # «зона стоимости» уезжала вслед за окном (см. _session_hours_msk).
     try:
         from src.collector.tinkoff_client import TinkoffClient
-        intr = await TinkoffClient().get_intraday_candles(ticker, tf_min=5, hours=9)
+        from src.agent.intraday_analyst import _session_hours_msk
+        intr = await TinkoffClient().get_intraday_candles(
+            ticker, tf_min=5, hours=_session_hours_msk())
     except Exception:
         intr = None
     if intr and intr.get("close"):

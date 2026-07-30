@@ -444,6 +444,39 @@ def _msk_today():
     return (datetime.now(timezone.utc) + timedelta(hours=3)).date()
 
 
+# Утренний аукцион стартует в 06:50 МСК, торги идут до 23:50. Берём запас в
+# пять минут, чтобы первая свеча дня гарантированно попадала в окно.
+SESSION_START_MSK = (6, 45)
+
+
+def _session_hours_msk(now_msk=None) -> int:
+    """
+    Сколько последних часов запрашивать, чтобы окно накрыло ВСЮ сегодняшнюю
+    сессию, начиная с утреннего аукциона.
+
+    Здесь стояла константа 8 часов, и это тихо ломало все уровни дня. Пока
+    сессия короткая, окно её накрывает; после ~15:00 МСК начало дня уходит за
+    край, и min/max окна перестают быть минимумом и максимумом ДНЯ — оставаясь
+    при этом похожими на правду.
+
+    30.07 в 23:30 по FLOT окно начиналось в 15:25 и давало диапазон
+    77.61–78.92 при настоящем 77.27–79.75: максимум дня стоял в 10:00 и в окно
+    не попадал. По этому «максимуму» был выдан сигнал на пробой — то есть вход
+    на уровне, который рынок прошёл и отверг тринадцатью часами ранее.
+    Сплошная проверка 48 бумаг: у 46 хотя бы один экстремум дня был вне окна.
+
+    Возвращает целые часы с запасом в один час, не больше суток.
+    """
+    now_msk = now_msk or (datetime.now(timezone.utc) + timedelta(hours=3))
+    start = now_msk.replace(hour=SESSION_START_MSK[0], minute=SESSION_START_MSK[1],
+                            second=0, microsecond=0)
+    if now_msk < start:
+        # до открытия — окно смотрит на хвост вчерашней сессии
+        start -= timedelta(days=1)
+    hours = (now_msk - start).total_seconds() / 3600.0
+    return max(1, min(24, int(hours) + 1))
+
+
 def _last_bar_age_min(dates: list) -> Optional[float]:
     """Возраст последней свечи в минутах по стенным часам. None — не разобрать."""
     if not dates:
@@ -457,11 +490,18 @@ def _last_bar_age_min(dates: list) -> Optional[float]:
     return (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
 
 
-async def fetch_intraday(ticker: str, tf_min: int = 5, hours: int = 8) -> Optional[dict]:
+async def fetch_intraday(ticker: str, tf_min: int = 5,
+                         hours: Optional[int] = None) -> Optional[dict]:
     """
     Интрадей-свечи с пометкой источника/задержки.
     Возвращает dict свечей + ключи "_source" и "_delayed".
+
+    hours=None (по умолчанию) — окно от утреннего аукциона до текущего момента,
+    чтобы min/max действительно были экстремумами ДНЯ. Явное число оставлено
+    для realized_price_after, которому нужен хвост за прошлые сутки.
     """
+    if hours is None:
+        hours = _session_hours_msk()
     # 1) Реалтайм через Tinkoff (если есть токен)
     try:
         from config.settings import TINKOFF_TOKEN
