@@ -30,9 +30,12 @@ class _Pred:
 
 
 def _apply(pred, entry=None, stop=None, target=None, note=""):
-    """Чистое воспроизведение логики correct_prediction_levels."""
+    """Чистое воспроизведение логики correct_prediction_levels, включая пересчёт
+    снимка позиции: рублёвый результат считается по risk_shares/risk_rub из
+    контекста, а не по уровням записи."""
     import json
     from datetime import datetime, timezone
+    from src.risk.engine import RiskConfig, size_position
     if pred.correct is not None or pred.realized_price is not None:
         return {"ok": False, "reason": "прогноз уже оценён — уровни не меняем"}
     before = {"entry": pred.entry, "stop": pred.stop, "target": pred.target,
@@ -46,14 +49,26 @@ def _apply(pred, entry=None, stop=None, target=None, note=""):
     risk = abs(pred.entry - pred.stop)
     pred.rr_planned = round(abs(pred.target - pred.entry) / risk, 2) if risk else None
     ctx = json.loads(pred.context_json) if pred.context_json else {}
+    pos_before = {k: ctx.get(k) for k in ("risk_shares", "risk_rub", "stop_pct")}
+    d = size_position(entry=pred.entry, stop=pred.stop,
+                      direction=("up" if getattr(pred, "direction", "up") == "up" else "down"),
+                      cfg=RiskConfig(), lot_size=1,
+                      spread_pct=ctx.get("spread_pct_at_signal"),
+                      depth_near_mid=ctx.get("depth_near_mid_at_signal"))
+    pos_after = {"risk_shares": d.shares, "risk_rub": round(d.risk_rub, 2),
+                 "stop_pct": round(abs(pred.entry - pred.stop) / pred.entry, 4)}
+    ctx.update(pos_after)
+    ctx["entry"], ctx["stop"], ctx["target"] = pred.entry, pred.stop, pred.target
     trail = ctx.get("level_corrections") or []
     trail.append({"at": datetime.now(timezone.utc).isoformat(), "before": before,
                   "after": {"entry": pred.entry, "stop": pred.stop,
                             "target": pred.target, "rr_planned": pred.rr_planned},
+                  "position_before": pos_before, "position_after": pos_after,
                   "note": note or "исполнение отличалось от записанного"})
     ctx["level_corrections"] = trail
     pred.context_json = json.dumps(ctx, ensure_ascii=False)
-    return {"ok": True, "before": before, "after": trail[-1]["after"]}
+    return {"ok": True, "before": before, "after": trail[-1]["after"],
+            "position_before": pos_before, "position_after": pos_after}
 
 
 def test_entry_correction_changes_rr():
@@ -118,6 +133,61 @@ def test_real_function_exists_with_same_contract():
     assert "прогноз уже оценён" in src
     assert "level_corrections" in src
 
+
+
+# ───── снимок позиции пересчитывается вместе с уровнями ───────────────────────
+
+def test_position_snapshot_recomputed():
+    """ГЛАВНОЕ. Рублёвый результат считается по risk_shares и risk_rub из
+    КОНТЕКСТА (_position_from_context), а не по уровням записи. Настоящий случай
+    664: снимок был посчитан от входа 39.00 со стопом 38.85 — риск 0.15 на акцию,
+    1282 шт, 192₽. При входе 39.40 и стопе 39.10 риск 0.30 на акцию: 1269 шт и
+    381₽. Расхождение вдвое, и без пересчёта оно попало бы в ожидание и в отчёт."""
+    import json
+    p = _Pred(entry=39.0, stop=38.85, target=39.72, rr=4.8,
+              ctx=json.dumps({"risk_shares": 1282, "risk_rub": 192.3,
+                              "stop_pct": 0.0038,
+                              "spread_pct_at_signal": 0.0255,
+                              "depth_near_mid_at_signal": 231300}))
+    r = _apply(p, entry=39.40, stop=39.10)
+    assert r["position_before"]["risk_shares"] == 1282
+    assert r["position_after"]["risk_shares"] != 1282, "размер обязан пересчитаться"
+    # риск на акцию вырос вдвое -> рублёвый риск вырос
+    assert r["position_after"]["risk_rub"] > r["position_before"]["risk_rub"] * 1.5, \
+        (r["position_before"]["risk_rub"], r["position_after"]["risk_rub"])
+
+
+def test_stop_pct_recomputed():
+    import json
+    p = _Pred(entry=39.0, stop=38.85, ctx=json.dumps({"stop_pct": 0.0038}))
+    r = _apply(p, entry=39.40, stop=39.10)
+    assert abs(r["position_after"]["stop_pct"] - 0.0076) < 0.0005, r["position_after"]["stop_pct"]
+
+
+def test_context_levels_stay_in_sync():
+    """Контекст держит свою копию уровней. Если поправить только поля записи,
+    пост-мортем и аудит прочитают разные цены одного сигнала."""
+    import json
+    p = _Pred(ctx=json.dumps({"entry": 39.0, "stop": 38.85, "target": 39.72}))
+    _apply(p, entry=39.40, stop=39.10, target=39.90)
+    ctx = json.loads(p.context_json)
+    assert ctx["entry"] == 39.40 and ctx["stop"] == 39.10 and ctx["target"] == 39.90
+
+
+def test_position_trail_keeps_both_snapshots():
+    import json
+    p = _Pred(ctx=json.dumps({"risk_shares": 1282, "risk_rub": 192.3}))
+    _apply(p, entry=39.40, stop=39.10)
+    tr = json.loads(p.context_json)["level_corrections"][0]
+    assert tr["position_before"]["risk_shares"] == 1282
+    assert tr["position_after"]["risk_shares"] is not None
+
+
+def test_real_function_recomputes_position():
+    import pathlib
+    src = pathlib.Path(ROOT, "src", "db.py").read_text(encoding="utf-8")
+    assert "position_after" in src and "size_position(" in src
+    assert "risk_shares" in src.split("async def correct_prediction_levels")[1][:4000]
 
 if __name__ == "__main__":
     tests = [(n, o) for n, o in sorted(globals().items())

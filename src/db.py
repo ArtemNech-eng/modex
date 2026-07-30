@@ -1030,18 +1030,60 @@ async def correct_prediction_levels(pred_id: int, entry: Optional[float] = None,
                 ctx = json.loads(pred.context_json) or {}
             except Exception:
                 ctx = {}
+
+        # СНИМОК ПОЗИЦИИ ПЕРЕСЧИТЫВАЕМ. Рублёвый результат считается по
+        # risk_shares/risk_rub из контекста (см. _position_from_context), а не по
+        # уровням записи. Если поправить только уровни, журнал покажет верный R и
+        # НЕВЕРНЫЕ рубли: у сигнала 664 снимок был посчитан от входа 39.00 со стопом
+        # 38.85 (риск 0.15 на акцию, 1282 шт, 192₽), тогда как при входе 39.40 и
+        # стопе 39.10 риск 0.30 на акцию — то есть 1269 шт и 381₽. Расхождение
+        # вдвое, и оно попало бы в ожидание и в отчёт по счёту.
+        pos_before = {k: ctx.get(k) for k in
+                      ("risk_shares", "risk_rub", "risk_pct_of_account",
+                       "risk_notional_rub", "risk_binding", "stop_pct")}
+        pos_after = None
+        try:
+            from src.risk.engine import RiskConfig, size_position
+            d = size_position(
+                entry=pred.entry, stop=pred.stop,
+                direction=("up" if pred.direction == "up" else "down"),
+                cfg=RiskConfig(), lot_size=int(ctx.get("lot_size") or 1),
+                spread_pct=ctx.get("spread_pct_at_signal"),
+                depth_near_mid=ctx.get("depth_near_mid_at_signal"))
+            pos_after = {
+                "risk_shares": d.shares,
+                "risk_rub": round(d.risk_rub, 2),
+                "risk_pct_of_account": round(d.risk_pct_of_account, 4),
+                "risk_notional_rub": round(d.notional_rub, 2),
+                "risk_binding": d.binding_constraint,
+                "risk_approved_after_correction": d.approved,
+                "stop_pct": (round(abs(pred.entry - pred.stop) / pred.entry, 4)
+                             if pred.entry else None),
+            }
+            ctx.update(pos_after)
+        except Exception as e:                       # noqa: BLE001
+            logger.warning(f"correct_prediction_levels: снимок позиции не пересчитан: {e}")
+
+        # Копии уровней в контексте держим согласованными с полями записи, иначе
+        # пост-мортем и аудит прочитают разные цены одного и того же сигнала.
+        ctx["entry"], ctx["stop"], ctx["target"] = pred.entry, pred.stop, pred.target
+        ctx["rr_planned"] = pred.rr_planned
+
         trail = ctx.get("level_corrections") or []
         trail.append({"at": datetime.now(timezone.utc).isoformat(),
                       "before": before,
                       "after": {"entry": pred.entry, "stop": pred.stop,
                                 "target": pred.target, "rr_planned": pred.rr_planned},
+                      "position_before": pos_before,
+                      "position_after": pos_after,
                       "note": note or "исполнение отличалось от записанного"})
         ctx["level_corrections"] = trail
         pred.context_json = json.dumps(ctx, ensure_ascii=False)
         await session.commit()
         return {"ok": True, "before": before,
                 "after": {"entry": pred.entry, "stop": pred.stop,
-                          "target": pred.target, "rr_planned": pred.rr_planned}}
+                          "target": pred.target, "rr_planned": pred.rr_planned},
+                "position_before": pos_before, "position_after": pos_after}
 
 
 async def merge_prediction_context(pred_id: int, extra: dict) -> bool:
