@@ -986,6 +986,64 @@ async def accuracy_stats(ticker: Optional[str] = None) -> dict:
     }
 
 
+async def correct_prediction_levels(pred_id: int, entry: Optional[float] = None,
+                                    stop: Optional[float] = None,
+                                    target: Optional[float] = None,
+                                    note: str = "") -> dict:
+    """Исправить уровни прогноза, если исполнение отличалось от записанного.
+
+    Нужно потому, что оценка считает R-мультипликатор по p.entry и p.stop, а не по
+    контексту. Если аналитик записал вход 39.00, а сделка исполнена по 39.40, то
+    всякий R, ожидание и точность считаются по цене, которой не было. Пометки в
+    контексте недостаточно — правка обязана лечь в те же поля, что читает оценка.
+
+    Исправление возможно ТОЛЬКО до оценки: менять уровни после того, как исход
+    посчитан, значит переписывать историю. Прежние значения сохраняются в контексте
+    как след правки, чтобы аудит видел и что было, и почему изменили.
+    """
+    async with async_session() as session:
+        pred = await session.get(Prediction, pred_id)
+        if pred is None:
+            return {"ok": False, "reason": "прогноз не найден"}
+        if getattr(pred, "correct", None) is not None or pred.realized_price is not None:
+            return {"ok": False, "reason": "прогноз уже оценён — уровни не меняем"}
+
+        before = {"entry": pred.entry, "stop": pred.stop, "target": pred.target,
+                  "rr_planned": pred.rr_planned}
+        if entry is not None:
+            pred.entry = float(entry)
+        if stop is not None:
+            pred.stop = float(stop)
+        if target is not None:
+            pred.target = float(target)
+        # R/R пересчитываем от новых уровней: иначе в журнале останется план,
+        # не соответствующий записанным ценам.
+        try:
+            risk = abs(pred.entry - pred.stop)
+            pred.rr_planned = round(abs(pred.target - pred.entry) / risk, 2) if risk else None
+        except (TypeError, ZeroDivisionError):
+            pred.rr_planned = None
+
+        ctx = {}
+        if pred.context_json:
+            try:
+                ctx = json.loads(pred.context_json) or {}
+            except Exception:
+                ctx = {}
+        trail = ctx.get("level_corrections") or []
+        trail.append({"at": datetime.now(timezone.utc).isoformat(),
+                      "before": before,
+                      "after": {"entry": pred.entry, "stop": pred.stop,
+                                "target": pred.target, "rr_planned": pred.rr_planned},
+                      "note": note or "исполнение отличалось от записанного"})
+        ctx["level_corrections"] = trail
+        pred.context_json = json.dumps(ctx, ensure_ascii=False)
+        await session.commit()
+        return {"ok": True, "before": before,
+                "after": {"entry": pred.entry, "stop": pred.stop,
+                          "target": pred.target, "rr_planned": pred.rr_planned}}
+
+
 async def merge_prediction_context(pred_id: int, extra: dict) -> bool:
     """Дописать поля в снимок контекста прогноза, не затирая существующие.
 

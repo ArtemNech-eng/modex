@@ -1178,6 +1178,27 @@ async def post_signal_decision(pred_id: int, decision: str, note: Optional[str] 
     return {"status": "ok", "prediction": updated}
 
 
+@app.post("/api/signals/{pred_id}/correct", summary="Исправить уровни сигнала до оценки")
+async def correct_signal_levels(pred_id: int, payload: dict = Body(...)):
+    """Привести записанные уровни в соответствие с фактическим исполнением.
+
+    Оценка считает R-мультипликатор по entry и stop ИЗ ЗАПИСИ, а не из контекста.
+    Если аналитик записал вход 39.00, а сделка исполнена по 39.40, то R, ожидание и
+    точность считаются по цене, которой не было — и обучение идёт на выдуманных
+    числах. Пометки в контексте для этого мало.
+
+    Меняем только до оценки. Прежние значения сохраняются в контексте как след
+    правки: аудит должен видеть и что было, и почему изменили.
+    """
+    res = await db.correct_prediction_levels(
+        pred_id,
+        entry=payload.get("entry"), stop=payload.get("stop"),
+        target=payload.get("target"), note=str(payload.get("note") or ""))
+    if not res.get("ok"):
+        raise HTTPException(status_code=409, detail=res.get("reason"))
+    return res
+
+
 @app.post("/api/analyst-signal", summary="Сценарий от внешнего аналитика в общий журнал")
 async def post_analyst_signal(payload: dict = Body(...)):
     """Принять торговый сценарий от внешнего аналитика.
