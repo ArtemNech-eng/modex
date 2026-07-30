@@ -189,27 +189,39 @@ def opening_range(highs: list[float], lows: list[float], bars: int = 6,
         "bars": bars,
         "session_open_min": s_open,
         "session_bars": len(idx),
+        # Минута дня, когда диапазон СФОРМИРОВАЛСЯ. Нужна, чтобы у сетапа был срок
+        # годности: пробой диапазона открытия — техника первого часа, а в 14:04
+        # «пробой» диапазона 10:00-10:30 это уже просто «рынок ниже утра».
+        "or_end_min": mins[first[-1]],
     }
 
 
 def orb_signal(price: float, or_high: float, or_low: float, atr: float,
-               target_mult: float = 1.5) -> dict:
+               target_mult: float = 1.5, min_rr: Optional[float] = None) -> dict:
     """
     Пробой диапазона открытия. Стоп — за противоположную границу диапазона,
     цель — на target_mult·ATR от входа. R/R считаем честно.
     """
     if atr is None or atr <= 0:
         return {"signal": "none", "reason": "нет ATR"}
+    if min_rr is None:
+        try:
+            from config.settings import SETUP_MIN_RR as _m
+            min_rr = _m
+        except Exception:
+            min_rr = 1.5
     if price > or_high:
         entry, stop = price, or_low
         target = round(price + target_mult * atr, 6)
         risk = entry - stop
-        return _plan("long", entry, stop, target, risk, "пробой диапазона открытия вверх")
+        return _plan("long", entry, stop, target, risk,
+                     "пробой диапазона открытия вверх", min_rr=min_rr)
     if price < or_low:
         entry, stop = price, or_high
         target = round(price - target_mult * atr, 6)
         risk = stop - entry
-        return _plan("short", entry, stop, target, risk, "пробой диапазона открытия вниз")
+        return _plan("short", entry, stop, target, risk,
+                     "пробой диапазона открытия вниз", min_rr=min_rr)
     return {"signal": "none", "reason": "цена внутри диапазона открытия"}
 
 
@@ -432,9 +444,34 @@ def velocity(closes: list, volumes: list, k: int = 6) -> dict:
 # ─── helpers ──────────────────────────────────────────────────────────────────
 
 def _plan(signal: str, entry: float, stop: float, target: float,
-          risk: float, reason: str) -> dict:
+          risk: float, reason: str, min_rr: Optional[float] = None) -> dict:
+    """Собрать план входа. Отказывает, если геометрия не оправдывает риск.
+
+    R/R считался и раньше, но НИКТО на него не смотрел, поэтому план выдавался
+    при любой геометрии. Замер 30.07 в 14:04: из 36 сетапов ORB у 35 R/R был ниже
+    1.0, медиана около 0.27 — стоп на границе утреннего диапазона стоял в 1-5% от
+    цены, а цель 1.5*ATR была в разы меньше. Худшие: MGNT 0.12, SMLT 0.22 при
+    риске 5.1%. Такой план формально корректен и практически безнадёжен.
+    """
     reward = abs(target - entry)
     rr = round(reward / risk, 2) if risk and risk > 0 else None
+    if min_rr is None:
+        # Порога нет по умолчанию НАМЕРЕННО. У новостного плана стоп стоит за всей
+        # свечой выноса (около 2.5*ATR), а цель 1.5*ATR, поэтому единый порог
+        # обнулил бы новостную ветку целиком — не потому, что она плоха, а потому
+        # что у неё неверно задана цель. Это отдельная задача: стоп должен стоять
+        # чуть за уровнем пробоя, а не за всем диапазоном события.
+        return {
+            "signal": signal, "entry": round(entry, 6),
+            "stop_loss": round(stop, 6), "take_profit": round(target, 6),
+            "risk_reward": rr, "reason": reason,
+        }
+    if rr is None:
+        return {"signal": "none", "reason": "риск не определён"}
+    if rr < min_rr:
+        return {"signal": "none",
+                "reason": f"R/R {rr} ниже минимума {min_rr} — вход не оправдан",
+                "risk_reward": rr}
     return {
         "signal": signal,
         "entry": round(entry, 6),

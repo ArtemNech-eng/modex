@@ -347,7 +347,7 @@ class ClaudeAgent:
                 f"{_s(b.get('regime'))} adx{_s(b.get('adx'))} rsi{_s(b.get('rsi'))} "
                 f"atr{_s(b.get('atr'))} {_s(b.get('vol'))} roc{_s(b.get('price_roc'))} "
                 f"v{_s(b.get('vol_ratio'))} orb{_s(b.get('orb_lo'))}-{_s(b.get('orb_hi'))} "
-                f"rr{_s(b.get('rr'))} {_s(b.get('entry_status'))} ob:{_s(b.get('ob_pressure'))}"
+                f"rr{_s(b.get('rr'))} srr{_s(b.get('srr'))} {_s(b.get('entry_status'))} ob:{_s(b.get('ob_pressure'))}"
                 f"/{_s(b.get('bid_ask'))}/{_s(b.get('liquidity'))} "
                 f"fl:{_s(b.get('flow'))}/{_s(b.get('delta'))}/{_s(b.get('buy_pct'))}% "
                 f"si{_s(b.get('si'))} set:{_s(b.get('setup'))} "
@@ -360,7 +360,7 @@ class ClaudeAgent:
             return []
         legend = ("Формат строки: ТИКЕР p<цена> <позиция к VWAP> <режим> adx rsi atr "
                   "<волатильность> roc<скорость цены,%> v<объём×среднего> orb<низ-верх> "
-                  "rr<R:R> <статус входа> ob:<давление стакана>/<bid-ask>/<ликвидность> "
+                  "rr<R:R ДНЕВНОГО плана техники> srr<R:R ИНТРАДЕЙ-сетапа: именно того входа, о котором говорит поле сетапа; если пусто — сетап не выдан> <статус входа> ob:<давление стакана>/<bid-ask>/<ликвидность> "
                   "fl:<поток>/<дельта,лот>/<%покупок> si<настроение> set:<сетап> "
                   "rv<объём последнего ЗАВЕРШЁННОГО дня к среднему, ×> "
                   "pace<темп объёма сегодня к ожидаемому на этот час, ×> "

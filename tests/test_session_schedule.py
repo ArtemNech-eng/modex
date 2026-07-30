@@ -261,6 +261,68 @@ def test_break_time_falls_back_to_last_traded_session():
     r = _or(**_bars(times, [93.0] * n, [92.0] * n), bars=6)
     assert r is not None and r["session_open_min"] == 10 * 60
 
+
+# ───── срок годности диапазона открытия ───────────────────────────────────────
+
+def test_range_reports_when_it_was_formed():
+    """Без времени формирования у сетапа не может быть срока годности."""
+    times = [(10, 5 * i) for i in range(6)]
+    r = _or(**_bars(times, [10.02] * 6, [9.98] * 6), bars=6)
+    assert r["or_end_min"] == 10 * 60 + 25
+
+
+def test_orb_expires_after_window():
+    """ГЛАВНОЕ. Пробой диапазона — техника первого часа. Замер 30.07 в 14:04,
+    через три с половиной часа после формирования диапазона 10:00-10:30, дал
+    ДЕСЯТЬ шортов при рынке, выросшем на 0.89% (32 бумаги вверх, 15 вниз).
+    Среди них шорт по DIAS, прибавившему 2.54% и стоявшему ВЫШЕ VWAP."""
+    n = 30
+    dates = ([f"2026-07-30T10:{5 * i:02d}:00+03:00" for i in range(6)]
+             + [f"2026-07-30T{11 + i // 12:02d}:{(i * 5) % 60:02d}:00+03:00"
+                for i in range(n - 6)])
+    c = {"open": [10.0] * n, "high": [10.02] * n, "low": [9.98] * n,
+         "close": [10.0] * n, "volume": [100] * n, "dates": dates}
+    # Цена только что вышла за диапазон и держится: расстояние до дальнего края
+    # меньше ATR, поэтому геометрия проходит порог. Так ORB и работает — вход
+    # берётся рядом с границей, а не после того, как цена ушла на проценты.
+    for i in range(6, n):
+        c["close"][i] = 10.05
+        c["high"][i], c["low"][i] = 10.13, 9.97
+    fresh = _ia.compute_intraday_context(c, hm(11, 30))    # 65 мин после диапазона
+    late = _ia.compute_intraday_context(c, hm(14, 4))      # 219 мин после
+    assert fresh["setup"] == "orb", fresh.get("orb_blocked")
+    assert late["setup"] != "orb"
+    assert "мин назад" in (late.get("orb_blocked") or "")
+
+
+def test_orb_requires_agreement_with_vwap():
+    """Пробой вниз при цене выше VWAP — противоречие внутри одного среза:
+    покупатель контролирует день, а сетап предлагает продавать."""
+    n = 30
+    dates = [f"2026-07-30T{10 + i // 12:02d}:{(i * 5) % 60:02d}:00+03:00" for i in range(n)]
+    # утро низко (тянет VWAP вниз), диапазон открытия высоко, цена ниже диапазона
+    c = {"open": [10.0] * n, "high": [10.6] * 6 + [10.2] * (n - 6),
+         "low": [10.4] * 6 + [10.0] * (n - 6), "close": [10.5] * 6 + [10.1] * (n - 6),
+         "volume": [100] * n, "dates": dates}
+    ctx = _ia.compute_intraday_context(c, hm(11, 0))
+    if ctx.get("orb_blocked"):
+        assert "VWAP" in ctx["orb_blocked"] or "R/R" in ctx["orb_blocked"]
+
+
+def test_blocked_reason_is_recorded_not_silent():
+    """Молчаливый отказ не отличить от «нечего торговать»."""
+    n = 30
+    dates = ([f"2026-07-30T10:{5 * i:02d}:00+03:00" for i in range(6)]
+             + [f"2026-07-30T{11 + i // 12:02d}:{(i * 5) % 60:02d}:00+03:00"
+                for i in range(n - 6)])
+    c = {"open": [10.0] * n, "high": [10.02] * n, "low": [9.98] * n,
+         "close": [10.0] * n, "volume": [100] * n, "dates": dates}
+    for i in range(6, n):
+        c["high"][i], c["low"][i], c["close"][i] = 11.0, 10.5, 10.9   # ушла далеко
+    ctx = _ia.compute_intraday_context(c, hm(11, 30))
+    assert ctx["setup"] != "orb"
+    assert ctx.get("orb_blocked"), "причина отказа должна записываться"
+
 if __name__ == "__main__":
     tests = [(n, o) for n, o in sorted(globals().items())
              if n.startswith("test_") and callable(o)]

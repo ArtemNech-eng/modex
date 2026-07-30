@@ -34,9 +34,37 @@ def test_opening_range_and_none_when_too_few_bars():
 
 
 def test_orb_long_short_none():
-    assert iv.orb_signal(11.5, 11, 8, atr=1.0)["signal"] == "long"
-    assert iv.orb_signal(7.5, 11, 8, atr=1.0)["signal"] == "short"
-    assert iv.orb_signal(9.0, 11, 8, atr=1.0)["signal"] == "none"
+    """Направление пробоя. min_rr=0 задан явно: геометрия здесь синтетическая
+    (стоп на другом краю диапазона даёт R/R 0.75), а проверяется именно выбор
+    стороны."""
+    assert iv.orb_signal(11.5, 11, 8, atr=1.0, min_rr=0)["signal"] == "long"
+    assert iv.orb_signal(7.5, 11, 8, atr=1.0, min_rr=0)["signal"] == "short"
+    assert iv.orb_signal(9.0, 11, 8, atr=1.0, min_rr=0)["signal"] == "none"
+
+
+def test_orb_rejects_bad_geometry():
+    """R/R считался и раньше, но никто на него не смотрел. Замер 30.07 в 14:04:
+    из 36 сетапов ORB у 35 R/R был ниже 1.0, медиана около 0.27 — стоп на границе
+    утреннего диапазона стоял в 1-5% от цены, а цель 1.5*ATR была в разы меньше.
+    Худшие: MGNT 0.12, SMLT 0.22 при риске 5.1%."""
+    r = iv.orb_signal(11.5, 11, 8, atr=1.0)          # порог по умолчанию 1.5
+    assert r["signal"] == "none"
+    assert "R/R" in r["reason"] and r["risk_reward"] == 0.43
+
+
+def test_orb_accepts_good_geometry():
+    """Узкий диапазон и достаточная цель — вход выдаётся."""
+    r = iv.orb_signal(10.1, 10.0, 9.9, atr=1.0)
+    assert r["signal"] == "long" and r["risk_reward"] >= 1.5
+
+
+def test_news_plan_keeps_no_floor_by_deliberate_choice():
+    """У новостного плана стоп стоит за ВСЕЙ свечой выноса (около 2.5*ATR), а цель
+    1.5*ATR, поэтому единый порог обнулил бы новостную ветку целиком — не потому,
+    что она плоха, а потому что у неё неверно задана цель. Это отдельная задача."""
+    p = iv.news_whipsaw_plan(event_high=12, event_low=8, price=12.3,
+                             vwap_last=11, atr=1.0)
+    assert p["signal"] == "long" and p["risk_reward"] < 1.5
 
 
 def test_volatility_state_detects_expansion():

@@ -52,12 +52,27 @@ def test_spike_now_is_observe():
 
 
 def test_orb_breakout_without_news():
+    """СВЕЖИЙ пробой: цена только что вышла за диапазон, поэтому стоп на дальнем
+    краю близко и R/R проходит порог 1.5. Так этот сетап и должен работать —
+    когда цена ушла далеко, риск до дальнего края становится больше цели."""
+    c = _base()
+    for i in range(20, N):
+        c["high"][i], c["low"][i], c["open"][i], c["close"][i] = 10.35, 10.05, 10.1, 10.12
+    ctx = ia.compute_intraday_context(c, 12 * 60, msg_zscore=0.0, opening_range_bars=6)
+    assert ctx["setup"] == "orb", ctx.get("orb_blocked") or ctx.get("note")
+    assert ctx["signal"] == "long"
+    assert ctx["plan"]["risk_reward"] >= 1.5
+
+
+def test_orb_rejected_when_price_ran_far():
+    """Цена далеко от диапазона: стоп на дальнем краю делает риск больше цели.
+    Именно так 30.07 в 14:04 появились десять шортов при растущем рынке."""
     c = _base()
     for i in range(20, N):
         c["high"][i], c["low"][i], c["open"][i], c["close"][i] = 10.6, 10.3, 10.35, 10.55
     ctx = ia.compute_intraday_context(c, 12 * 60, msg_zscore=0.0, opening_range_bars=6)
-    assert ctx["setup"] == "orb"
-    assert ctx["signal"] == "long"
+    assert ctx["setup"] != "orb"
+    assert ctx.get("orb_blocked") and "R/R" in ctx["orb_blocked"]
 
 
 def test_late_session_forces_observe():

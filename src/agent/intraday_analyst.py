@@ -214,10 +214,44 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
                     f"вынос ({_basis}) — ждём подтверждения разрешения")
 
     # 2) Пробой диапазона открытия
+    #
+    # СРОК ГОДНОСТИ. Это техника первого часа: диапазон 10:00-10:30 актуален, пока
+    # он свежий. Замер 30.07 в 14:04 — через три с половиной часа после
+    # формирования — дал ДЕСЯТЬ шортов при рынке, выросшем на 0.89% (32 бумаги
+    # вверх, 15 вниз). Среди них шорт по DIAS, прибавившему 2.54% и стоявшему ВЫШЕ
+    # VWAP: «пробой вниз» означал лишь то, что цена ниже утреннего диапазона.
+    #
+    # СОГЛАСИЕ С VWAP. Пробой вниз при цене выше VWAP — противоречие внутри одного
+    # среза: покупатель контролирует день, а сетап предлагает продавать.
+    orb_block = None
     if not observe and setup == "none" and orr:
-        ob = iv.orb_signal(price, orr["or_high"], orr["or_low"], atr)
-        if ob["signal"] in ("long", "short"):
-            setup, plan, note = "orb", ob, ob["reason"]
+        try:
+            from config.settings import ORB_VALID_MIN as _orb_valid
+        except Exception:
+            _orb_valid = 90
+        age_min = None
+        if orr.get("or_end_min") is not None:
+            age_min = minute_of_day - orr["or_end_min"]
+        if age_min is not None and age_min > _orb_valid:
+            orb_block = (f"диапазон открытия сформирован {age_min} мин назад "
+                         f"(предел {_orb_valid}) — пробой уже не сетап")
+        else:
+            ob = iv.orb_signal(price, orr["or_high"], orr["or_low"], atr)
+            if ob["signal"] in ("long", "short"):
+                # согласие с VWAP
+                if vwap_last:
+                    if ob["signal"] == "short" and price > vwap_last:
+                        orb_block = ("пробой вниз при цене выше VWAP — "
+                                     "покупатель контролирует день")
+                    elif ob["signal"] == "long" and price < vwap_last:
+                        orb_block = ("пробой вверх при цене ниже VWAP — "
+                                     "продавец контролирует день")
+                if orb_block is None:
+                    setup, plan, note = "orb", ob, ob["reason"]
+            elif ob.get("risk_reward") is not None:
+                orb_block = ob["reason"]        # отказ по R/R — тоже причина
+    if orb_block and setup == "none":
+        note = note or orb_block
 
     # 3) Подсказка по волатильности
     if setup == "none" and vol.get("state") == "expansion":
@@ -260,6 +294,9 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
         # Основание, по которому момент назван новостным. Голого флага мало:
         # решение надо уметь проверить постфактум, поэтому отдаём и запас по
         # времени между новостью и выносом, и сколько новостей нашлось.
+        # Почему сетап ORB не выдан, если диапазон есть: срок годности, R/R или
+        # несогласие с VWAP. Молчаливый отказ не отличить от «нечего торговать».
+        "orb_blocked": orb_block,
         "news_lag_min": news_near,
         "news_count": len(news_ts or []),
         "delayed": delayed,

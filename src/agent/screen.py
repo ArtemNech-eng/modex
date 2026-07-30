@@ -196,7 +196,13 @@ async def screen_ticker(ticker: str, aggregator) -> Optional[dict]:
         "setup": (intraday or {}).get("setup"),
         "orb_hi": _lv.get("or_high"),
         "orb_lo": _lv.get("or_low"),
+        # rr — из ДНЕВНОГО плана техники. srr — из интрадей-сетапа. Раньше было
+        # только rr, и рядом с сетапом ORB стояло «R/R 3.89» из дневной техники,
+        # тогда как настоящий R/R этого входа был 0.22. Одно число описывало не тот
+        # вход, о котором шла речь.
         "rr": _tp.get("risk_reward"),
+        "srr": ((intraday or {}).get("plan") or {}).get("risk_reward"),
+        "sblock": (intraday or {}).get("orb_blocked"),
         "entry_status": _tp.get("entry_status"),
         "si": (sentiment or {}).get("sentiment_index"),
         # производные «реальных денег» (спек Data Engine):
