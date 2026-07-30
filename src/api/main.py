@@ -116,6 +116,16 @@ async def startup():
         _fill_demo_data()
         logger.info("🧪 DEMO_MODE: агрегатор наполнен демо-данными")
 
+    # Быстрый наблюдатель сетапов — БЕЗ Claude, поэтому может стартовать всегда:
+    # ловить момент нужно быстро и дёшево, рассуждать можно медленно и дорого.
+    try:
+        from config.settings import SETUP_WATCH_ENABLED, SETUP_WATCH_INTERVAL_MIN
+        if SETUP_WATCH_ENABLED:
+            from src.agent import setup_watcher
+            setup_watcher.start(SETUP_WATCH_INTERVAL_MIN)
+    except Exception as e:                            # noqa: BLE001
+        logger.warning(f"наблюдатель сетапов не запущен: {e}")
+
     # Контур ОБУЧЕНИЯ (оценка прогнозов, БЕЗ Claude) — стартует ВСЕГДА и работает
     # независимо от сканера: самообучение (точность / R / regime-stats) не прерывается,
     # даже когда сканер выключен. БД уже готова.
@@ -1176,6 +1186,39 @@ async def post_signal_decision(pred_id: int, decision: str, note: Optional[str] 
     if updated is None:
         raise HTTPException(status_code=404, detail=f"прогноз {pred_id} не найден")
     return {"status": "ok", "prediction": updated}
+
+
+@app.get("/api/setup-watch", summary="Быстрый наблюдатель сетапов: состояние и срабатывания")
+async def setup_watch_status():
+    """Состояние наблюдателя и последние срабатывания.
+
+    Наблюдатель НЕ обращается к Claude, поэтому может ходить раз в 5 минут
+    бесплатно. Смысл в скорости: сетап пробоя по Мечелу 30.07 сработал в 13:25, а
+    сканер с подтверждением увидел бы его в 14:10 — опоздание стоило половины
+    прибыли.
+    """
+    from src.agent import setup_watcher
+    return setup_watcher.status()
+
+
+@app.post("/api/setup-watch/start", summary="Запустить наблюдателя сетапов")
+async def setup_watch_start(interval_min: Optional[int] = None):
+    from src.agent import setup_watcher
+    return setup_watcher.start(interval_min)
+
+
+@app.post("/api/setup-watch/stop", summary="Остановить наблюдателя сетапов")
+async def setup_watch_stop():
+    from src.agent import setup_watcher
+    return setup_watcher.stop()
+
+
+@app.post("/api/setup-watch/pass", summary="Один проход наблюдателя прямо сейчас")
+async def setup_watch_pass():
+    """Разовый проход без запуска цикла — для проверки и ручного опроса."""
+    from src.agent import setup_watcher
+    fires = await setup_watcher.one_pass()
+    return {"fired": len(fires), "fires": fires, "status": setup_watcher.status()}
 
 
 @app.post("/api/signals/{pred_id}/correct-position",

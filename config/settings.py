@@ -359,3 +359,17 @@ BREAKOUT_VOL_MULT = float(os.getenv("BREAKOUT_VOL_MULT", "1.5"))
 BREAKOUT_TARGET_R = float(os.getenv("BREAKOUT_TARGET_R", "2.0"))
 BREAKOUT_MAX_RISK_PCT = float(os.getenv("BREAKOUT_MAX_RISK_PCT", "3.0"))
 BREAKOUT_ENABLED = os.getenv("BREAKOUT_ENABLED", "true").lower() == "true"
+
+
+# ── Быстрый наблюдатель сетапов (без Claude) ──────────────────────────────────
+# Сканер с подтверждением Claude ходит раз в 45 минут. Сетап пробоя по Мечелу 30.07
+# сработал в 13:25, был бы увиден в 14:10 при цене уже 39.16, и опоздание стоило
+# половины прибыли: вход 13:25 дал бы 8 056₽ против фактических 4 088₽.
+#
+# Интервал 5 минут, а не чаще: сетапы считаются по ЗАКРЫТИЮ пятиминутного бара,
+# поэтому один проход на бар — и максимальная осмысленная скорость, и минимальная
+# нагрузка на лимиты Tinkoff.
+SETUP_WATCH_ENABLED = os.getenv("SETUP_WATCH_ENABLED", "false").lower() == "true"
+SETUP_WATCH_INTERVAL_MIN = int(os.getenv("SETUP_WATCH_INTERVAL_MIN", "5"))
+SETUP_WATCH_DEDUP_MIN = int(os.getenv("SETUP_WATCH_DEDUP_MIN", "30"))
+SETUP_WATCH_PACING_SEC = float(os.getenv("SETUP_WATCH_PACING_SEC", "0.2"))
