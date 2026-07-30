@@ -1485,6 +1485,42 @@ async def recent_events(ticker: Optional[str] = None, source: Optional[str] = No
         return [e.to_dict() for e in result.scalars().all()]
 
 
+# Политика «что считается новостью» живёт в config/settings.py — это решение о
+# смысле данных, а не деталь слоя БД.
+try:
+    from config.settings import NEWS_KINDS, NEWS_EXCLUDE_SOURCES
+except Exception:                                   # noqa: BLE001
+    NEWS_KINDS = ("news", "message")
+    NEWS_EXCLUDE_SOURCES = ("tinkoff", "pulse_deal")
+
+
+async def fresh_news(ticker: str, since_minutes: int = 90,
+                     limit: int = 20) -> list[dict]:
+    """Свежие ТЕКСТОВЫЕ новости по бумаге: RSS, чаты, Пульс.
+
+    Возвращает сами записи, а не флаг: детектору событий нужна метка времени для
+    проверки причинности, а человеку и Claude — заголовок, чтобы понять, на каком
+    основании момент назван новостным.
+
+    ts — время ПУБЛИКАЦИИ (pubDate из ленты), а не время сбора, поэтому по нему
+    можно сравнивать с барами свечей.
+    """
+    if not ticker:
+        return []
+    async with async_session() as session:
+        stmt = (select(MarketEvent)
+                .where(MarketEvent.ticker == ticker.upper())
+                .where(MarketEvent.kind.in_(NEWS_KINDS))
+                .where(MarketEvent.source.notin_(NEWS_EXCLUDE_SOURCES))
+                .order_by(MarketEvent.ts.desc())
+                .limit(min(limit, 100)))
+        if since_minutes:
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
+            stmt = stmt.where(MarketEvent.ts >= cutoff)
+        result = await session.execute(stmt)
+        return [e.to_dict() for e in result.scalars().all()]
+
+
 async def save_trader_deals(deals: list[dict]) -> dict:
     """
     Сохранить сделки трейдеров (скрейп агента) в market_events (source=pulse_deal,

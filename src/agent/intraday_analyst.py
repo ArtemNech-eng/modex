@@ -13,6 +13,7 @@ MOODEX — Интрадей-аналитик: связывает данные MO
 Не является инвестиционной рекомендацией.
 """
 import logging
+import os
 from datetime import datetime, timezone, timedelta, date
 from typing import Optional
 
@@ -62,9 +63,33 @@ def _minute_of_day_msk(iso_or_dt) -> int:
         return 12 * 60
 
 
+# Окно причинности новости относительно свечи выноса (минуты). Новость может
+# заметно опережать движение (рынок переваривает) и может слегка отставать: у RSS
+# есть задержка публикации, а лента иногда двигается раньше заголовка.
+try:
+    from config.settings import (NEWS_BEFORE_SPIKE_MIN as _NEWS_BEFORE_SPIKE_MIN,
+                                 NEWS_AFTER_SPIKE_MIN as _NEWS_AFTER_SPIKE_MIN)
+except Exception:                                   # noqa: BLE001
+    _NEWS_BEFORE_SPIKE_MIN, _NEWS_AFTER_SPIKE_MIN = 30.0, 10.0
+
+
+def _to_dt(ts):
+    """Отметка времени -> datetime в UTC. None, если не разобрать."""
+    if ts is None:
+        return None
+    if isinstance(ts, datetime):
+        return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 def compute_intraday_context(candles: dict, minute_of_day: int,
                              msg_zscore: Optional[float] = None,
                              has_fresh_news: bool = False,
+                             news_ts: Optional[list] = None,
                              delayed: bool = False,
                              source: Optional[str] = None,
                              opening_range_bars: int = 6,
@@ -107,7 +132,31 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
                 spike_idx = i
                 break
     spike_found = spike_idx is not None
-    event = iv.classify_event(spike_found, msg_zscore, has_fresh_news)
+
+    # ПРИЧИННОСТЬ НОВОСТИ. Раньше has_fresh_news не передавался ниоткуда и всегда
+    # был False, то есть настоящие новости до детектора не доходили вовсе. Но
+    # просто «была ли новость за последний час» — плохой признак: заголовок,
+    # вышедший через сорок минут ПОСЛЕ выноса, не объясняет вынос.
+    #
+    # Считаем новость объясняющей, если она опубликована в окне вокруг свечи
+    # выноса: заметно раньше (рынок переваривает) или чуть позже (лента успела
+    # опередить заголовок — у RSS есть задержка публикации).
+    news_near = None
+    if news_ts and spike_idx is not None:
+        spike_dt = _to_dt((candles.get("dates") or [None] * len(c))[spike_idx])
+        if spike_dt is not None:
+            best = None
+            for t in news_ts:
+                dt = _to_dt(t)
+                if dt is None:
+                    continue
+                lag = (spike_dt - dt).total_seconds() / 60.0   # >0 — новость раньше
+                if -_NEWS_AFTER_SPIKE_MIN <= lag <= _NEWS_BEFORE_SPIKE_MIN:
+                    if best is None or abs(lag) < abs(best):
+                        best = round(lag, 1)
+            news_near = best
+    has_news_effective = bool(has_fresh_news or news_near is not None)
+    event = iv.classify_event(spike_found, msg_zscore, has_news_effective)
 
     setup, plan, observe, note = "none", None, False, ""
 
@@ -140,15 +189,29 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
     # 1) Новостной вынос
     if not observe and event["event"] and spike_idx is not None:
         event_high, event_low = h[spike_idx], l[spike_idx]
+        # Чем именно момент признан новостным — в текст, а не только в поля.
+        # Новостная ветка имеет ПРИОРИТЕТ над пробоем диапазона, поэтому основание
+        # должно читаться сразу: иначе непонятно, почему сетап выбран этот.
+        if news_near is not None:
+            _basis = (f"новость за {news_near:.0f} мин до выноса"
+                      if news_near >= 0 else
+                      f"новость через {abs(news_near):.0f} мин после выноса")
+        elif has_fresh_news:
+            _basis = "новость передана извне"
+        else:
+            _basis = "аномальный объём сообщений"
         if spike_idx >= len(c) - 1:
             # вынос прямо сейчас — разрешения ещё нет, только наблюдаем
-            observe, setup, note = True, "news_observe", "новостной вынос только что — наблюдаем разрешение"
+            observe, setup, note = (True, "news_observe",
+                f"новостной вынос только что ({_basis}) — наблюдаем разрешение")
         else:
             wp = iv.news_whipsaw_plan(event_high, event_low, price, vwap_last, atr)
             if wp["signal"] in ("long", "short"):
-                setup, plan, note = "news_resolution", wp, "разрешение новостного выноса"
+                setup, plan, note = ("news_resolution", wp,
+                                     f"разрешение новостного выноса ({_basis})")
             else:
-                observe, setup, note = True, "news_observe", "вынос — ждём подтверждения разрешения"
+                observe, setup, note = (True, "news_observe",
+                    f"вынос ({_basis}) — ждём подтверждения разрешения")
 
     # 2) Пробой диапазона открытия
     if not observe and setup == "none" and orr:
@@ -194,6 +257,11 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
         "velocity": vel,
         "phase": phase,
         "event": event,
+        # Основание, по которому момент назван новостным. Голого флага мало:
+        # решение надо уметь проверить постфактум, поэтому отдаём и запас по
+        # времени между новостью и выносом, и сколько новостей нашлось.
+        "news_lag_min": news_near,
+        "news_count": len(news_ts or []),
         "delayed": delayed,
         # Какой источник дал свечи. Флаг задержки был, а ИМЕНИ источника
         # не было — значит нельзя было понять, почему данные запоздали и по
@@ -304,12 +372,32 @@ async def build_intraday_context(ticker: str, tf_min: int = 5,
         return None
     last_ts = data["dates"][-1] if data.get("dates") else datetime.now(timezone.utc)
     minute = _minute_of_day_msk(last_ts)
+    # СВЕЖИЕ НОВОСТИ по бумаге. Раньше has_fresh_news не передавался ниоткуда и
+    # всегда был False: вход в детектор существовал, но настоящие новости до него
+    # не доходили. Читаем из базы знаний, потому что коллектор и API — разные
+    # процессы. Окно берём с запасом: причинность проверяется внутри относительно
+    # свечи выноса, а не по факту «была новость за час».
+    news_items, news_ts = [], []
+    try:
+        from src import db as _db
+        window = int(_NEWS_BEFORE_SPIKE_MIN + 60)
+        news_items = await _db.fresh_news(ticker, since_minutes=window, limit=20)
+        news_ts = [n.get("ts") for n in news_items if n.get("ts")]
+    except Exception as e:                          # noqa: BLE001
+        logger.debug(f"fresh_news {ticker}: {e}")
+
     ctx = compute_intraday_context(
         data, minute, msg_zscore=msg_zscore, has_fresh_news=has_fresh_news,
+        news_ts=news_ts,
         delayed=bool(data.get("_delayed")), source=data.get("_source"),
         opening_range_bars=opening_range_bars)
     if not ctx:
         return ctx
+    # Заголовки — чтобы основание решения читалось человеком, а не только кодом.
+    if news_items:
+        ctx["news_titles"] = [str(n.get("text") or "")[:120] for n in news_items[:3]]
+        ctx["news_sources"] = sorted({str(n.get("channel") or n.get("source"))
+                                      for n in news_items})[:4]
 
     # ЗАСЛОН ПО СВЕЖЕСТИ. Источник может молча отдать старую серию: 30.07 по
     # пятнадцати тикерам приходили свечи за 29.07 с пометкой «задержка ~15 мин»,

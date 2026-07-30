@@ -187,6 +187,12 @@ async def screen_ticker(ticker: str, aggregator) -> Optional[dict]:
         # поэтому без этой пометки давление стакана уходит Клоду ДВАЖДЫ: как
         # «настроение» и отдельным блоком по стакану.
         "sbasis": (sentiment or {}).get("basis"),
+        # Новости по бумаге. Вход в детектор событий существовал, но никто не
+        # передавал has_fresh_news, поэтому новостная ветка не срабатывала ни
+        # разу. Отдаём и число новостей, и запас по времени до выноса: без него
+        # непонятно, объясняет новость движение или вышла уже после него.
+        "news": (intraday or {}).get("news_count"),
+        "nlag": (intraday or {}).get("news_lag_min"),
         "setup": (intraday or {}).get("setup"),
         "orb_hi": _lv.get("or_high"),
         "orb_lo": _lv.get("or_low"),
