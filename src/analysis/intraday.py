@@ -225,6 +225,95 @@ def orb_signal(price: float, or_high: float, or_low: float, atr: float,
     return {"signal": "none", "reason": "цена внутри диапазона открытия"}
 
 
+def consolidation_breakout(highs: list[float], lows: list[float], closes: list[float],
+                           volumes: list[float], atr: Optional[float],
+                           vwap: Optional[float], window: int = 6,
+                           max_width_atr: float = 1.2, vol_mult: float = 1.5,
+                           target_r: float = 2.0, max_risk_pct: float = 3.0,
+                           min_rr: Optional[float] = None) -> dict:
+    """Пробой внутридневной консолидации по тренду.
+
+    ЗАЧЕМ. Единственной техникой входа был пробой диапазона открытия, а он живёт
+    только первые 90 минут. 30.07 Мечел прошёл 7.1% от минимума дня, и в момент
+    правильного входа (13:25, пробой сжатия на объёме 4x) ни один сетап системы не
+    срабатывал: диапазон открытия просрочен, новостей нет, а дневная техника
+    рекомендовала ШОРТ у верхней границы коридора. Этот сетап закрывает дырку и
+    работает весь день, потому что консолидация по определению свежая.
+
+    УСТРОЙСТВО. Стоп — под минимум консолидации, поэтому чем уже сжатие, тем
+    меньше риск. Цель задана В РИСКЕ (entry + target_r * risk), а не в ATR: тогда
+    R/R равен target_r по построению, и остаётся один содержательный вопрос —
+    достигается ли эта цель на практике. С целью в ATR планируемый R/R
+    структурно занижался: у победившего входа по Мечелу он выходил 1.05 при
+    фактическом ходе 4.03R.
+
+    ПРОВЕРКА. 12 ликвидных бумаг, 10-мин свечи, 18 торговых дней июля 2026,
+    издержки 0.05% на круг. Ожидание положительно во ВСЕХ проверенных
+    конфигурациях, но устойчиво только при узком сжатии:
+
+        ширина <=2.0 ATR: 365 входов, +0.065R; по половинам -0.098R и +0.176R —
+                          знак меняется, ненадёжно;
+        ширина <=1.5 ATR: 149 входов, +0.077R; первая половина после издержек
+                          уходит в минус;
+        ширина <=1.2 ATR:  55 входов, +0.264R; по половинам +0.381R и +0.220R,
+                          после издержек +0.291R и +0.149R.
+
+    Поэтому по умолчанию 1.2. ЧЕГО ПРОВЕРКА НЕ ДОКАЗЫВАЕТ: выборка 55 входов, один
+    режим рынка (июль 2026, рынок рос), 12 бумаг из 48, тест на 10-мин свечах, а
+    вживую сетап смотрит 5-мин. Это измеряемая гипотеза, а не установленное
+    преимущество — исходы надо накапливать.
+    """
+    n = min(len(highs), len(lows), len(closes), len(volumes))
+    if n < window + 2 or not atr or atr <= 0:
+        return {"signal": "none", "reason": "мало данных или нет ATR"}
+    price = closes[n - 1]
+    seg = slice(n - 1 - window, n - 1)          # бары ДО пробойного
+    c_high, c_low = max(highs[seg]), min(lows[seg])
+    width_atr = (c_high - c_low) / atr
+    if width_atr > max_width_atr:
+        return {"signal": "none",
+                "reason": (f"диапазон {width_atr:.2f}xATR шире предела "
+                           f"{max_width_atr} — это не сжатие, а коридор"),
+                "width_atr": round(width_atr, 2)}
+    if price <= c_high:
+        return {"signal": "none", "reason": "цена не вышла за верх консолидации",
+                "width_atr": round(width_atr, 2)}
+
+    vols = [v for v in volumes[seg] if v]
+    avg_v = sum(vols) / len(vols) if vols else 0
+    last_v = volumes[n - 1] or 0
+    if not avg_v or last_v < vol_mult * avg_v:
+        return {"signal": "none",
+                "reason": (f"объём пробоя {last_v / avg_v:.2f}x при требуемых "
+                           f"{vol_mult}x — выход без участия" if avg_v
+                           else "нет данных по объёму"),
+                "width_atr": round(width_atr, 2)}
+
+    # Согласие с VWAP: пробой вверх при цене ниже средней дня — это отскок внутри
+    # снижения, а не продолжение. Тот же принцип, что и для диапазона открытия.
+    if vwap and price < vwap:
+        return {"signal": "none",
+                "reason": "пробой вверх при цене ниже VWAP — продавец контролирует день"}
+
+    entry, stop = price, c_low
+    risk = entry - stop
+    if risk <= 0:
+        return {"signal": "none", "reason": "стоп не ниже входа"}
+    if risk / entry * 100 > max_risk_pct:
+        return {"signal": "none",
+                "reason": f"риск {risk / entry * 100:.2f}% выше предела {max_risk_pct}%"}
+    target = round(entry + target_r * risk, 6)
+    plan = _plan("long", entry, stop, target, risk,
+                 (f"пробой сжатия {c_low}-{c_high} ({width_atr:.2f}xATR) "
+                  f"на объёме {last_v / avg_v:.1f}x"), min_rr=min_rr)
+    if plan.get("signal") == "long":
+        plan["width_atr"] = round(width_atr, 2)
+        plan["vol_x"] = round(last_v / avg_v, 2)
+        plan["consolidation"] = {"low": round(c_low, 6), "high": round(c_high, 6),
+                                 "bars": window}
+    return plan
+
+
 # ─── Сжатие → расширение волатильности (squeeze breakout) ─────────────────────
 
 def volatility_state(highs: list[float], lows: list[float], closes: list[float],

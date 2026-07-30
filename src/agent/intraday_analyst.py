@@ -224,6 +224,7 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
     # СОГЛАСИЕ С VWAP. Пробой вниз при цене выше VWAP — противоречие внутри одного
     # среза: покупатель контролирует день, а сетап предлагает продавать.
     orb_block = None
+    breakout_blocked = None
     if not observe and setup == "none" and orr:
         try:
             from config.settings import ORB_VALID_MIN as _orb_valid
@@ -252,6 +253,34 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
                 orb_block = ob["reason"]        # отказ по R/R — тоже причина
     if orb_block and setup == "none":
         note = note or orb_block
+
+    # 2.5) Пробой внутридневной консолидации — работает ВЕСЬ день.
+    #
+    # Нужен потому, что пробой диапазона открытия живёт первые 90 минут, и после
+    # полудня у системы не оставалось ни одной техники входа. 30.07 Мечел прошёл
+    # 7.1% от минимума дня, а в момент правильного входа дневная техника
+    # рекомендовала ШОРТ у верхней границы коридора.
+    if not observe and setup == "none":
+        try:
+            from config.settings import (BREAKOUT_ENABLED, BREAKOUT_WINDOW_BARS,
+                                         BREAKOUT_MAX_WIDTH_ATR, BREAKOUT_VOL_MULT,
+                                         BREAKOUT_TARGET_R, BREAKOUT_MAX_RISK_PCT)
+        except Exception:                            # noqa: BLE001
+            BREAKOUT_ENABLED, BREAKOUT_WINDOW_BARS = True, 6
+            BREAKOUT_MAX_WIDTH_ATR, BREAKOUT_VOL_MULT = 1.2, 1.5
+            BREAKOUT_TARGET_R, BREAKOUT_MAX_RISK_PCT = 2.0, 3.0
+        if BREAKOUT_ENABLED:
+            cb = iv.consolidation_breakout(
+                h, l, c, v, atr, vwap_last,
+                window=BREAKOUT_WINDOW_BARS, max_width_atr=BREAKOUT_MAX_WIDTH_ATR,
+                vol_mult=BREAKOUT_VOL_MULT, target_r=BREAKOUT_TARGET_R,
+                max_risk_pct=BREAKOUT_MAX_RISK_PCT)
+            if cb.get("signal") == "long":
+                setup, plan, note = "consolidation_breakout", cb, cb["reason"]
+            else:
+                # причина отказа — данные, а не тишина: иначе не отличить
+                # «сжатия не было» от «сжатие есть, но объём не подтвердил»
+                breakout_blocked = cb.get("reason")
 
     # 3) Подсказка по волатильности
     if setup == "none" and vol.get("state") == "expansion":
@@ -297,6 +326,7 @@ def compute_intraday_context(candles: dict, minute_of_day: int,
         # Почему сетап ORB не выдан, если диапазон есть: срок годности, R/R или
         # несогласие с VWAP. Молчаливый отказ не отличить от «нечего торговать».
         "orb_blocked": orb_block,
+        "breakout_blocked": breakout_blocked,
         "news_lag_min": news_near,
         "news_count": len(news_ts or []),
         "delayed": delayed,

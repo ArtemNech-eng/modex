@@ -343,3 +343,19 @@ SETUP_MIN_RR = float(os.getenv("SETUP_MIN_RR", "1.5"))
 # появились десять шортов при рынке, выросшем на 0.89% (32 бумаги вверх, 15 вниз),
 # включая шорт по DIAS, прибавившему 2.54% и стоявшему ВЫШЕ VWAP.
 ORB_VALID_MIN = int(os.getenv("ORB_VALID_MIN", "90"))
+
+
+# ── Пробой внутридневной консолидации ─────────────────────────────────────────
+# Закрывает дырку: пробой диапазона открытия живёт только первые 90 минут, и в
+# середине дня у системы не было ни одной техники входа. 30.07 Мечел прошёл 7.1%,
+# а в момент правильного входа дневная техника рекомендовала ШОРТ.
+#
+# Порог ширины 1.2 выбран по проверке на 12 бумагах и 18 торговых днях июля 2026:
+# только он держит положительное ожидание в ОБЕИХ половинах выборки и после
+# издержек (+0.291R и +0.149R). При 2.0 знак между половинами меняется.
+BREAKOUT_WINDOW_BARS = int(os.getenv("BREAKOUT_WINDOW_BARS", "6"))
+BREAKOUT_MAX_WIDTH_ATR = float(os.getenv("BREAKOUT_MAX_WIDTH_ATR", "1.2"))
+BREAKOUT_VOL_MULT = float(os.getenv("BREAKOUT_VOL_MULT", "1.5"))
+BREAKOUT_TARGET_R = float(os.getenv("BREAKOUT_TARGET_R", "2.0"))
+BREAKOUT_MAX_RISK_PCT = float(os.getenv("BREAKOUT_MAX_RISK_PCT", "3.0"))
+BREAKOUT_ENABLED = os.getenv("BREAKOUT_ENABLED", "true").lower() == "true"

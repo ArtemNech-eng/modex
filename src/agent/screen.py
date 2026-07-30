@@ -203,6 +203,9 @@ async def screen_ticker(ticker: str, aggregator) -> Optional[dict]:
         "rr": _tp.get("risk_reward"),
         "srr": ((intraday or {}).get("plan") or {}).get("risk_reward"),
         "sblock": (intraday or {}).get("orb_blocked"),
+        # причина отказа сетапа пробоя консолидации — чтобы «нечего торговать»
+        # отличалось от «сжатие есть, но объём не подтвердил»
+        "bblock": (intraday or {}).get("breakout_blocked"),
         "entry_status": _tp.get("entry_status"),
         "si": (sentiment or {}).get("sentiment_index"),
         # производные «реальных денег» (спек Data Engine):
