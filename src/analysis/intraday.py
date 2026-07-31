@@ -232,6 +232,7 @@ def consolidation_breakout(highs: list[float], lows: list[float], closes: list[f
                            max_width_atr_short: Optional[float] = None,
                            target_r: float = 2.0, max_risk_pct: float = 3.0,
                            min_rr: Optional[float] = None,
+                           min_width_day_share: float = 0.15,
                            allow: tuple = ("long", "short")) -> dict:
     """Пробой внутридневной консолидации по тренду.
 
@@ -305,6 +306,31 @@ def consolidation_breakout(highs: list[float], lows: list[float], closes: list[f
                 "reason": (f"диапазон {width_atr:.2f}xATR шире предела "
                            f"{lim} — это не сжатие, а коридор"),
                 "width_atr": round(width_atr, 2)}
+
+    # ВТОРАЯ мера ширины: доля ДНЕВНОГО диапазона.
+    #
+    # Одного сравнения с ATR пятиминутки мало. 31.07 сканер выдал сигнал по SBER:
+    # сжатие 274.08-274.70, то есть 0.62 руб при недельном ходе бумаги
+    # 267.54-277.65 (10.11 руб). Формально 1.53xATR — проходит. По сути это три
+    # спокойные минуты внутри широкого боковика, и пробить такое можно двадцать
+    # раз за день в обе стороны. Сигнал был выдан владельцу и оказался мусорным:
+    # цена вернулась под уровень через пять минут.
+    #
+    # ПРОВЕРКА порога (шорт-пробой, 12 бумаг, 181 день, издержки 0.05%):
+    #     оставляем (>=15%): 2344 входа, -0.074R
+    #     отсекаем  (<15%):  3078 входов, -0.203R
+    #     разница 0.129R, t=4.17, положительна в 6 месяцах из 7.
+    # Фильтр НЕ делает основную сессию прибыльной — он надёжно отделяет заведомо
+    # плохие входы от просто плохих. По утреннему шорту выборки на 10-мин свечах
+    # не хватило (33 входа), там эффект не измерен.
+    day_range = max(highs[:n]) - min(lows[:n])
+    width_share = (c_high - c_low) / day_range if day_range > 0 else 0.0
+    if width_share < min_width_day_share:
+        return {"signal": "none",
+                "reason": (f"сжатие {width_share:.0%} дневного диапазона — это "
+                           f"пауза между сделками, а не сжатие"),
+                "width_atr": round(width_atr, 2),
+                "width_day_share": round(width_share, 3)}
     up = price > c_high
     down = price < c_low
     if not (up or down):
