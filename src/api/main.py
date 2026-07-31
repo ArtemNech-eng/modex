@@ -767,6 +767,39 @@ async def get_screen(limit: int = 25):
     return {"screened": len(ranked), "results": ranked[:limit]}
 
 
+@app.get("/api/universe", summary="Кого вообще смотреть: список по обороту")
+async def get_universe(min_turnover_mln: float = 100, max_n: int = 80):
+    """
+    Список бумаг, построенный по ФАКТУ оборота на бирже, и расхождение с
+    рукописным списком в настройках.
+
+    Зачем. 31.07 владелец прислал скриншот «Взлёты дня»: десять из пятнадцати
+    лидеров роста отсутствовали в системе. MVID рос на 8.29% при обороте
+    390 млн, SGZH падал на 4.21% при обороте 637 млн — обеих в списке не было,
+    а я в это время докладывал, что лидер дня SMLT с +4.92%.
+
+    Рукописный список стареет молча. Этот маршрут делает расхождение видимым:
+    поле `missing` — что биржа торгует, а система не смотрит.
+    """
+    from config.settings import MOEX_TICKERS
+    from src.analysis.universe import cached_universe, diff_against
+
+    static = list(MOEX_TICKERS.keys())
+    u = cached_universe(min_turnover=min_turnover_mln * 1e6, max_n=max_n,
+                        fallback=static)
+    try:
+        d = diff_against(static)
+    except Exception as e:                                   # noqa: BLE001
+        d = {"error": str(e)[:80]}
+    return {
+        "source": u.get("source"),
+        "count": len(u.get("tickers") or []),
+        "tickers": u.get("tickers"),
+        "rows": (u.get("rows") or [])[:max_n],
+        "vs_static": d,
+    }
+
+
 @app.get("/api/geopolitics", summary="Геополитический фон рынка")
 async def get_geopolitics():
     """Текущий геополитический фон (влияет на весь рынок РФ)."""
