@@ -16,9 +16,44 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Зависимости Python
+# ─── torch: ОТДЕЛЬНЫМ шагом и с --index-url, а не --extra-index-url ───────────
+#
+# В requirements.txt стояло:
+#     --extra-index-url https://download.pytorch.org/whl/cpu
+#     torch==2.4.1
+# и это не гарантирует CPU-сборку. --extra-index-url не задаёт приоритет: pip
+# сливает оба индекса и выбирает по версии, а не по источнику. Пин 2.4.1 без
+# суффикса подходит и к 2.4.1 с PyPI, и к 2.4.1+cpu с индекса PyTorch.
+#
+# Разница в весе решающая:
+#     torch 2.4.1+cpu (индекс PyTorch)     195 МБ
+#     torch 2.4.1     (PyPI)               797 МБ + 12 пакетов nvidia-*
+#     только семь из этих nvidia-пакетов  2 824 МБ
+# Итого лишних примерно 3.4 ГБ загрузки на сборку. На небольшом сервере это
+# заканчивается «no space left on device» — причём плавающе, в зависимости от
+# того, сколько места оставил предыдущий образ и кэш сборки.
+#
+# --index-url (без extra) означает: брать ТОЛЬКО отсюда, PyPI как источник torch
+# не рассматривать. Шаг стоит ДО requirements.txt, чтобы кэшировался отдельно и
+# не пересобирался при каждой правке зависимостей.
+RUN pip install --no-cache-dir \
+    --index-url https://download.pytorch.org/whl/cpu \
+    torch==2.4.1
+
+# Зависимости Python. torch здесь уже установлен как 2.4.1+cpu и требованию
+# torch==2.4.1 удовлетворяет (PEP 440: локальная версия совпадает по базовой),
+# поэтому повторно не скачивается.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Заслон: если CUDA-сборка всё-таки просочилась, сборка обязана упасть ЗДЕСЬ с
+# понятной причиной, а не через десять минут по нехватке диска.
+RUN if pip list 2>/dev/null | grep -qiE '^(nvidia-|triton[[:space:]])'; then \
+        echo "СБОРКА ОСТАНОВЛЕНА: в образ попала CUDA-сборка torch (+3.4 ГБ)."; \
+        echo "Проверь --index-url для torch выше по Dockerfile."; \
+        pip list | grep -iE '^(nvidia-|triton[[:space:]])'; \
+        exit 1; \
+    fi
 
 # Код приложения
 COPY . .

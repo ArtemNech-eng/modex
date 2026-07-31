@@ -142,3 +142,65 @@ def test_secrets_not_copied_into_image(secret):
     di = ROOT / ".dockerignore"
     assert di.exists(), "нет .dockerignore — COPY . . тащит в образ всё, включая секреты"
     assert secret in di.read_text()
+
+
+# ─── torch: только CPU-сборка ─────────────────────────────────────────────────
+#
+# 31.07 сборки перестали проходить. Причина — не код, а разрешение зависимостей.
+# В requirements.txt стояло --extra-index-url на CPU-индекс PyTorch, и это НЕ
+# гарантирует CPU-колесо: extra-index не задаёт приоритет источника, pip сливает
+# оба индекса и выбирает по версии. Пин torch==2.4.1 без суффикса одинаково
+# подходит к 2.4.1 с PyPI и к 2.4.1+cpu с индекса PyTorch.
+#
+# Замерено:
+#     torch 2.4.1+cpu                      195 МБ
+#     torch 2.4.1 с PyPI                   797 МБ + 12 пакетов nvidia-*
+#     только семь из этих nvidia-пакетов 2 824 МБ
+# Лишних около 3.4 ГБ на сборку — на небольшом сервере это «no space left on
+# device», причём плавающе: зависит от того, сколько оставили прошлый образ и
+# кэш сборки. Отсюда и «раньше собиралось».
+
+
+def test_torch_installed_from_cpu_index_only():
+    """
+    torch ставится с --index-url (только этот источник), а не с
+    --extra-index-url (оба источника, приоритета нет).
+    """
+    df = DOCKERFILE.read_text()
+    assert "--index-url https://download.pytorch.org/whl/cpu" in df, (
+        "torch должен ставиться с --index-url на индекс PyTorch"
+    )
+    torch_step = [ln for ln in df.splitlines() if "torch==" in ln]
+    assert torch_step, "в Dockerfile нет отдельного шага установки torch"
+
+
+def test_dockerfile_installs_torch_before_requirements():
+    """
+    Шаг с torch должен идти ДО pip install -r requirements.txt: иначе
+    requirements успеет притащить CUDA-колесо, и заслон сработает поздно.
+    """
+    lines = DOCKERFILE.read_text().splitlines()
+    i_torch = next(i for i, ln in enumerate(lines) if "torch==" in ln)
+    i_req = next(i for i, ln in enumerate(lines) if "requirements.txt" in ln and "pip install" in ln)
+    assert i_torch < i_req, "torch ставится после requirements.txt — порядок неверный"
+
+
+def test_build_fails_loudly_on_cuda_packages():
+    """
+    Если CUDA-сборка всё же просочилась, сборка обязана упасть с внятной
+    причиной, а не через десять минут по нехватке диска.
+    """
+    df = DOCKERFILE.read_text()
+    assert "nvidia-" in df and "exit 1" in df, "нет заслона на пакеты nvidia-*"
+
+
+def test_requirements_warns_about_the_trap():
+    """
+    Ловушку надо описать там, где её увидят: в requirements.txt рядом со
+    строкой --extra-index-url. Иначе следующий человек уберёт шаг из Dockerfile
+    как дублирующий.
+    """
+    req = (ROOT / "requirements.txt").read_text()
+    assert "--index-url" in req and "Dockerfile" in req, (
+        "в requirements.txt нет предупреждения про extra-index-url и Dockerfile"
+    )
