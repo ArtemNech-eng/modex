@@ -152,9 +152,17 @@ def cached_universe(min_turnover: float = MIN_TURNOVER_RUB,
     """
     То же, но с дневным кэшем на диске. Биржу дёргаем раз в сутки: состав по
     обороту за день не меняется настолько, чтобы опрашивать чаще.
+
+    КЛЮЧ КЭША ВКЛЮЧАЕТ ПАРАМЕТРЫ. Сначала имя файла было просто датой, и это
+    давало разные ответы на один и тот же вопрос: сборщик просил порог 10 млн,
+    маршрут /api/universe — 100 млн, а получал тот список, который успел
+    записаться первым. Я полдня считал, что endpoint отдаёт 25 бумаг вместо 110
+    из-за незашедшего деплоя, хотя причина была здесь: кто первый обратился,
+    того порог и закреплялся на весь день.
     """
     os.makedirs(CACHE_DIR, exist_ok=True)
-    p = os.path.join(CACHE_DIR, f"{date.today().isoformat()}.json")
+    key = f"{date.today().isoformat()}-{int(min_turnover)}-{int(max_n)}"
+    p = os.path.join(CACHE_DIR, f"{key}.json")
     if os.path.exists(p):
         try:
             d = json.load(open(p))
@@ -170,6 +178,96 @@ def cached_universe(min_turnover: float = MIN_TURNOVER_RUB,
         except Exception:                                     # noqa: BLE001
             pass
     return d
+
+
+# ─── Кого опрашивать КАЖДЫЙ цикл, а кого по кругу ─────────────────────────────
+#
+# Ядро — бумаги, по которым стакан снимается каждый цикл (90 сек). Хвост
+# опрашивается срезами по кругу, чтобы не упираться в лимиты Tinkoff.
+#
+# До 31.07 ядро было зашито перечнем из двадцати шести голубых фишек. В этот
+# день лидером роста стал MVID: +8.29% при обороте 390 млн ₽ — восьмой оборот
+# на бирже. В ядро он не попал, в хвост тоже: его не было в списке ВООБЩЕ.
+# К вечеру владелец спросил, какую позицию открыть по главной аномалии дня, а
+# у меня по ней не было ни одного снимка стакана — только свечи.
+#
+# Поэтому ядро определяется ОБОРОТОМ ЗА СЕГОДНЯ. Бумага, которую сегодня
+# торгуют, сегодня же попадает под стакан, без правки конфигурации.
+SNAPSHOT_CORE_N = int(os.getenv("SNAPSHOT_CORE_N", "26"))
+
+# Одного оборота НЕ ХВАТИЛО. Проверка на живых данных 31.07 в 18:10: из десяти
+# лидеров движения четыре не попадали в топ-26 по обороту —
+#
+#     ETLN  +5.69%  оборот  106 млн   ← вне ядра по обороту
+#     MVID  +4.31%  оборот  469 млн   ← вне ядра по обороту
+#     DATA  +3.33%  оборот   87 млн   ← вне ядра по обороту
+#     CNRU  +3.31%  оборот  137 млн   ← вне ядра по обороту
+#
+# MVID при отборе только по обороту оказывался тридцатым и попадал в хвост:
+# один снимок стакана раз в двенадцать минут. А это и была аномалия дня —
+# объём в 15.7 раза выше обычного. Под стакан должно идти не только то, что
+# много торгуется, но и то, что СЕГОДНЯ ДВИГАЕТСЯ.
+SNAPSHOT_MOVERS_N = int(os.getenv("SNAPSHOT_MOVERS_N", "8"))
+
+
+def split_core_tail(rows: list, core_n: int = None, pinned=None,
+                    fallback_tickers: list = None,
+                    movers_n: int = None) -> tuple:
+    """
+    Разделить список на ядро (каждый цикл) и хвост (по кругу).
+
+    Ядро складывается из трёх частей:
+      • верх по ОБОРОТУ — то, что торгуется всегда;
+      • верх по ДВИЖЕНИЮ за день — то, где сегодня что-то происходит;
+      • закреплённое владельцем через SNAPSHOT_CORE — остаётся в ядре даже при
+        тихом обороте, потому что это его выбор.
+
+    rows — строки build_universe (оборот + изменение за день). Когда биржа
+    недоступна и rows пусты, работаем по fallback_tickers, чтобы сбор не
+    остановился совсем.
+    """
+    n = SNAPSHOT_CORE_N if core_n is None else core_n
+    m = SNAPSHOT_MOVERS_N if movers_n is None else movers_n
+    pin = [t.strip().upper() for t in (pinned or []) if t and t.strip()]
+    movers = []
+    if rows:
+        ranked = [x["ticker"] for x in
+                  sorted(rows, key=lambda x: -(x.get("turnover") or 0))]
+        if m > 0:
+            movers = [x["ticker"] for x in sorted(
+                (x for x in rows if x.get("change_pct") is not None),
+                key=lambda x: -abs(x["change_pct"]))][:m]
+    else:
+        ranked = list(fallback_tickers or [])
+    core_set = set(ranked[:n]) | set(movers) | set(pin)
+    core = [t for t in ranked if t in core_set]
+    # Закреплённые, которых сегодня нет в живом списке, всё равно в ядре.
+    core += [t for t in pin if t not in set(ranked)]
+    tail = [t for t in ranked if t not in core_set]
+    return core, tail
+
+
+def is_known(ticker: str, dictionary=None) -> bool:
+    """
+    Существует ли бумага: справочник ПОДПИСЕЙ ИЛИ живой список по обороту.
+
+    Эндпоинты проверяли тикер только по MOEX_TICKERS — словарю из 48 подписей
+    компаний — и отвечали 404 «Тикер не найден». 31.07 так отвечали по MVID,
+    лидеру роста дня (+8.29%, оборот 390 млн ₽, восьмой оборот биржи). То есть
+    даже собери сборщик данные, прочитать их было бы нельзя.
+
+    Справочник — это подписи, а не перечень существующего на бирже. Проверка
+    ослаблена ровно до этого: мусорный тикер по-прежнему отвергается.
+    """
+    t = (ticker or "").strip().upper()
+    if not t:
+        return False
+    if dictionary and t in dictionary:
+        return True
+    try:
+        return t in set(cached_universe(fallback=[]).get("tickers") or [])
+    except Exception:                                            # noqa: BLE001
+        return False
 
 
 def diff_against(static_list) -> dict:

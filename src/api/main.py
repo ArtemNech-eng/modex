@@ -245,11 +245,26 @@ async def get_orderbook_index_all():
     }
 
 
+def ticker_known(ticker: str) -> bool:
+    """
+    Тикер известен, если он в справочнике подписей ИЛИ в живом списке по
+    обороту. Логика и обстоятельства — в src/analysis/universe.is_known:
+    31.07 эндпоинты отвечали 404 по MVID, лидеру роста дня.
+    """
+    from src.analysis.universe import is_known
+    return is_known(ticker, MOEX_TICKERS)
+
+
+def company_name(ticker: str) -> str:
+    """Подпись компании; для бумаг вне справочника — сам тикер."""
+    return MOEX_TICKERS.get((ticker or "").upper(), ticker)
+
+
 @app.get("/api/orderbook-index/{ticker}", summary="Индекс стакана по тикеру")
 async def get_orderbook_index_ticker(ticker: str):
     """Индекс настроения по стакану для конкретного тикера (реальные деньги, без чатов)."""
     ticker = ticker.upper()
-    if ticker not in MOEX_TICKERS:
+    if not ticker_known(ticker):
         raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
     idx = aggregator.get_orderbook_index(ticker)
     if not idx:
@@ -268,7 +283,7 @@ async def get_orderbook_index_ticker(ticker: str):
 async def get_ticker_index(ticker: str):
     """Получить индекс настроения для тикера (например, SBER, GAZP)"""
     ticker = ticker.upper()
-    if ticker not in MOEX_TICKERS:
+    if not ticker_known(ticker):
         raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
     
     index = aggregator.get_ticker_index(ticker)
@@ -713,7 +728,7 @@ async def search_channel(query: str):
 async def get_technical(ticker: str):
     """Технический анализ тикера по данным Московской биржи (свечи, RSI, MACD, тренд)."""
     ticker = ticker.upper()
-    if ticker not in MOEX_TICKERS:
+    if not ticker_known(ticker):
         raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
     result = await ta.analyze_ticker(ticker)
     if not result:
@@ -768,7 +783,7 @@ async def get_screen(limit: int = 25):
 
 
 @app.get("/api/universe", summary="Кого вообще смотреть: список по обороту")
-async def get_universe(min_turnover_mln: float = 100, max_n: int = 80):
+async def get_universe(min_turnover_mln: float = None, max_n: int = 80):
     """
     Список бумаг, построенный по ФАКТУ оборота на бирже, и расхождение с
     рукописным списком в настройках.
@@ -780,19 +795,28 @@ async def get_universe(min_turnover_mln: float = 100, max_n: int = 80):
 
     Рукописный список стареет молча. Этот маршрут делает расхождение видимым:
     поле `missing` — что биржа торгует, а система не смотрит.
+
+    Порог по умолчанию — ПРОИЗВОДНЫЙ от размера позиции (10 млн ₽ при позиции
+    200 тыс.), а не круглые 100 млн, которые стояли здесь раньше. Из-за них
+    маршрут отдавал 25 бумаг, и я полдня искал причину в деплое.
     """
     from config.settings import MOEX_TICKERS
-    from src.analysis.universe import cached_universe, diff_against
+    from src.analysis.universe import (MIN_TURNOVER_RUB, cached_universe,
+                                       diff_against)
 
     static = list(MOEX_TICKERS.keys())
-    u = cached_universe(min_turnover=min_turnover_mln * 1e6, max_n=max_n,
-                        fallback=static)
+    floor = (MIN_TURNOVER_RUB if min_turnover_mln is None
+             else min_turnover_mln * 1e6)
+    # Обращение к бирже синхронное — уводим в поток, чтобы не блокировать
+    # цикл событий на время запроса (таймаут до 30 секунд).
+    u = await asyncio.to_thread(cached_universe, floor, max_n, static)
     try:
-        d = diff_against(static)
+        d = await asyncio.to_thread(diff_against, static)
     except Exception as e:                                   # noqa: BLE001
         d = {"error": str(e)[:80]}
     return {
         "source": u.get("source"),
+        "turnover_floor_mln": round(floor / 1e6, 1),
         "count": len(u.get("tickers") or []),
         "tickers": u.get("tickers"),
         "rows": (u.get("rows") or [])[:max_n],
@@ -815,7 +839,7 @@ async def get_agent_analysis(ticker: str, save: bool = True):
     с обоснованием. Прогноз сохраняется в память (БД) для последующего обучения.
     """
     ticker = ticker.upper()
-    if ticker not in MOEX_TICKERS:
+    if not ticker_known(ticker):
         raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
     # stage="manual": ручной вызов не должен искажать воронку сканера в журнале.
     return await analyst.analyze(ticker, aggregator, save=save, stage="manual")
@@ -1088,7 +1112,7 @@ async def get_chart_analysis(ticker: str):
     """
     from src.agent.chart_generator import generate_chart_b64
     ticker = ticker.upper()
-    if ticker not in MOEX_TICKERS:
+    if not ticker_known(ticker):
         raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
 
     try:
@@ -1147,7 +1171,7 @@ async def start_claude_backtest(
     from src.agent.historical_backtest import run_real_claude_backtest
 
     ticker = ticker.upper()
-    if ticker not in MOEX_TICKERS:
+    if not ticker_known(ticker):
         raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
     if _bt_claude_status["running"]:
         return {"status": "already_running", **_bt_claude_status}
@@ -2003,7 +2027,7 @@ async def _ai_panel(key: str, ttl: int, producer, note: str):
 async def ai_analyze_ticker(ticker: str):
     """Claude анализирует все сигналы по тикеру и даёт инсайт"""
     ticker = ticker.upper()
-    if ticker not in MOEX_TICKERS:
+    if not ticker_known(ticker):
         raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
 
     idx = aggregator.get_ticker_index(ticker)

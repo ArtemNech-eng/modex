@@ -328,17 +328,40 @@ async def market_snapshot_pipeline():
     from config.settings import (TINKOFF_TOKEN, MOEX_TICKERS, SNAPSHOT_MAX,
                                   SNAPSHOT_PACING_SEC, SNAPSHOT_CORE, SNAPSHOT_TAIL_PER_CYCLE)
     from src.analysis.intraday import session_phase
+    from src.analysis.universe import cached_universe, split_core_tail
     await db.setup_db()
-    all_tickers = list(MOEX_TICKERS.keys())
-    watch = all_tickers if SNAPSHOT_MAX <= 0 else all_tickers[:SNAPSHOT_MAX]
-    # core+rotating: ядро (ликвидные) — каждый цикл; хвост — по кругу срезами.
-    # Это ограничивает нагрузку на Tinkoff за цикл → нет троттлинга и «залипания».
-    core_set = set(SNAPSHOT_CORE)
-    core = [t for t in watch if t in core_set]
-    tail = [t for t in watch if t not in core_set]
+
+    # Состав берётся ИЗ ОБОРОТА НА БИРЖЕ, а не из константы в конфиге.
+    #
+    # 31.07 лидером роста стал MVID (+8.29%, оборот 390 млн ₽), а лидером
+    # падения SGZH (−4.28%, 635 млн ₽). Ни того, ни другого в зашитом списке
+    # из 48 тикеров не было, поэтому по обеим бумагам не собралось ни одного
+    # снимка стакана. Рукописный список стареет МОЛЧА: бумага набирает
+    # обороты, а система её не видит и об этом не сообщает.
+    static_tickers = list(MOEX_TICKERS.keys())
+
+    def _plan():
+        u = cached_universe(max_n=(SNAPSHOT_MAX if SNAPSHOT_MAX > 0 else 80),
+                            fallback=static_tickers)
+        c, t = split_core_tail(u["rows"], pinned=SNAPSHOT_CORE,
+                               fallback_tickers=u["tickers"])
+        return u, c, t
+
+    def _msk_day():
+        return (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d")
+
+    # Запрос к бирже синхронный (таймаут до 30 с) — уводим в поток, иначе на
+    # старте он держит цикл событий и задерживает подъём API и healthcheck.
+    uni, core, tail = await asyncio.to_thread(_plan)
+    plan_day = _msk_day()
     tail_ptr = 0
-    logger.info(f"🧠 База знаний: стакан core+rotating — ядро {len(core)}/цикл, "
-                f"хвост {len(tail)} по {SNAPSHOT_TAIL_PER_CYCLE}/цикл (всего {len(watch)})")
+    logger.info(f"🧠 База знаний: состав из оборота ({uni['source']}) — "
+                f"{len(uni['tickers'])} бумаг; ядро {len(core)}/цикл, "
+                f"хвост {len(tail)} по {SNAPSHOT_TAIL_PER_CYCLE}/цикл")
+    _new = [t for t in uni["tickers"] if t not in set(static_tickers)]
+    if _new:
+        logger.info(f"🧠 Сверх статического списка ({len(_new)}): {', '.join(_new[:20])}"
+                    + (" …" if len(_new) > 20 else ""))
     tk = None
     if TINKOFF_TOKEN:
         from src.collector.tinkoff_client import TinkoffClient
@@ -356,6 +379,16 @@ async def market_snapshot_pipeline():
         # Фаза сессии: в торговые часы опрашиваем часто, вне — редко (данные не меняются).
         _mm = datetime.now(timezone.utc) + timedelta(hours=3)
         open_now = session_phase(_mm.hour * 60 + _mm.minute) in ("main", "evening")
+        # Состав пересобирается раз в сутки: контейнер живёт неделями, и без
+        # этого он до перезапуска смотрел бы на вчерашних лидеров.
+        if _msk_day() != plan_day:
+            try:
+                uni, core, tail = await asyncio.to_thread(_plan)
+                plan_day, tail_ptr = _msk_day(), 0
+                logger.info(f"🧠 Состав на {plan_day} ({uni['source']}): "
+                            f"{len(uni['tickers'])} бумаг, ядро {len(core)}")
+            except Exception as e:                              # noqa: BLE001
+                logger.warning(f"🧠 Состав не пересобрался ({e}) — работаю прежним")
         # Тикеры этого цикла: всё ЯДРО + срез ХВОСТА по кругу (ограничиваем нагрузку).
         if tail and SNAPSHOT_TAIL_PER_CYCLE > 0:
             n = min(SNAPSHOT_TAIL_PER_CYCLE, len(tail))
