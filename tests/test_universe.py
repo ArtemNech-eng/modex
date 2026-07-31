@@ -46,12 +46,43 @@ def test_preferred_shares_included():
     assert "2" in SHARE_TYPES
 
 
-def test_threshold_matches_position_size():
+def test_threshold_derived_from_position_size():
     """
-    Порог оборота привязан к размеру позиции владельца (150-250 тыс ₽),
-    а не взят круглым числом от балды.
+    Порог оборота — ПРОИЗВОДНАЯ от размера позиции, а не круглое число.
+
+    Сначала стояло 100 млн ₽ на глаз. 31.07 владелец прислал график CNTL
+    (+10.4%) и спросил, почему такие движения не ловятся. Проверка показала,
+    что порог одновременно и слишком строг, и не защищает:
+
+        CNTL   оборот 1.08 млн ₽  -> позиция 200к = 18.5% оборота, НЕЛЬЗЯ
+        KZOS   оборот   12 млн ₽  -> 1.58%, вполне торгуемо, но отсекалось
+        AKRN   оборот   41 млн ₽  -> 0.48%, тоже отсекалось
+
+    Значение имеет не оборот сам по себе, а ДОЛЯ позиции в нём.
     """
-    assert MIN_TURNOVER_RUB == 100_000_000
+    from src.analysis.universe import (MAX_SHARE_OF_TURNOVER, POSITION_RUB,
+                                       turnover_floor)
+    assert MIN_TURNOVER_RUB == POSITION_RUB / MAX_SHARE_OF_TURNOVER
+    assert turnover_floor(200_000, 0.02) == 10_000_000
+    assert turnover_floor(500_000, 0.02) == 25_000_000, "крупнее позиция — строже порог"
+
+
+def test_position_share_flags_illiquid():
+    """Доля позиции в обороте: по ней и принимается решение «влезем или нет»."""
+    from src.analysis.universe import position_share
+    assert round(position_share(1_080_154, 200_000), 3) == 0.185   # CNTL, нельзя
+    assert round(position_share(12_000_000, 200_000), 4) == 0.0167  # KZOS, можно
+    assert position_share(0, 200_000) > 100, "нулевой оборот — заведомо нельзя"
+
+
+def test_position_share_attached_to_each_row(monkeypatch):
+    """Доля лежит рядом с бумагой, чтобы её не считали заново перед входом."""
+    import src.analysis.universe as u
+    rows = [{"ticker": "AAA", "sectype": "1", "name": "A", "turnover": 2e7,
+             "price": 10, "change_pct": 1, "lot": 1}]
+    monkeypatch.setattr(u, "_fetch", lambda *a, **kw: rows)
+    out = u.build_universe()
+    assert out["rows"][0]["position_share"] == 0.01
 
 
 def test_fallback_when_exchange_unreachable(monkeypatch):
@@ -137,3 +168,4 @@ def test_incident_recorded_in_module():
     src = (Path(__file__).resolve().parents[1] / "src/analysis/universe.py").read_text()
     assert "MVID" in src and "SGZH" in src
     assert "8.29" in src
+    assert "CNTL" in src, "случай с неторгуемым лидером тоже должен быть записан"

@@ -41,9 +41,46 @@ ISS_TQBR = ("https://iss.moex.com/iss/engines/stock/markets/shares/boards/"
 # Обыкновенные и привилегированные акции. Всё остальное — фонды и расписки.
 SHARE_TYPES = {"1", "2"}
 
-# Порог оборота. 100 млн ₽ в день — примерно та граница, ниже которой позиция
-# владельца (150–250 тыс ₽) начинает заметно двигать цену на выходе.
-MIN_TURNOVER_RUB = 100_000_000
+# ─── Порог ликвидности считается ОТ РАЗМЕРА ПОЗИЦИИ, а не круглым числом ──────
+#
+# Сначала здесь стояло 100 млн ₽ — взято на глаз. 31.07 владелец прислал
+# график CNTL с ростом +10.4% и спросил, почему такие движения не ловятся.
+# Проверка показала две разные вещи сразу:
+#
+#   CNTL   +10.36%   оборот за ВЕСЬ день 1 080 154 ₽
+#          позиция 200 000 ₽ = 18.5% дневного оборота → торговать НЕЛЬЗЯ,
+#          выход двигал бы цену на проценты;
+#
+#   KZOS   +4.98%    оборот 12 млн ₽ → позиция 1.58% оборота → ТОРГУЕМО,
+#   KZOSP  +4.48%    оборот 16 млн ₽ → 1.23% → ТОРГУЕМО,
+#   AKRN   +5.05%    оборот 41 млн ₽ → 0.48% → ТОРГУЕМО.
+#
+# То есть порог 100 млн одновременно пропускал неторгуемое (нет, он его резал,
+# но заодно) и резал вполне торгуемое. Правильная величина — не оборот сам по
+# себе, а ДОЛЯ позиции в обороте.
+#
+# 2% выбрано так: при доле ниже 2% дневного оборота вход и выход рыночной
+# заявкой умещаются в обычный спред и не двигают цену заметно. Это оценка, а не
+# измерение — если появятся данные по проскальзыванию, порог надо уточнить.
+POSITION_RUB = float(os.getenv("POSITION_RUB", "200000"))
+MAX_SHARE_OF_TURNOVER = float(os.getenv("MAX_SHARE_OF_TURNOVER", "0.02"))
+
+# 200 000 / 0.02 = 10 млн ₽. Раньше стояло 100 млн — вдесятеро строже, чем надо.
+MIN_TURNOVER_RUB = POSITION_RUB / MAX_SHARE_OF_TURNOVER
+
+
+def turnover_floor(position_rub: float = None, max_share: float = None) -> float:
+    """Минимальный дневной оборот, при котором позиция не двигает цену."""
+    p = POSITION_RUB if position_rub is None else position_rub
+    s = MAX_SHARE_OF_TURNOVER if max_share is None else max_share
+    return p / s
+
+
+def position_share(turnover_rub: float, position_rub: float = None) -> float:
+    """Какую долю дневного оборота займёт позиция. Больше 2% — не входить."""
+    p = POSITION_RUB if position_rub is None else position_rub
+    return (p / turnover_rub) if turnover_rub else 999.0
+
 
 CACHE_DIR = os.getenv("UNIVERSE_CACHE_DIR", "/tmp/universe")
 
@@ -98,6 +135,10 @@ def build_universe(min_turnover: float = MIN_TURNOVER_RUB,
 
     shares = [x for x in rows
               if x["sectype"] in SHARE_TYPES and (x["turnover"] or 0) >= min_turnover]
+    # Доля позиции в обороте — главное число для решения «влезем или нет».
+    # Держим его рядом с бумагой, чтобы не пересчитывать и не забыть проверить.
+    for x in shares:
+        x["position_share"] = round(position_share(x["turnover"]), 4)
     shares.sort(key=lambda x: -(x["turnover"] or 0))
     shares = shares[:max_n]
     if not shares:
