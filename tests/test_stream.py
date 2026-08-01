@@ -553,6 +553,101 @@ def test_dealer_data_is_stored_not_dropped():
     assert "merge_book_minutes(tk, rows, source=src)" in main
 
 
+# ─── структура уровней: плита против ровной раскладки ─────────────────────────
+#
+# Сумма по 20 уровням не отличает одну большую заявку от размазанного объёма, а
+# для вопроса «кто давит цену» это разные картины. Уровни целиком не храним —
+# 20 цен по десять раз в секунду на 80 бумаг это уже не минутная таблица.
+
+def test_wall_and_spread_out_book_look_different():
+    """Одинаковый общий объём, разная структура — и это должно быть видно."""
+    a = Aggregator()
+    # плита: 1000 в одной заявке, ещё 1000 по мелочи
+    a.add_book("WALL", _utc(7, 0, 10), 2000, 2000, 1.0, 1.1,
+               bid5=1200, ask5=400, bid_top=1000, ask_top=120)
+    # ровно: тот же объём, ни одной крупной
+    a.add_book("FLAT", _utc(7, 0, 10), 2000, 2000, 1.0, 1.1,
+               bid5=500, ask5=400, bid_top=120, ask_top=120)
+    book = a.drain()[1]["exchange"]
+    assert book["WALL"][0]["bid_top_max"] == 1000
+    assert book["FLAT"][0]["bid_top_max"] == 120
+    assert book["WALL"][0]["bid5_sum"] > book["FLAT"][0]["bid5_sum"]
+
+
+def test_biggest_order_of_the_minute_is_the_max_not_the_average():
+    """
+    Важно, что плита БЫЛА. Усреднение размажет её по минуте и спрячет: три
+    пакета по 100 и один на 900 дадут среднее 300, то есть ничего особенного.
+    """
+    a = Aggregator()
+    for top in (100, 900, 100, 100):
+        a.add_book("X", _utc(7, 0, 10), 1000, 1000, 1.0, 1.1, bid_top=top)
+    assert a.drain()[1]["exchange"]["X"][0]["bid_top_max"] == 900
+
+
+def test_levels_are_sorted_before_taking_the_best_five():
+    """
+    Регрессия на молчаливое допущение. bids[0] как лучшая цена сходится на
+    живых данных, но «пять лучших» опирается на порядок ВСЕГО списка. Такие
+    допущения тут уже выходили боком — сортируем явно.
+    """
+    from src.collector.stream import MarketStream
+    s = MarketStream("x", {"SBER": "F1"})
+    # уровни НАМЕРЕННО перемешаны, лучшая цена в середине
+    ob = pb.OrderBook(
+        ticker="SBER", depth=20, is_consistent=True,
+        order_book_type=pb.ORDERBOOK_TYPE_EXCHANGE,
+        bids=[pb.Order(price=common.Quotation(units=99, nano=0), quantity=7),
+              pb.Order(price=common.Quotation(units=101, nano=0), quantity=500),
+              pb.Order(price=common.Quotation(units=100, nano=0), quantity=3)],
+        asks=[pb.Order(price=common.Quotation(units=105, nano=0), quantity=9),
+              pb.Order(price=common.Quotation(units=102, nano=0), quantity=400)])
+    ob.time.FromSeconds(1785000000)
+    s._handle(pb.MarketDataResponse(orderbook=ob))
+    r = s.agg.drain()[1]["exchange"]["SBER"][0]
+    assert r["best_bid"] == 101.0, "лучший бид — САМАЯ ВЫСОКАЯ цена покупки"
+    assert r["best_ask"] == 102.0, "лучший аск — САМАЯ НИЗКАЯ цена продажи"
+    assert r["bid_top_max"] == 500 and r["ask_top_max"] == 400
+
+
+def test_near_share_shows_where_the_volume_sits():
+    """
+    Доля объёма в пяти лучших уровнях. Близко к 1 — заявки прижаты к цене,
+    близко к 0 — размазаны вглубь и цену не держат.
+    """
+    rows = [{"ts": "2026-08-03T10:00", "session": "main", "updates": 2,
+             "bid_vol_sum": 1000.0, "ask_vol_sum": 1000.0, "spread_sum": 0.2,
+             "best_bid": 100.0, "best_ask": 100.1, "imb_min": 0.5,
+             "imb_max": 0.5, "bid5_sum": 900.0, "ask5_sum": 100.0,
+             "bid_top_max": 400, "ask_top_max": 50}]
+    r = aggregate_book(rows, 1, "X")[0]
+    assert r["bid_near_share"] == pytest.approx(0.9), "покупатели у самой цены"
+    assert r["ask_near_share"] == pytest.approx(0.1), "продавцы размазаны вглубь"
+    assert r["bid_top"] == 400 and r["ask_top"] == 50
+
+
+def test_glue_sums_five_levels_and_maxes_the_wall():
+    """При склейке минут пятёрка складывается, а плита берётся максимумом."""
+    base = {"ts": "2026-08-03T10:00", "session": "main", "updates": 1,
+            "bid_vol_sum": 100.0, "ask_vol_sum": 100.0, "spread_sum": 0.1,
+            "best_bid": 1.0, "best_ask": 1.1, "imb_min": 0.5, "imb_max": 0.5,
+            "bid5_sum": 40.0, "ask5_sum": 40.0, "bid_top_max": 30,
+            "ask_top_max": 10}
+    second = {**base, "ts": "2026-08-03T10:01", "bid_top_max": 90}
+    r = aggregate_book([base, second], 5, "X")[0]
+    assert r["bid_near_share"] == pytest.approx(80.0 / 200.0)
+    assert r["bid_top"] == 90, "плита из второй минуты не должна потеряться"
+
+
+def test_level_columns_are_migrated():
+    """Таблица уже существует в базе, значит колонки добавляются миграцией."""
+    src = (ROOT / "src/db.py").read_text()
+    i = src.index('"book_minute": {')
+    block = src[i:i + 420]
+    for col in ("bid5_sum", "ask5_sum", "bid_top_max", "ask_top_max"):
+        assert col in block, f"{col} не мигрируется"
+
+
 def test_handler_failure_is_not_swallowed():
     """
     Проглоченное исключение и скрыло всю историю. Ошибка разбора обязана

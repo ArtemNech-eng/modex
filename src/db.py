@@ -382,6 +382,15 @@ class BookMinute(Base):
     best_ask: Mapped[float] = mapped_column(Float, default=0.0)
     imb_min: Mapped[float] = mapped_column(Float, default=0.0)
     imb_max: Mapped[float] = mapped_column(Float, default=0.0)
+    # Структура уровней. Сумма по всем 20 не отличает ПЛИТУ от ровной раскладки:
+    # 263 тысячи лотов на продажу могут стоять одной заявкой на одной цене, а
+    # могут быть размазаны по двадцати. Для вопроса «кто давит цену» это разные
+    # картины. Сами уровни не храним — 20 цен по десять раз в секунду на 80
+    # бумаг это уже не минутная таблица.
+    bid5_sum: Mapped[float] = mapped_column(Float, default=0.0)   # пять лучших
+    ask5_sum: Mapped[float] = mapped_column(Float, default=0.0)
+    bid_top_max: Mapped[int] = mapped_column(Integer, default=0)  # крупнейшая заявка
+    ask_top_max: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
@@ -529,7 +538,11 @@ _PREDICTION_ADDED_COLUMNS = {
 _ADDED_COLUMNS = {
     "predictions": _PREDICTION_ADDED_COLUMNS,
     "flow_minute": {"source": "VARCHAR(8) DEFAULT 'mixed'"},
-    "book_minute": {"source": "VARCHAR(8) DEFAULT 'mixed'"},
+    "book_minute": {"source": "VARCHAR(8) DEFAULT 'mixed'",
+                    "bid5_sum": "DOUBLE PRECISION DEFAULT 0",
+                    "ask5_sum": "DOUBLE PRECISION DEFAULT 0",
+                    "bid_top_max": "INTEGER DEFAULT 0",
+                    "ask_top_max": "INTEGER DEFAULT 0"},
 }
 
 
@@ -2220,12 +2233,20 @@ async def merge_book_minutes(ticker: str, rows: list[dict],
                                      updates=0, bid_vol_sum=0.0, ask_vol_sum=0.0,
                                      spread_sum=0.0, best_bid=0.0, best_ask=0.0,
                                      imb_min=float(r.get("imb_min") or 0.0),
-                                     imb_max=float(r.get("imb_max") or 0.0))
+                                     imb_max=float(r.get("imb_max") or 0.0),
+                                     bid5_sum=0.0, ask5_sum=0.0,
+                                     bid_top_max=0, ask_top_max=0)
                     session.add(row)
                 row.updates += int(r.get("updates") or 0)
                 row.bid_vol_sum += float(r.get("bid_vol_sum") or 0.0)
                 row.ask_vol_sum += float(r.get("ask_vol_sum") or 0.0)
                 row.spread_sum += float(r.get("spread_sum") or 0.0)
+                row.bid5_sum += float(r.get("bid5_sum") or 0.0)
+                row.ask5_sum += float(r.get("ask5_sum") or 0.0)
+                row.bid_top_max = max(row.bid_top_max,
+                                      int(r.get("bid_top_max") or 0))
+                row.ask_top_max = max(row.ask_top_max,
+                                      int(r.get("ask_top_max") or 0))
                 if r.get("best_bid"):
                     row.best_bid = float(r["best_bid"])
                 if r.get("best_ask"):
@@ -2265,6 +2286,7 @@ def aggregate_book(rows: list[dict], step: int, ticker: str = "") -> list[dict]:
             buckets[k] = {"ts": ts, "upd": 0, "bid": 0.0, "ask": 0.0,
                           "spread": 0.0, "bb": 0.0, "ba": 0.0,
                           "lo": r.get("imb_min", 0.5), "hi": r.get("imb_max", 0.5),
+                          "b5": 0.0, "a5": 0.0, "btop": 0, "atop": 0,
                           "session": r.get("session") or "main"}
             order.append(k)
         b = buckets[k]
@@ -2272,6 +2294,10 @@ def aggregate_book(rows: list[dict], step: int, ticker: str = "") -> list[dict]:
         b["bid"] += r.get("bid_vol_sum") or 0.0
         b["ask"] += r.get("ask_vol_sum") or 0.0
         b["spread"] += r.get("spread_sum") or 0.0
+        b["b5"] += r.get("bid5_sum") or 0.0
+        b["a5"] += r.get("ask5_sum") or 0.0
+        b["btop"] = max(b["btop"], r.get("bid_top_max") or 0)
+        b["atop"] = max(b["atop"], r.get("ask_top_max") or 0)
         if r.get("best_bid"):
             b["bb"] = r["best_bid"]
         if r.get("best_ask"):
@@ -2292,6 +2318,17 @@ def aggregate_book(rows: list[dict], step: int, ticker: str = "") -> list[dict]:
             "flipped": bool(b["lo"] < 0.5 < b["hi"]),
             "avg_spread": round(b["spread"] / b["upd"], 6) if b["upd"] else None,
             "best_bid": b["bb"] or None, "best_ask": b["ba"] or None,
+            # Доля объёма в ПЯТИ лучших уровнях: близко к 1 — заявки прижаты к
+            # цене, близко к 0 — размазаны вглубь. Считается из сумм, поэтому
+            # склейка минут в пятиминутки остаётся верной.
+            "bid_near_share": round(b["b5"] / b["bid"], 4) if b["bid"] else None,
+            "ask_near_share": round(b["a5"] / b["ask"], 4) if b["ask"] else None,
+            # Крупнейшая одиночная заявка за интервал и её доля в стороне.
+            "bid_top": b["btop"] or None, "ask_top": b["atop"] or None,
+            "bid_top_share": (round(b["btop"] / (b["bid"] / b["upd"]), 4)
+                              if b["upd"] and b["bid"] else None),
+            "ask_top_share": (round(b["atop"] / (b["ask"] / b["upd"]), 4)
+                              if b["upd"] and b["ask"] else None),
         })
     return out
 
@@ -2314,7 +2351,9 @@ async def book_series(ticker: str, day: str, res: str = "1m",
               "bid_vol_sum": r.bid_vol_sum, "ask_vol_sum": r.ask_vol_sum,
               "spread_sum": r.spread_sum, "best_bid": r.best_bid,
               "best_ask": r.best_ask, "imb_min": r.imb_min,
-              "imb_max": r.imb_max} for r in rows]
+              "imb_max": r.imb_max, "bid5_sum": r.bid5_sum,
+              "ask5_sum": r.ask5_sum, "bid_top_max": r.bid_top_max,
+              "ask_top_max": r.ask_top_max} for r in rows]
     return aggregate_book(plain, step, ticker)
 
 

@@ -174,8 +174,22 @@ class Aggregator:
         self.trades_seen += 1
 
     def add_book(self, ticker: str, when: datetime, bid_vol: int, ask_vol: int,
-                 best_bid: float, best_ask: float,
-                 source: str = "exchange") -> None:
+                 best_bid: float, best_ask: float, source: str = "exchange",
+                 bid5: int = 0, ask5: int = 0,
+                 bid_top: int = 0, ask_top: int = 0) -> None:
+        """
+        bid5/ask5 — объём в ПЯТИ лучших уровнях, bid_top/ask_top — крупнейшая
+        одиночная заявка.
+
+        Зачем сверх суммы по всем уровням. Сумма не отличает плиту от ровной
+        раскладки: 263 тысячи лотов на продажу могут стоять одной заявкой на
+        одной цене, а могут быть размазаны по двадцати. Для вопроса «кто давит
+        цену» это разные картины, а в одной сумме они неразличимы.
+
+        Сами уровни не храним: 20 цен с объёмами по десять раз в секунду на 80
+        бумаг — это уже не минутная таблица. Четыре числа дают то же по смыслу:
+        насколько объём собран у цены и есть ли в нём одна большая заявка.
+        """
         if not ticker:
             return
         total = bid_vol + ask_vol
@@ -189,11 +203,18 @@ class Aggregator:
             r = {"ts": mk, "session": session_of(mk), "updates": 0,
                  "bid_vol_sum": 0.0, "ask_vol_sum": 0.0, "spread_sum": 0.0,
                  "best_bid": 0.0, "best_ask": 0.0,
-                 "imb_min": share, "imb_max": share}
+                 "imb_min": share, "imb_max": share,
+                 "bid5_sum": 0.0, "ask5_sum": 0.0,
+                 "bid_top_max": 0, "ask_top_max": 0}
             self.book[k] = r
         r["updates"] += 1
         r["bid_vol_sum"] += bid_vol
         r["ask_vol_sum"] += ask_vol
+        r["bid5_sum"] += bid5
+        r["ask5_sum"] += ask5
+        # Плита — это МАКСИМУМ за минуту, а не среднее: важно, что она была.
+        r["bid_top_max"] = max(r["bid_top_max"], bid_top)
+        r["ask_top_max"] = max(r["ask_top_max"], ask_top)
         if best_bid > 0 and best_ask > 0:
             r["spread_sum"] += best_ask - best_bid
             r["best_bid"] = best_bid
@@ -335,12 +356,24 @@ class MarketStream:
                 self.stats["books_skipped"] += 1
                 self.agg.books_skipped += 1
                 return
-            bid = sum(int(o.quantity) for o in ob.bids)
-            ask = sum(int(o.quantity) for o in ob.asks)
-            bb = quotation(ob.bids[0].price) if ob.bids else 0.0
-            ba = quotation(ob.asks[0].price) if ob.asks else 0.0
+            # Уровни СОРТИРУЮТСЯ явно, а не берутся в порядке пакета. Биржа
+            # присылает их лучшими вперёд, и bids[0] как лучшая цена сходится
+            # на живых данных. Но «пять лучших» — уже опора на порядок ВСЕГО
+            # списка, а такие молчаливые допущения тут уже выходили боком.
+            bids = sorted(ob.bids, key=lambda o: -quotation(o.price))
+            asks = sorted(ob.asks, key=lambda o: quotation(o.price))
+            bid = sum(int(o.quantity) for o in bids)
+            ask = sum(int(o.quantity) for o in asks)
+            bid5 = sum(int(o.quantity) for o in bids[:5])
+            ask5 = sum(int(o.quantity) for o in asks[:5])
+            bid_top = max((int(o.quantity) for o in bids), default=0)
+            ask_top = max((int(o.quantity) for o in asks), default=0)
+            bb = quotation(bids[0].price) if bids else 0.0
+            ba = quotation(asks[0].price) if asks else 0.0
             when = ob.time.ToDatetime().replace(tzinfo=timezone.utc)
-            self.agg.add_book(tk, when, bid, ask, bb, ba, source=src)
+            self.agg.add_book(tk, when, bid, ask, bb, ba, source=src,
+                              bid5=bid5, ask5=ask5,
+                              bid_top=bid_top, ask_top=ask_top)
             self.stats["books_dealer" if src == "dealer" else "books"] += 1
         elif name in SUB_FIELD:
             self._handle_subscription(name, getattr(resp, name))
