@@ -374,7 +374,7 @@ async def _loop() -> None:
         try:
             from src.analysis.intraday import session_phase
             msk = datetime.now(timezone.utc) + timedelta(hours=3)
-            phase = session_phase(msk.hour * 60 + msk.minute)
+            phase = session_phase(msk.hour * 60 + msk.minute, msk.weekday())
             if phase in ("morning", "main", "evening"):
                 await one_pass()
                 # Исходы считаем тем же проходом: это тоже бесплатно, а без них

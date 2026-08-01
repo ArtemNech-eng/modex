@@ -494,7 +494,7 @@ async def analyze(ticker: str, aggregator, save: bool = True,
         from src.analysis import intraday as _iv
         _msk = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=3)))
         _mod = _msk.hour * 60 + _msk.minute
-        _phase = _iv.session_phase(_mod)
+        _phase = _iv.session_phase(_mod, _msk.weekday())
         _near_close = _iv.is_last_minutes(_mod, buffer_min=15)
     except Exception:
         _mod, _phase, _near_close = 12 * 60, "main", False

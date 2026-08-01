@@ -380,7 +380,8 @@ async def market_snapshot_pipeline():
         first_err = None
         # Фаза сессии: в торговые часы опрашиваем часто, вне — редко (данные не меняются).
         _mm = datetime.now(timezone.utc) + timedelta(hours=3)
-        open_now = session_phase(_mm.hour * 60 + _mm.minute) in ("main", "evening")
+        open_now = session_phase(_mm.hour * 60 + _mm.minute,
+                                 _mm.weekday()) in ("main", "evening")
         # Состав пересобирается раз в сутки: контейнер живёт неделями, и без
         # этого он до перезапуска смотрел бы на вчерашних лидеров.
         if _msk_day() != plan_day:

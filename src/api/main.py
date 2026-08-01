@@ -539,7 +539,8 @@ async def health_sources():
         from src.analysis import intraday as iv
         from datetime import timedelta
         msk = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=3)))
-        out["session_phase_msk"] = iv.session_phase(msk.hour * 60 + msk.minute)
+        out["session_phase_msk"] = iv.session_phase(msk.hour * 60 + msk.minute,
+                                                    msk.weekday())
     except Exception:
         out["session_phase_msk"] = "?"
 
@@ -1719,7 +1720,7 @@ async def _live_scan_once() -> dict:
     from datetime import timedelta as _td
     from src.analysis import intraday as _iv
     _msk = datetime.now(timezone.utc).astimezone(timezone(_td(hours=3)))
-    _phase = _iv.session_phase(_msk.hour * 60 + _msk.minute)
+    _phase = _iv.session_phase(_msk.hour * 60 + _msk.minute, _msk.weekday())
     if _phase not in ("main", "evening"):
         _live_status["last_scan"] = _now_iso()
         _live_status["scanned"] = 0

@@ -36,6 +36,54 @@ def test_before_morning_open_is_closed():
     assert session_phase(hm(3)) == "closed"
 
 
+# ─────────────────────────── выходные ────────────────────────────────────────
+#
+# Функция знала только время суток. В СУББОТУ 01.08 в 12:34 она отвечала "main",
+# и от неё зависят шесть мест, включая сторож сетапов. Совпало это с другой
+# находкой того же дня: Tinkoff в выходные отдаёт ДИЛЕРСКИЕ сделки (внутренний
+# рынок брокера) при закрытой бирже — ISS не дал ни одного минутного бара против
+# 500 в пятницу. Вместе получалось, что на котировках брокера в субботу можно
+# было выдать сигнал «основной сессии».
+
+def test_saturday_and_sunday_are_closed_at_any_hour():
+    """Биржа в выходные не торгует, каким бы ни было время суток."""
+    for wd in (5, 6):                                   # суббота, воскресенье
+        for t in (hm(7), hm(10, 30), hm(12, 34), hm(15), hm(19, 30), hm(23)):
+            assert session_phase(t, wd) == "closed", (wd, t)
+
+
+def test_weekdays_keep_their_phases():
+    """Проверка дня недели не должна ломать будни."""
+    for wd in range(5):                                 # понедельник-пятница
+        assert session_phase(hm(8), wd) == "morning", wd
+        assert session_phase(hm(12, 34), wd) == "main", wd
+        assert session_phase(hm(19, 30), wd) == "evening", wd
+
+
+def test_without_weekday_behaviour_is_unchanged():
+    """
+    Аргумент необязателен: там, где даты под рукой нет, работает как раньше.
+    Иначе правка потребовала бы менять все вызовы разом.
+    """
+    assert session_phase(hm(12, 34)) == "main"
+    assert session_phase(hm(3)) == "closed"
+
+
+def test_every_caller_passes_the_weekday():
+    """
+    Проверка бесполезна, если её не передают. Все места, где дата ЕСТЬ, обязаны
+    передавать день недели — иначе выходной снова станет торговым днём.
+    """
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[1]
+    for f in ("src/agent/analyst.py", "src/agent/setup_watcher.py", "main.py"):
+        src = (root / f).read_text()
+        i = src.index("session_phase(")
+        assert "weekday()" in src[i:i + 160], f"{f}: день недели не передан"
+    api = (root / "src/api/main.py").read_text()
+    assert api.count("weekday())") >= 2, "оба вызова в API"
+
+
 def test_pre_auction_between_sessions():
     """09:50-10:00 — аукцион открытия основной сессии, входов нет."""
     assert session_phase(hm(9, 55)) == "pre"
