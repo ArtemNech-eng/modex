@@ -5,7 +5,7 @@ REST API + WebSocket для дашборда и внешних интеграц�
 import asyncio
 import logging
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, BackgroundTasks, Body

@@ -265,3 +265,16 @@ def test_collector_writes_flow_minutes():
     src = (Path(__file__).resolve().parents[1] / "main.py").read_text()
     assert "minute_buckets" in src and "merge_flow_minutes" in src
     assert "get_flow_watermark" in src, "без отсечки объём задвоится"
+
+
+def test_api_imports_timedelta():
+    """
+    Регрессия. Маршрут /api/flow считает московскую дату через timedelta,
+    а модуль импортировал только datetime и timezone. Деплой 01.08 доехал,
+    маршрут появился и сразу отдавал 500 на каждый запрос: NameError.
+    Тесты этого не поймали, потому что модуль целиком не импортируется под
+    Python 3.9 в песочнице — там синтаксис 3.10 в geopolitics.
+    """
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "src/api/main.py").read_text()
+    assert "timedelta" in src.split("\n")[7], "timedelta должен быть в импорте datetime"
