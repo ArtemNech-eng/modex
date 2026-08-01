@@ -61,6 +61,21 @@ MSK_SHIFT_H = 3
 # gRPC не заметил. Ночью тишина законна, поэтому сторож смотрит на расписание.
 SILENCE_SEC = int(os.getenv("STREAM_SILENCE_SEC", "60"))
 
+# Список статусов подписки называется по-разному у разных типов данных.
+# Я этого не заметил и читал общее «subscriptions», которого нет ни у одного:
+# обработчик падал на AttributeError, падение уходило в debug-лог, а наружу это
+# выглядело как «подписано 0» при исправно идущем стакане.
+# Числами, а не через pb2: обработчик сделок вызывается на каждый тик, и тянуть
+# туда импорт protobuf незачем. Совпадение с контрактом сторожит тест.
+TRADE_SOURCE_DEALER = 2
+
+SUB_FIELD = {
+    "subscribe_trades_response": "trade_subscriptions",
+    "subscribe_order_book_response": "order_book_subscriptions",
+    "subscribe_candles_response": "candles_subscriptions",
+    "subscribe_last_price_response": "last_price_subscriptions",
+}
+
 
 # Живой стрим процесса. Нужен эндпоинту диагностики: без него «работает ли
 # сбор» можно узнать только по косвенным признакам, а на прошлой неделе
@@ -204,8 +219,10 @@ class MarketStream:
         self.agg = Aggregator()
         self.last_msg: dict = {}          # тикер -> время последнего пакета
         self.stats = {"connected_at": None, "reconnects": 0, "messages": 0,
-                      "trades": 0, "books": 0, "books_skipped": 0,
-                      "last_error": None, "subscribed": 0}
+                      "trades": 0, "trades_dealer": 0, "books": 0,
+                      "books_skipped": 0, "last_error": None, "subscribed": 0,
+                      "subscriptions": {}, "handler_errors": 0,
+                      "last_handler_error": None}
         # Простой флаг, а НЕ asyncio.Event. Event в Python 3.9 привязывается
         # к циклу событий прямо в конструкторе, и объект нельзя создать до
         # запуска цикла. Семантика Event здесь не нужна: ждать на нём мы не
@@ -221,12 +238,22 @@ class MarketStream:
         """
         from .tinkoff_pb import marketdata_pb2 as md
         ids = list(self.figis.values())
+        # trade_source В ЗАПРОСЕ НЕ ЗАДАЁТСЯ. Здесь стояло TRADE_SOURCE_EXCHANGE,
+        # и за первые семь минут работы пришло 4991 сообщение стакана и НОЛЬ
+        # сделок — при том, что опрос REST в те же минуты видел сделки по FEES,
+        # TRMK, LSRG. Среди статусов подписки есть SOURCE_IS_INVALID, то есть
+        # отказ по источнику вполне возможен, а увидеть его я не мог из-за
+        # сломанного разбора ответа.
+        #
+        # По контракту значение по умолчанию — TRADE_SOURCE_ALL. Берём всё, а
+        # дилерские сделки отсекаем У СЕБЯ, по полю trade_source каждой сделки.
+        # Так лучше и по существу: фильтр виден и измеряем, а не спрятан в
+        # подписке. Сколько именно дилерского потока — теперь видно в счётчике,
+        # а не предполагается.
         yield md.MarketDataRequest(
             subscribe_trades_request=md.SubscribeTradesRequest(
                 subscription_action=md.SUBSCRIPTION_ACTION_SUBSCRIBE,
                 instruments=[md.TradeInstrument(instrument_id=f) for f in ids],
-                # Только биржевые. Дилерские сделки не проходят через стакан.
-                trade_source=md.TRADE_SOURCE_EXCHANGE,
             ))
         yield md.MarketDataRequest(
             subscribe_order_book_request=md.SubscribeOrderBookRequest(
@@ -256,10 +283,16 @@ class MarketStream:
         if name == "trade":
             t = resp.trade
             tk = (t.ticker or "").upper()
+            self.last_msg[tk] = datetime.now(timezone.utc)
+            # Дилерские сделки (внутренние сделки брокера) не проходят через
+            # стакан и завысили бы поток. Отсекаем ЗДЕСЬ, а не в подписке, и
+            # считаем отдельно — чтобы знать их долю, а не предполагать.
+            if t.trade_source == TRADE_SOURCE_DEALER:
+                self.stats["trades_dealer"] += 1
+                return
             when = t.time.ToDatetime().replace(tzinfo=timezone.utc)
             self.agg.add_trade(tk, when, int(t.direction),
                                quotation(t.price), int(t.quantity))
-            self.last_msg[tk] = datetime.now(timezone.utc)
             self.stats["trades"] += 1
         elif name == "orderbook":
             ob = resp.orderbook
@@ -278,18 +311,57 @@ class MarketStream:
             self.agg.add_book(tk, when, bid, ask, bb, ba)
             self.last_msg[tk] = datetime.now(timezone.utc)
             self.stats["books"] += 1
-        elif name in ("subscribe_trades_response", "subscribe_order_book_response"):
-            payload = getattr(resp, name)
-            ok = sum(1 for s in payload.subscriptions
-                     if "SUCCESS" in str(s.subscription_status))
-            bad = [s for s in payload.subscriptions
-                   if "SUCCESS" not in str(s.subscription_status)]
-            self.stats["subscribed"] += ok
-            if bad:
-                logger.warning("подписка отклонена по %d инструментам: %s",
-                               len(bad), str(bad[0].subscription_status))
-            logger.info("подписка %s: принято %d, отклонено %d", name, ok, len(bad))
+        elif name in SUB_FIELD:
+            self._handle_subscription(name, getattr(resp, name))
         self.stats["messages"] += 1
+
+    def _handle_subscription(self, name: str, payload) -> None:
+        """
+        Разбор ответа на подписку.
+
+        ЗДЕСЬ БЫЛИ ДВЕ ОШИБКИ, и вместе они сделали отказ невидимым.
+
+        Первая: список статусов называется по-разному у разных подписок —
+        trade_subscriptions у сделок, order_book_subscriptions у стаканов.
+        Я читал несуществующее payload.subscriptions, обработчик падал на
+        AttributeError, а падение писалось в лог уровнем debug и пропадало.
+
+        Вторая: статус сравнивался как строка — «SUCCESS» in str(enum). Enum в
+        protobuf это ЧИСЛО, str(1) даёт «1», и проверка всегда ложна.
+
+        В итоге стрим сообщал «подписано 0» при исправно идущем стакане, а
+        отказ по сделкам не было видно вообще. Статусы теперь складываются по
+        ИМЕНАМ и отдаются в /api/stream/health — без чтения логов.
+        """
+        from .tinkoff_pb import marketdata_pb2 as md
+        subs = getattr(payload, SUB_FIELD[name], None)
+        if subs is None:
+            self._note_error(f"{name}: нет поля {SUB_FIELD[name]}")
+            return
+        counts: dict = {}
+        for s in subs:
+            st = md.SubscriptionStatus.Name(s.subscription_status)
+            counts[st] = counts.get(st, 0) + 1
+        self.stats["subscriptions"][name] = counts
+        ok = counts.get("SUBSCRIPTION_STATUS_SUCCESS", 0)
+        self.stats["subscribed"] += ok
+        if ok != len(subs):
+            logger.warning("подписка %s: принято %d из %d, статусы %s",
+                           name, ok, len(subs), counts)
+        else:
+            logger.info("подписка %s: принято %d", name, ok)
+
+    def _note_error(self, msg: str) -> None:
+        """
+        Ошибку разбора видно в диагностике, а не только в логе.
+
+        Проглоченное исключение в обработчике — ровно то, что скрыло отказ
+        подписки на сделки: стакан шёл, счётчик сделок стоял на нуле, и причина
+        лежала в debug-логе, куда никто не смотрит.
+        """
+        self.stats["handler_errors"] += 1
+        self.stats["last_handler_error"] = msg[:300]
+        logger.warning("стрим: %s", msg)
 
     # ─── жизненный цикл ──────────────────────────────────────────────────────
 
@@ -319,7 +391,11 @@ class MarketStream:
                 try:
                     self._handle(resp)
                 except Exception as e:                       # noqa: BLE001
-                    logger.debug("пакет не разобран: %s", e)
+                    # НЕ debug. Здесь тихо пропадала ошибка разбора ответа на
+                    # подписку, и из-за неё семь минут не приходило ни одной
+                    # сделки, а причину не было видно ни в одном показателе.
+                    self._note_error(f"пакет {resp.WhichOneof('payload')} "
+                                     f"не разобран: {type(e).__name__}: {e}")
 
     async def _flusher(self) -> None:
         while not self._stopped:

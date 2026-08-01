@@ -291,6 +291,8 @@ def test_health_endpoint_exists():
 
 pb = pytest.importorskip("src.collector.tinkoff_pb.marketdata_pb2",
                          reason="protobuf не установлен")
+# Quotation живёт в common.proto, а не в marketdata.proto.
+common = pytest.importorskip("src.collector.tinkoff_pb.common_pb2")
 
 
 def test_hardcoded_direction_numbers_match_the_contract():
@@ -316,7 +318,8 @@ def test_subscription_requests_are_built_and_serialize():
     tr = reqs[0].subscribe_trades_request
     assert len(tr.instruments) == 2
     assert tr.subscription_action == pb.SUBSCRIPTION_ACTION_SUBSCRIBE
-    assert tr.trade_source == pb.TRADE_SOURCE_EXCHANGE, "дилерские сделки не берём"
+    assert tr.trade_source == pb.TRADE_SOURCE_UNSPECIFIED, \
+        "источник не задаём: явный EXCHANGE совпал с нулём сделок, фильтр перенесён к нам"
 
     ob = reqs[1].subscribe_order_book_request
     assert all(i.depth == 20 for i in ob.instruments)
@@ -335,6 +338,115 @@ def test_all_instruments_go_in_one_request_per_type():
     reqs = list(MarketStream("x", figis)._subscribe_requests())
     assert len(reqs) == 2
     assert len(reqs[0].subscribe_trades_request.instruments) == 80
+
+
+# ─── разбор ответа на подписку ────────────────────────────────────────────────
+#
+# Живой прогон 01.08: за семь минут пришло 4991 сообщение стакана и НОЛЬ сделок,
+# при том что опрос REST в те же минуты видел сделки по FEES, TRMK, LSRG.
+# Причин было две, и обе прятали сами себя.
+
+def test_subscription_field_names_match_the_contract():
+    """
+    Список статусов называется по-разному у каждого типа подписки. Я читал
+    общее «subscriptions», которого нет ни у одного: обработчик падал на
+    AttributeError, а падение уходило в debug-лог.
+    """
+    from src.collector.stream import SUB_FIELD
+    for resp_name, field in SUB_FIELD.items():
+        cls = "".join(p.capitalize() for p in resp_name.split("_"))
+        cls = cls.replace("Orderbook", "OrderBook").replace("Lastprice", "LastPrice")
+        msg = getattr(pb, cls, None)
+        assert msg is not None, f"нет сообщения {cls}"
+        assert field in [f.name for f in msg.DESCRIPTOR.fields], \
+            f"{cls} не имеет поля {field}"
+
+
+def test_status_is_compared_as_enum_not_as_string():
+    """
+    Вторая ошибка: «SUCCESS» in str(enum). Enum это число, str(1) даёт «1»,
+    проверка всегда ложна — стрим сообщал «подписано 0» при живом стакане.
+    """
+    assert "SUCCESS" not in str(pb.SUBSCRIPTION_STATUS_SUCCESS), \
+        "именно поэтому строковое сравнение и не работало"
+    src = (ROOT / "src/collector/stream.py").read_text()
+    assert 'SubscriptionStatus.Name' in src, "статус берём именем, а не строкой"
+
+
+def test_subscription_statuses_are_counted_by_name():
+    from src.collector.stream import MarketStream
+    s = MarketStream("x", {"SBER": "F1", "MVID": "F2", "DATA": "F3"})
+    resp = pb.MarketDataResponse(
+        subscribe_trades_response=pb.SubscribeTradesResponse(
+            trade_subscriptions=[
+                pb.TradeSubscription(figi="F1",
+                                     subscription_status=pb.SUBSCRIPTION_STATUS_SUCCESS),
+                pb.TradeSubscription(figi="F2",
+                                     subscription_status=pb.SUBSCRIPTION_STATUS_SUCCESS),
+                pb.TradeSubscription(figi="F3",
+                                     subscription_status=pb.SUBSCRIPTION_STATUS_SOURCE_IS_INVALID),
+            ]))
+    s._handle(resp)
+    got = s.stats["subscriptions"]["subscribe_trades_response"]
+    assert got == {"SUBSCRIPTION_STATUS_SUCCESS": 2,
+                   "SUBSCRIPTION_STATUS_SOURCE_IS_INVALID": 1}
+    assert s.stats["subscribed"] == 2
+    assert s.stats["handler_errors"] == 0, "разбор не должен падать"
+
+
+def test_rejection_is_visible_in_health_without_reading_logs():
+    """Отказ должен быть виден показателем, а не строчкой в debug-логе."""
+    from src.collector.stream import MarketStream
+    s = MarketStream("x", {"SBER": "F1"})
+    s._handle(pb.MarketDataResponse(
+        subscribe_trades_response=pb.SubscribeTradesResponse(
+            trade_subscriptions=[pb.TradeSubscription(
+                figi="F1",
+                subscription_status=pb.SUBSCRIPTION_STATUS_SOURCE_IS_INVALID)])))
+    h = s.health()
+    assert h["subscribed"] == 0
+    assert "SUBSCRIPTION_STATUS_SOURCE_IS_INVALID" in str(h["subscriptions"])
+
+
+def test_trade_source_is_not_set_in_the_request():
+    """
+    Регрессия. Явный TRADE_SOURCE_EXCHANGE в подписке совпал с нулём сделок за
+    семь минут. По контракту умолчание — TRADE_SOURCE_ALL; дилерские отсекаем
+    у себя, где это видно и измеримо.
+    """
+    from src.collector.stream import MarketStream
+    req = list(MarketStream("x", {"SBER": "F1"})._subscribe_requests())[0]
+    assert req.subscribe_trades_request.trade_source == pb.TRADE_SOURCE_UNSPECIFIED
+
+
+def test_dealer_trades_are_counted_but_not_added_to_flow():
+    """Дилерские сделки не проходят через стакан — в поток они не идут."""
+    from src.collector.stream import MarketStream, TRADE_SOURCE_DEALER
+    assert TRADE_SOURCE_DEALER == pb.TRADE_SOURCE_DEALER, "число разошлось с контрактом"
+
+    s = MarketStream("x", {"SBER": "F1"})
+    for source, qty in ((pb.TRADE_SOURCE_EXCHANGE, 10), (pb.TRADE_SOURCE_DEALER, 999)):
+        t = pb.Trade(ticker="SBER", direction=pb.TRADE_DIRECTION_BUY,
+                     price=common.Quotation(units=100, nano=0), quantity=qty,
+                     trade_source=source)
+        t.time.FromSeconds(1785000000)
+        s._handle(pb.MarketDataResponse(trade=t))
+    assert s.stats["trades"] == 1 and s.stats["trades_dealer"] == 1
+    assert s.agg.drain()[0]["SBER"][0]["buy_volume"] == 10, "дилерская не в потоке"
+
+
+def test_handler_failure_is_not_swallowed():
+    """
+    Проглоченное исключение и скрыло всю историю. Ошибка разбора обязана
+    попадать в показатели, а не только в лог.
+    """
+    from src.collector.stream import MarketStream
+    s = MarketStream("x", {"SBER": "F1"})
+    s._note_error("проверка")
+    assert s.health()["handler_errors"] == 1
+    assert s.health()["last_handler_error"] == "проверка"
+    src = (ROOT / "src/collector/stream.py").read_text()
+    assert "logger.debug(\"пакет не разобран" not in src
 
 
 def test_broken_task_takes_the_others_down_with_it():
