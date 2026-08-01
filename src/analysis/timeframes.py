@@ -43,6 +43,20 @@ def _num(row: dict, key: str) -> Optional[float]:
     return v if v > 0 else None
 
 
+def _vol(row: dict) -> float:
+    """
+    Объём как число, чего бы ни пришло.
+
+    Без этого `bars()` падал с TypeError на строке в поле объёма и уносил с собой
+    ВЕСЬ блок таймфреймов из-за одной битой минуты. Ноль вместо падения: лучше
+    недосчитать объём одной минуты, чем не отдать ничего.
+    """
+    try:
+        return float(row.get("volume") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _minute_of_day(ts: str) -> Optional[int]:
     try:
         return int(ts[11:13]) * 60 + int(ts[14:16])
@@ -77,14 +91,14 @@ def bars(rows: list, step: int) -> list:
         if not out or out[-1]["key"] != k:
             out.append({"key": k, "ts": r.get("ts"), "open": _num(r, "open") or cl,
                         "high": hi, "low": lo, "close": cl, "minutes": 1,
-                        "volume": r.get("volume") or 0})
+                        "volume": _vol(r)})
         else:
             b = out[-1]
             b["high"] = max(b["high"], hi)
             b["low"] = min(b["low"], lo)
             b["close"] = cl
             b["minutes"] += 1
-            b["volume"] = (b["volume"] or 0) + (r.get("volume") or 0)
+            b["volume"] = (b["volume"] or 0) + _vol(r)
     for b in out:
         b["complete"] = not (b["key"] == last_key)
     return out

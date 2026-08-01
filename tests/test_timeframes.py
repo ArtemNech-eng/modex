@@ -92,6 +92,19 @@ def test_empty_and_broken_input():
     assert bars([{"ts": "bad"}, {"ts": "2026-08-03T10:00"}], 5) == []
 
 
+def test_non_numeric_volume_does_not_kill_the_whole_block():
+    """
+    Найдено тестом объёма. Сложение строки с числом валило `bars()` с TypeError и
+    уносило ВЕСЬ блок таймфреймов из-за одной битой минуты. Ноль вместо падения.
+    """
+    rows = [bar(i, 100, 99, close=99.5) for i in range(6)]
+    rows[2]["volume"] = "х"
+    rows[3]["volume"] = None
+    b = bars(rows, 5)
+    assert b, "бары собрались, несмотря на битые значения"
+    assert b[0]["volume"] == 30, "три целых минуты по 10, битые как ноль"
+
+
 # ─── структура HH/HL и LH/LL ─────────────────────────────────────────────────
 
 def test_higher_high_and_higher_low_is_up():
