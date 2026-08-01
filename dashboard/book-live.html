@@ -87,6 +87,8 @@
   Пометок «сильный» и «слабый» нет: сколько касаний делает уровень значимым — не измерено.<br>
   ATR дня берётся из дневных свечей ISS; если его ещё нет, показывается средний диапазон за 14 минут
   и это помечено.<br>
+  Направление и структура таймфреймов считаются только по ЗАКРЫТЫМ барам: тридцатиминутный бар на
+  второй минуте и завершённый — не одно и то же. Текущий бар виден отдельно.<br>
   «Структура» — описание последних пяти минут. 31.07 требование «структура вверх» для покупки на
   откате измерялось <b>вредным</b>: t=−12.57, положительных дней 16%.
 </footer>
@@ -145,6 +147,43 @@ function card(tk) {
   h += `<div class="row"><span class="${cls(f.change_1m_pct)}">${pct(f.change_1m_pct)}</span>`
      + `<span class="${cls(f.change_3m_pct)}">${pct(f.change_3m_pct)}</span>`
      + `<span class="${cls(f.change_5m_pct)}">${pct(f.change_5m_pct)}</span></div>`;
+
+  // ПЯТЬ ТАЙМФРЕЙМОВ и согласие. Расхождение младшего со старшим — то, что
+  // одна цифра изменения не показывает.
+  const tf = f.timeframes || {}, ag = tf.agreement, fr = tf.frames || {};
+  h += `<div class="lbl">таймфреймы · согласие</div>`;
+  if (ag) {
+    const arrow = d => d === "up" ? "↑" : d === "down" ? "↓" : "→";
+    const col = d => d === "up" ? "up" : d === "down" ? "down" : "dim";
+    h += `<div class="row">` + ["1m","3m","5m","15m","30m"].map(k => {
+      const x = fr[k] || {};
+      return x.direction
+        ? `<span class="${col(x.direction)}">${k.replace("m","м")}${arrow(x.direction)}</span>`
+        : `<span class="dim">${k.replace("m","м")}·</span>`;
+    }).join("") + `</div>`;
+    h += `<div class="row"><span class="dim">${
+      ag.all_agree ? "все согласны" :
+      ag.fast_vs_slow === "opposite" ? "младший против старшего" : "расходятся"
+    }</span><span>${ag.up}↑ ${ag.down}↓ ${ag.flat}→</span></div>`;
+    // Темп и разворот последнего закрытого бара по минутке и пятиминутке.
+    const pace = ["1m","5m"].map(k => {
+      const x = fr[k] || {};
+      if (!x.pace) return null;
+      return `${k.replace("m","м")} ${x.pace === "accelerating" ? "ускор" :
+              x.pace === "decelerating" ? "замедл" : "ровно"}${x.turned ? " разворот" : ""}`;
+    }).filter(Boolean);
+    if (pace.length) h += `<div class="row"><span class="dim">темп</span>`
+      + `<span>${pace.join(" · ")}</span></div>`;
+    // Структура по каждому — только по ЗАКРЫТЫМ барам.
+    const st = ["1m","5m","15m"].map(k => {
+      const x = fr[k] || {};
+      return x.structure ? `${k.replace("m","м")} ${x.structure}` : null;
+    }).filter(Boolean);
+    if (st.length) h += `<div class="row"><span class="dim">структура</span>`
+      + `<span>${st.join(" · ")}</span></div>`;
+  } else {
+    h += `<div class="empty">баров пока мало</div>`;
+  }
 
   // КРАЙНОСТИ ДНЯ со временем: максимум на открытии и максимум минуту назад —
   // разные ситуации, и без времени их не отличить.

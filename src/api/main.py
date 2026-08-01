@@ -712,6 +712,15 @@ async def get_book_live(ticker: str, light: bool = False):
     out["price_levels"] = levels(rows, tick=out.get("step") or 0.01,
                                  price_now=out.get("price"), top=6)
 
+    # ПЯТЬ ТАЙМФРЕЙМОВ и их СОГЛАСИЕ. «1м вверх, 5м вниз, 15м вниз» — другая
+    # ситуация, чем «все вверх», а одна цифра изменения их не различает.
+    #
+    # Структура и направление считаются только по ЗАКРЫТЫМ барам: тридцатиминутный
+    # бар на второй минуте и завершённый — не одно и то же. Текущий отдаётся
+    # отдельным полем forming.
+    from src.analysis.timeframes import profile
+    out["timeframes"] = profile(rows)
+
     # ДНЕВНОЙ ATR — от него считается риск. На карточке до этого был средний
     # диапазон за 14 МИНУТ, что для стопа бесполезно; он остаётся отдельным полем.
     a = (getattr(CURRENT, "atr", None) or {}).get(tk)
