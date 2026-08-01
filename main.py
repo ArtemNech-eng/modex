@@ -572,11 +572,13 @@ async def stream_pipeline():
         counts: dict = {}
         for src, per_ticker in flow.items():
             for tk, rows in per_ticker.items():
-                n = await db.merge_flow_minutes(tk, rows, None, source=src)
+                n = await db.merge_flow_minutes(tk, rows, None, source=src,
+                                                instance=stream.instance)
                 counts[f"поток/{src}"] = counts.get(f"поток/{src}", 0) + n
         for src, per_ticker in book.items():
             for tk, rows in per_ticker.items():
-                n = await db.merge_book_minutes(tk, rows, source=src)
+                n = await db.merge_book_minutes(tk, rows, source=src,
+                                                instance=stream.instance)
                 counts[f"стакан/{src}"] = counts.get(f"стакан/{src}", 0) + n
         for tk, rows in candle.items():
             n = await db.merge_candle_minutes(tk, rows)
@@ -584,6 +586,8 @@ async def stream_pipeline():
         if counts:
             logger.debug("стрим записал: %s", counts)
 
+    # stream упоминается внутри _flush выше: замыкание разрешает имя в момент
+    # ВЫЗОВА, а первый вызов случится не раньше первого сброса.
     stream = MarketStream(TINKOFF_TOKEN, figis, depth=STREAM_DEPTH,
                           flush_sec=STREAM_FLUSH_SEC, on_flush=_flush)
     await stream.run()

@@ -56,6 +56,7 @@ watermark по времени последней сделки, поток отд
 import asyncio
 import logging
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -323,6 +324,19 @@ class MarketStream:
         self.depth = depth
         self.flush_sec = flush_sec
         self.on_flush = on_flush
+        # Метка ЭТОГО экземпляра стрима. Нужна, потому что при перекате деплоя
+        # Coolify держит два контейнера, у каждого свой стрим, и оба получают
+        # ПОЛНЫЙ поток независимо. Раньше они писали в одну строку flow_minute
+        # со складывающим слиянием — и объём удваивался.
+        #
+        # Как это нашлось 01.08: сверка со свечой биржи. По SBER за 14:03 наш
+        # поток показал 736 лотов против настоящих 468, а когда остался один
+        # контейнер, цифры совпали до лота. Свечи не задвоились, потому что там
+        # объём накопительный и при слиянии ЗАМЕНЯЕТСЯ, а не прибавляется.
+        #
+        # Теперь экземпляры пишут в РАЗНЫЕ строки, а на чтении берётся самая
+        # полная, а не сумма.
+        self.instance = uuid.uuid4().hex[:6]
         self.agg = Aggregator()
         self.last_msg: dict = {}          # тикер -> время последнего пакета
         self.stats = {"connected_at": None, "reconnects": 0, "messages": 0,
@@ -652,6 +666,7 @@ class MarketStream:
         fresh = sum(1 for a in ages.values() if a <= 60)
         return {
             **self.stats,
+            "instance": self.instance,
             "tickers_subscribed": len(self.figis),
             "tickers_with_data": len(ages),
             "tickers_fresh_60s": fresh,

@@ -526,17 +526,20 @@ def test_migration_covers_the_new_tables():
 def test_reads_default_to_exchange():
     """Забыть указать источник должно быть безопасно: молча вернётся биржевой."""
     src = (ROOT / "src/db.py").read_text()
-    assert src.count('source: str = "exchange"') == 4, \
-        "две записи и два чтения — везде умолчание биржевое"
+    assert 'source: str = "dealer"' not in src, "умолчание нигде не дилерское"
+    assert src.count('source: str = "exchange"') >= 4, \
+        "записи и чтения — везде умолчание биржевое"
     api = (ROOT / "src/api/main.py").read_text()
-    assert api.count('source: str = "exchange"') == 2
+    assert 'source: str = "dealer"' not in api
+    assert api.count('source: str = "exchange"') >= 2
 
 
 def test_endpoints_reject_unknown_source():
     """Опечатка в источнике не должна молча отдавать пустой список."""
     api = (ROOT / "src/api/main.py").read_text()
     assert 'FLOW_SOURCES = ("exchange", "dealer", "mixed", "all")' in api
-    assert api.count("if source not in FLOW_SOURCES:") == 2
+    assert api.count("if source not in FLOW_SOURCES:") >= 2, \
+        "каждый маршрут с параметром source обязан его проверять"
 
 
 def test_dealer_data_is_stored_not_dropped():
@@ -550,8 +553,8 @@ def test_dealer_data_is_stored_not_dropped():
     assert 'self.stats["trades_dealer"] += 1\n                return' not in stream, \
         "дилерские больше не отбрасываются"
     main = (ROOT / "main.py").read_text()
-    assert "merge_flow_minutes(tk, rows, None, source=src)" in main
-    assert "merge_book_minutes(tk, rows, source=src)" in main
+    assert "merge_flow_minutes(tk, rows, None, source=src," in main
+    assert "merge_book_minutes(tk, rows, source=src," in main
 
 
 # ─── структура уровней: плита против ровной раскладки ─────────────────────────
@@ -781,6 +784,88 @@ def test_candle_and_live_endpoints_exist():
     main = (ROOT / "main.py").read_text()
     assert "merge_candle_minutes" in main, "свечи должны писаться при сбросе"
     assert "prune_candle_minute" in main, "и чиститься по сроку"
+
+
+# ─── задвоение при перекате деплоя ────────────────────────────────────────────
+
+from src.db import pick_fullest                                   # noqa: E402
+
+
+def test_two_containers_are_not_summed():
+    """
+    01.08 при перекате Coolify держал два контейнера, у каждого свой стрим, и оба
+    писали в ОДНУ строку со складывающим слиянием. По SBER за 14:03 сумма дала
+    736 лотов против настоящих 468 — завышение в полтора раза и с виду
+    совершенно правдоподобное.
+    """
+    rows = [
+        {"ts": "2026-08-01T14:03", "trade_count": 40, "buy_volume": 248},
+        {"ts": "2026-08-01T14:03", "trade_count": 40, "buy_volume": 248},
+    ]
+    out = pick_fullest(rows, "trade_count")
+    assert len(out) == 1, "одна минута — одно наблюдение"
+    assert out[0]["buy_volume"] == 248, "НЕ 496"
+
+
+def test_the_fuller_observation_wins():
+    """
+    Контейнер, поднявшийся посреди минуты, видел меньше. Берём того, у кого
+    событий больше — он прожил минуту целиком.
+    """
+    rows = [
+        {"ts": "2026-08-01T14:03", "trade_count": 12, "buy_volume": 100},
+        {"ts": "2026-08-01T14:03", "trade_count": 40, "buy_volume": 248},
+    ]
+    assert pick_fullest(rows, "trade_count")[0]["buy_volume"] == 248
+
+
+def test_different_minutes_all_survive():
+    """Отсечка работает ВНУТРИ минуты, а не между минутами."""
+    rows = [{"ts": f"2026-08-01T14:0{i}", "trade_count": i} for i in range(1, 5)]
+    assert len(pick_fullest(rows, "trade_count")) == 4
+
+
+def test_result_is_ordered_by_time():
+    """Дальше идёт склейка в бары, ей нужен порядок."""
+    rows = [{"ts": "2026-08-01T14:05", "updates": 1},
+            {"ts": "2026-08-01T14:03", "updates": 1},
+            {"ts": "2026-08-01T14:04", "updates": 1}]
+    assert [r["ts"][11:] for r in pick_fullest(rows, "updates")] == \
+        ["14:03", "14:04", "14:05"]
+
+
+def test_instance_goes_into_the_key():
+    """
+    Без метки экземпляра в ключе два контейнера снова попадут в одну строку.
+    """
+    src = (ROOT / "src/db.py").read_text()
+    assert src.count('key += f":{instance}"') == 2, "поток и стакан"
+    stream = (ROOT / "src/collector/stream.py").read_text()
+    assert "self.instance = uuid.uuid4().hex[:6]" in stream
+    main = (ROOT / "main.py").read_text()
+    assert main.count("instance=stream.instance") == 2
+
+
+def test_reads_pick_fullest_not_sum():
+    src = (ROOT / "src/db.py").read_text()
+    assert 'pick_fullest(plain, "trade_count")' in src, "поток"
+    assert 'pick_fullest(plain, "updates")' in src, "стакан"
+
+
+def test_candle_cross_check_exists():
+    """
+    Сверка со свечой — то, чем задвоение и нашлось. Пусть остаётся постоянной
+    проверкой, а не разовым скриптом.
+    """
+    src = (ROOT / "src/db.py").read_text()
+    assert "async def flow_candle_check" in src
+    i = src.index("async def flow_candle_check")
+    body = src[i:i + 2600]
+    assert 'source == "exchange"' in body, \
+        "дилерские сделки в биржевую свечу не входят, сверять их бессмысленно"
+    assert "ours > theirs" in body, "подозрительно ПРЕВЫШЕНИЕ, а не недосчёт"
+    api = (ROOT / "src/api/main.py").read_text()
+    assert "/api/flow/{ticker}/check" in api
 
 
 def test_handler_failure_is_not_swallowed():

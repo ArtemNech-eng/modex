@@ -2099,7 +2099,8 @@ async def get_flow_watermark(ticker: str, day: str) -> Optional[str]:
 
 async def merge_flow_minutes(ticker: str, rows: list[dict],
                              watermark: Optional[str],
-                             source: str = "exchange") -> int:
+                             source: str = "exchange",
+                             instance: str = "") -> int:
     """
     Влить минутные срезы потока. rows: [{ts, session, buy_volume, sell_volume,
     trade_count, max_trade, vwap_num}], ts вида "YYYY-MM-DDTHH:MM" (МСК).
@@ -2115,6 +2116,8 @@ async def merge_flow_minutes(ticker: str, rows: list[dict],
         async with async_session() as session:
             for r in rows:
                 key = f"{r['ts']}:{ticker.upper()}:{source}"
+                if instance:
+                    key += f":{instance}"
                 row = await session.get(FlowMinute, key)
                 if row is None:
                     # Значения задаются ЯВНО, а не через default колонки:
@@ -2140,6 +2143,34 @@ async def merge_flow_minutes(ticker: str, rows: list[dict],
         logger.debug(f"merge_flow_minutes {ticker}: {e}")
         return 0
     return n
+
+
+def pick_fullest(rows: list[dict], by: str) -> list[dict]:
+    """
+    Из нескольких наблюдений ОДНОЙ минуты оставить самое полное.
+
+    Зачем. При перекате деплоя Coolify держит два контейнера, у каждого свой
+    стрим, и оба получают ПОЛНЫЙ поток независимо. Складывать их наблюдения
+    нельзя: 01.08 по SBER за минуту 14:03 сумма дала 736 лотов против настоящих
+    468 — завышение в полтора раза, и с виду совершенно правдоподобное.
+
+    Правильный ответ — не сумма, а ОДНО из наблюдений. Для полностью прожитой
+    минуты они совпадают; если контейнер поднялся посреди минуты, его наблюдение
+    беднее. Поэтому берётся то, где событий больше.
+
+    Недосчёт при этом возможен: если один контейнер умер посреди минуты, а
+    второй в ней же поднялся, ни одно наблюдение не полное. Это видно сверкой с
+    объёмом свечи и лучше задвоения — недостача заметна, а задвоение нет.
+
+    ЧИСТАЯ функция: ни базы, ни сети.
+    """
+    best: dict = {}
+    for r in rows:
+        ts = r.get("ts")
+        cur = best.get(ts)
+        if cur is None or (r.get(by) or 0) > (cur.get(by) or 0):
+            best[ts] = r
+    return [best[k] for k in sorted(best)]
 
 
 FLOW_RES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "session": 10 ** 6}
@@ -2221,6 +2252,9 @@ async def flow_series(ticker: str, day: str, res: str = "1m",
     plain = [{"ts": r.ts, "session": r.session, "buy_volume": r.buy_volume,
               "sell_volume": r.sell_volume, "trade_count": r.trade_count,
               "max_trade": r.max_trade, "vwap_num": r.vwap_num} for r in rows]
+    # Одну минуту могли записать ДВА экземпляра стрима при перекате деплоя.
+    # Берём самое полное наблюдение, а не сумму.
+    plain = pick_fullest(plain, "trade_count")
     return aggregate_flow(plain, step, ticker)
 
 
@@ -2242,7 +2276,8 @@ async def prune_flow_minute(keep_days: int = 90) -> int:
 
 
 async def merge_book_minutes(ticker: str, rows: list[dict],
-                             source: str = "exchange") -> int:
+                             source: str = "exchange",
+                             instance: str = "") -> int:
     """
     Влить минутные срезы стакана. Складывает в существующие минуты.
 
@@ -2257,6 +2292,8 @@ async def merge_book_minutes(ticker: str, rows: list[dict],
         async with async_session() as session:
             for r in rows:
                 key = f"{r['ts']}:{ticker.upper()}:{source}"
+                if instance:
+                    key += f":{instance}"
                 row = await session.get(BookMinute, key)
                 if row is None:
                     # Значения ЯВНО, а не через default колонки: до записи в
@@ -2389,6 +2426,7 @@ async def book_series(ticker: str, day: str, res: str = "1m",
               "imb_max": r.imb_max, "bid5_sum": r.bid5_sum,
               "ask5_sum": r.ask5_sum, "bid_top_max": r.bid_top_max,
               "ask_top_max": r.ask_top_max} for r in rows]
+    plain = pick_fullest(plain, "updates")
     return aggregate_book(plain, step, ticker)
 
 
@@ -2495,6 +2533,51 @@ async def candle_series(ticker: str, day: str, res: str = "1m") -> list[dict]:
               "volume_buy": r.volume_buy, "volume_sell": r.volume_sell}
              for r in rows]
     return aggregate_candles(plain, step, ticker)
+
+
+async def flow_candle_check(ticker: str, day: str,
+                            source: str = "exchange") -> dict:
+    """
+    Сверка НАШЕГО разбора направлений с объёмом свечи биржи.
+
+    Зачем. volume_buy и volume_sell приходят от биржи в самой свече, а
+    flow_minute считается нами из отдельных сделок. Два независимых счёта одного
+    и того же — значит расхождение указывает на ошибку в одном из них.
+
+    01.08 эта сверка нашла задвоение через две минуты после того, как появилась:
+    по SBER за 14:03 наш поток дал 736 лотов против 468 в свече, потому что при
+    перекате деплоя два контейнера писали в одну строку. Минуты после переката
+    совпали до лота.
+
+    ВАЖНО ПРО ИСТОЧНИК. Свеча строится из БИРЖЕВЫХ сделок, поэтому сверять с ней
+    осмысленно только source=exchange. Для dealer объёмы просто не связаны:
+    дилерские сделки в биржевую свечу не входят, и расхождение там ничего не
+    означает. Поэтому флаг выставляется только для биржевого источника.
+    """
+    flow = await flow_series(ticker, day, "1m", source=source)
+    candles = await candle_series(ticker, day, "1m")
+    cd = {r["ts"]: r for r in candles}
+    out, bad = [], 0
+    for f in flow:
+        c = cd.get(f["ts"])
+        if not c:
+            continue
+        ours = (f["buy_volume"] or 0) + (f["sell_volume"] or 0)
+        theirs = c["volume"] or 0
+        # Подозрительно ПРЕВЫШЕНИЕ: это подпись задвоения. Недосчёт возможен
+        # законно — контейнер мог подняться посреди минуты.
+        suspect = bool(source == "exchange" and theirs and ours > theirs * 1.05)
+        if suspect:
+            bad += 1
+        out.append({
+            "ts": f["ts"], "ours": ours, "candle": theirs,
+            "diff": ours - theirs,
+            "ours_buy": f["buy_volume"], "candle_buy": c["volume_buy"],
+            "ours_sell": f["sell_volume"], "candle_sell": c["volume_sell"],
+            "suspect": suspect,
+        })
+    return {"ticker": ticker.upper(), "day": day, "source": source,
+            "minutes": len(out), "suspect_minutes": bad, "rows": out}
 
 
 async def prune_candle_minute(keep_days: int = 90) -> int:

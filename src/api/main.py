@@ -489,6 +489,29 @@ async def get_stream_candles(ticker: str, day: Optional[str] = None,
             "count": len(rows), "rows": rows}
 
 
+@app.get("/api/flow/{ticker}/check", summary="Сверка нашего потока с объёмом свечи биржи")
+async def get_flow_check(ticker: str, day: Optional[str] = None,
+                         source: str = "exchange"):
+    """
+    Два независимых счёта одного и того же: наш разбор сделок против объёма,
+    который биржа кладёт в свечу. Расхождение означает ошибку в одном из них.
+
+    suspect выставляется при ПРЕВЫШЕНИИ нашего объёма над свечным больше чем на
+    5% — это подпись задвоения. Недосчёт законен: контейнер мог подняться
+    посреди минуты.
+
+    Сверять осмысленно только source=exchange: дилерские сделки в биржевую свечу
+    не входят вовсе.
+    """
+    if not ticker_known(ticker):
+        raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
+    if source not in FLOW_SOURCES:
+        raise HTTPException(status_code=400,
+                            detail=f"source: {', '.join(sorted(FLOW_SOURCES))}")
+    d = day or (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d")
+    return await db.flow_candle_check(ticker, d, source=source)
+
+
 @app.get("/api/live/{ticker}", summary="Прямо сейчас: из памяти, без ожидания сброса")
 async def get_live(ticker: str):
     """
