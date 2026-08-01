@@ -118,7 +118,13 @@ SNAPSHOT_CORE = [t.strip().upper() for t in os.getenv(
     "SNAPSHOT_CORE",
     "SBER,GAZP,LKOH,GMKN,NVTK,ROSN,YDEX,TATN,MTSS,MGNT,ALRS,PLZL,VTBR,CHMF,"
     "NLMK,MAGN,SNGS,SNGSP,MOEX,T,OZON,SIBN,TRNFP,PHOR,X5,POSI").split(",") if t.strip()]
-SNAPSHOT_TAIL_PER_CYCLE = int(os.getenv("SNAPSHOT_TAIL_PER_CYCLE", "6"))  # тикеров хвоста за цикл
+SNAPSHOT_TAIL_PER_CYCLE = int(os.getenv("SNAPSHOT_TAIL_PER_CYCLE", "6"))
+
+# Хранение минутного потока сделок (таблица flow_minute).
+# Три дня, как у session_footprint, здесь не годятся: минутный поток и нужен
+# для проверки гипотез на истории, а на трёх днях проверить нечего.
+# 80 бумаг x ~1000 минут x 90 дней ~ 2.4 млн строк — SQLite это тянет.
+FLOW_MINUTE_KEEP_DAYS = int(os.getenv("FLOW_MINUTE_KEEP_DAYS", "90"))  # тикеров хвоста за цикл
 
 # ─── Приём сделок трейдеров (скрейпер агента → POST /api/ingest/deals) ─────────
 # Токен для защиты ingest-эндпоинта. Пусто = приём открыт (внутренний хобби-режим);

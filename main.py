@@ -326,7 +326,8 @@ async def market_snapshot_pipeline():
     Всё пишется в market_events с меткой времени (реалтайм + история для Claude).
     """
     from config.settings import (TINKOFF_TOKEN, MOEX_TICKERS, SNAPSHOT_MAX,
-                                  SNAPSHOT_PACING_SEC, SNAPSHOT_CORE, SNAPSHOT_TAIL_PER_CYCLE)
+                                  SNAPSHOT_PACING_SEC, SNAPSHOT_CORE,
+                                  SNAPSHOT_TAIL_PER_CYCLE, FLOW_MINUTE_KEEP_DAYS)
     from src.analysis.intraday import session_phase
     from src.analysis.universe import cached_universe, split_core_tail
     await db.setup_db()
@@ -374,7 +375,7 @@ async def market_snapshot_pipeline():
     cycle = 0
     while True:
         cycle += 1
-        written = {"orderbook": 0, "quote": 0, "trades": 0, "deal": 0}
+        written = {"orderbook": 0, "quote": 0, "trades": 0, "deal": 0, "flow_min": 0}
         first_err = None
         # Фаза сессии: в торговые часы опрашиваем часто, вне — редко (данные не меняются).
         _mm = datetime.now(timezone.utc) + timedelta(hours=3)
@@ -430,9 +431,9 @@ async def market_snapshot_pipeline():
                         # НЕ пишем (иначе раздует базу).
                         raw = tr.pop("raw", None)
                         if raw:
+                            day = (ts + timedelta(hours=3)).strftime("%Y-%m-%d")  # МСК-дата сессии
                             try:
                                 from src.collector.tinkoff_client import _footprint_increment
-                                day = (ts + timedelta(hours=3)).strftime("%Y-%m-%d")  # МСК-дата сессии
                                 prev = await db.get_session_footprint(t, day)
                                 inc = _footprint_increment(raw, (prev or {}).get("watermark"))
                                 if inc["new"]:
@@ -440,6 +441,20 @@ async def market_snapshot_pipeline():
                                         day, t, inc["buckets"], inc["watermark"])
                             except Exception as e:
                                 logger.debug(f"session footprint {t}: {e}")
+                            # Поток с МИНУТНЫМ разрешением — отдельно от footprint.
+                            # Footprint группирует по цене и живёт три дня; из него
+                            # нельзя получить ни 1m/5m/15m, ни число сделок, ни
+                            # размеры. Здесь ключ — минута, хранение 90 дней.
+                            try:
+                                from src.collector.tinkoff_client import minute_buckets
+                                wm = await db.get_flow_watermark(t, day)
+                                mb = minute_buckets(raw, wm)
+                                if mb["new"]:
+                                    n = await db.merge_flow_minutes(
+                                        t, mb["rows"], mb["watermark"])
+                                    written["flow_min"] = written.get("flow_min", 0) + n
+                            except Exception as e:
+                                logger.debug(f"flow_minute {t}: {e}")
                         await db.add_event({"source": "tinkoff", "kind": "trades",
                                             "ticker": t, "payload": tr, "ts": ts})
                         written["trades"] += 1
@@ -473,12 +488,17 @@ async def market_snapshot_pipeline():
                                f"Проверь права токена/часы торгов.")
             else:
                 logger.info(f"🧠 База знаний: +Tinkoff стакан {written['orderbook']}, "
-                            f"цена {written['quote']}, поток {written['trades']}; сделки {written['deal']}")
+                            f"цена {written['quote']}, поток {written['trades']}, "
+                            f"минут потока {written.get('flow_min', 0)}; "
+                            f"сделки {written['deal']}")
 
             # Ретеншн: раз в ~50 циклов чистим старше 14 дней
             if cycle % 50 == 1:
                 await db.prune_events(keep_days=14)
                 await db.prune_session_footprint(keep_days=3)
+                # Минутный поток живёт дольше: ради него всё и затевалось,
+                # на трёх днях проверить нельзя ничего.
+                await db.prune_flow_minute(keep_days=FLOW_MINUTE_KEEP_DAYS)
         except Exception as e:
             logger.debug(f"market snapshot: {e}")
         # В сессию — частые снимки (90с); вне сессии — редкие (300с): экономим API,

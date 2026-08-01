@@ -308,6 +308,41 @@ class SessionFootprint(Base):
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+class FlowMinute(Base):
+    """
+    Поток сделок с разрешением в ОДНУ МИНУТУ. Дедуп по watermark.
+
+    Зачем отдельно от session_footprint. Та таблица группирует объём по ЦЕНЕ и
+    хранится три дня. Из неё нельзя получить ни 1m/5m/15m/30m, ни число сделок,
+    ни размеры: сделка на 1000 лотов и десять по 100 дают одинаковую корзину.
+    31.07 это заблокировало проверку потока целиком.
+
+    Откуда данные. Tinkoff GetLastTrades отдаёт сделки за ОКНО ВРЕМЕНИ, а не
+    «последние N». Прежний код запрашивал четыре часа и оставлял из ответа
+    последние 50 сделок, остальное выбрасывал: данные были, но терялись в коде.
+    Теперь берутся все сделки окна, новые определяются по времени последней
+    учтённой.
+
+    Производные — дельта, накопленная дельта, доли, средний размер, дисбаланс —
+    здесь НЕ хранятся, а считаются на чтении. Хранить производное опасно: при
+    смене порога «крупной сделки» пришлось бы переписывать всю историю.
+    """
+    __tablename__ = "flow_minute"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)   # "YYYY-MM-DDTHH:MM:TICKER"
+    ts: Mapped[str] = mapped_column(String(16), index=True)          # "YYYY-MM-DDTHH:MM" МСК
+    ticker: Mapped[str] = mapped_column(String(32), index=True)
+    session: Mapped[str] = mapped_column(String(8), default="main")  # morning|main|evening
+    buy_volume: Mapped[int] = mapped_column(Integer, default=0)
+    sell_volume: Mapped[int] = mapped_column(Integer, default=0)
+    trade_count: Mapped[int] = mapped_column(Integer, default=0)
+    max_trade: Mapped[int] = mapped_column(Integer, default=0)
+    vwap_num: Mapped[float] = mapped_column(Float, default=0.0)      # сумма цена*объём
+    watermark: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 class SignalAttempt(Base):
     """
     ЖУРНАЛ ПОПЫТОК (наблюдаемость воронки сигналов).
@@ -1931,6 +1966,156 @@ async def prune_session_footprint(keep_days: int = 3) -> int:
     async with async_session() as session:
         result = await session.execute(
             delete(SessionFootprint).where(SessionFootprint.date < cutoff))
+        await session.commit()
+        return result.rowcount or 0
+
+
+# ─── Поток сделок с минутным разрешением ──────────────────────────────────────
+
+async def get_flow_watermark(ticker: str, day: str) -> Optional[str]:
+    """
+    Время последней учтённой сделки за день. По нему отбираются НОВЫЕ сделки.
+
+    Без этого пересекающиеся опросы задваивают объём: Tinkoff отдаёт окно
+    времени, и соседние снимки перекрываются почти целиком.
+    """
+    async with async_session() as session:
+        q = (select(FlowMinute.watermark)
+             .where(FlowMinute.ticker == ticker.upper(),
+                    FlowMinute.ts.like(f"{day}%"),
+                    FlowMinute.watermark.is_not(None))
+             .order_by(FlowMinute.watermark.desc()).limit(1))
+        return (await session.execute(q)).scalar_one_or_none()
+
+
+async def merge_flow_minutes(ticker: str, rows: list[dict],
+                             watermark: Optional[str]) -> int:
+    """
+    Влить минутные срезы потока. rows: [{ts, session, buy_volume, sell_volume,
+    trade_count, max_trade, vwap_num}], ts вида "YYYY-MM-DDTHH:MM" (МСК).
+
+    Складывает в существующие минуты. Защита от двойного счёта — НЕ здесь, а
+    на входе: сюда попадают только сделки новее прежнего watermark.
+    Пишем «мягко»: ошибка записи не должна ронять сбор.
+    """
+    if not rows:
+        return 0
+    n = 0
+    try:
+        async with async_session() as session:
+            for r in rows:
+                key = f"{r['ts']}:{ticker.upper()}"
+                row = await session.get(FlowMinute, key)
+                if row is None:
+                    # Значения задаются ЯВНО, а не через default колонки:
+                    # до записи в базу они остались бы None, и накопление
+                    # падало бы на «NoneType + int».
+                    row = FlowMinute(key=key, ts=r["ts"], ticker=ticker.upper(),
+                                     session=r.get("session") or "main",
+                                     buy_volume=0, sell_volume=0, trade_count=0,
+                                     max_trade=0, vwap_num=0.0)
+                    session.add(row)
+                row.buy_volume += int(r.get("buy_volume") or 0)
+                row.sell_volume += int(r.get("sell_volume") or 0)
+                row.trade_count += int(r.get("trade_count") or 0)
+                row.max_trade = max(row.max_trade, int(r.get("max_trade") or 0))
+                row.vwap_num += float(r.get("vwap_num") or 0.0)
+                if watermark:
+                    row.watermark = watermark
+                row.updated_at = datetime.now(timezone.utc)
+                n += 1
+            await session.commit()
+    except Exception as e:                                       # noqa: BLE001
+        logger.debug(f"merge_flow_minutes {ticker}: {e}")
+        return 0
+    return n
+
+
+FLOW_RES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "session": 10 ** 6}
+
+
+def aggregate_flow(rows: list[dict], step: int, ticker: str = "") -> list[dict]:
+    """
+    Склейка минут в бары нужного шага и расчёт производных. ЧИСТАЯ функция:
+    ни базы, ни сети — поэтому проверяется тестом без подмены модулей.
+
+    rows: [{ts "YYYY-MM-DDTHH:MM", session, buy_volume, sell_volume,
+            trade_count, max_trade, vwap_num}] в порядке возрастания времени.
+
+    Производные считаются ЗДЕСЬ, а не хранятся: при смене определения «крупной
+    сделки» историю не придётся переписывать.
+
+    VWAP склеивается через сумму цена*объём, а не усреднением минутных VWAP:
+    средние усреднять нельзя, суммы складываются.
+    """
+    if not rows:
+        return []
+    buckets: dict = {}
+    order: list = []
+    for r in rows:
+        ts = r["ts"]
+        mm = int(ts[11:13]) * 60 + int(ts[14:16])
+        k = mm // step
+        if k not in buckets:
+            buckets[k] = {"ts": ts, "buy": 0, "sell": 0, "n": 0,
+                          "max": 0, "num": 0.0,
+                          "session": r.get("session") or "main"}
+            order.append(k)
+        b = buckets[k]
+        b["buy"] += r.get("buy_volume") or 0
+        b["sell"] += r.get("sell_volume") or 0
+        b["n"] += r.get("trade_count") or 0
+        b["max"] = max(b["max"], r.get("max_trade") or 0)
+        b["num"] += r.get("vwap_num") or 0.0
+    out, cum = [], 0
+    for k in order:
+        b = buckets[k]
+        tot = b["buy"] + b["sell"]
+        delta = b["buy"] - b["sell"]
+        cum += delta
+        out.append({
+            "ts": b["ts"], "ticker": ticker.upper(), "session": b["session"],
+            "buy_volume": b["buy"], "sell_volume": b["sell"],
+            "delta": delta, "cumulative_delta": cum,
+            "buy_ratio": round(b["buy"] / tot, 4) if tot else None,
+            "sell_ratio": round(b["sell"] / tot, 4) if tot else None,
+            "trade_count": b["n"],
+            "average_trade_size": round(tot / b["n"], 2) if b["n"] else None,
+            "max_trade": b["max"],
+            "vwap": round(b["num"] / tot, 6) if tot else None,
+            "imbalance": round(delta / tot, 4) if tot else None,
+        })
+    return out
+
+
+async def flow_series(ticker: str, day: str, res: str = "1m") -> list[dict]:
+    """Поток по бумаге за день. res: 1m | 5m | 15m | 30m | session."""
+    step = FLOW_RES.get(res, 1)
+    async with async_session() as session:
+        q = (select(FlowMinute)
+             .where(FlowMinute.ticker == ticker.upper(),
+                    FlowMinute.ts.like(f"{day}%"))
+             .order_by(FlowMinute.ts))
+        rows = (await session.execute(q)).scalars().all()
+    plain = [{"ts": r.ts, "session": r.session, "buy_volume": r.buy_volume,
+              "sell_volume": r.sell_volume, "trade_count": r.trade_count,
+              "max_trade": r.max_trade, "vwap_num": r.vwap_num} for r in rows]
+    return aggregate_flow(plain, step, ticker)
+
+
+async def prune_flow_minute(keep_days: int = 90) -> int:
+    """
+    Чистка минутного потока.
+
+    Три дня, как у session_footprint, здесь не годятся: ради минутного потока
+    всё и затевалось, а на трёх днях ничего не проверить. При 80 бумагах и
+    ~1000 минут в день это ~2.4 млн строк за 90 дней — SQLite тянет.
+    """
+    cutoff = (datetime.now(timezone.utc) + timedelta(hours=3)
+              - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+    async with async_session() as session:
+        result = await session.execute(
+            delete(FlowMinute).where(FlowMinute.ts < cutoff))
         await session.commit()
         return result.rowcount or 0
 

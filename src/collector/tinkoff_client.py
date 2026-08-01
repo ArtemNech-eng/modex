@@ -18,6 +18,15 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# Окно запроса сделок у Tinkoff. GetLastTrades отдаёт ВСЕ сделки за период,
+# а не «последние N» — поэтому окно определяет полноту сбора.
+#
+# Раньше стояло 4 часа, и весь ответ, кроме последних 50 сделок, выбрасывался.
+# Окно должно быть заметно БОЛЬШЕ интервала между опросами, иначе между
+# снимками появятся дыры. Замер 01.08: интервал по SBER 322 секунды, поэтому
+# 30 минут дают пятикратный запас и payload на порядок меньше четырёхчасового.
+TRADES_WINDOW_MIN = int(os.getenv("TRADES_WINDOW_MIN", "30"))
+
 TINKOFF_BASE = "https://invest-public-api.tinkoff.ru/rest"
 
 # Кэш соответствия тикер -> FIGI. ЗАПОЛНЯЕТСЯ ТОЛЬКО ИЗ API, вручную не ведём.
@@ -266,7 +275,7 @@ class TinkoffClient:
             return None
 
         now  = datetime.now(timezone.utc)
-        from_ = (now - timedelta(hours=4)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        from_ = (now - timedelta(minutes=TRADES_WINDOW_MIN)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         data = await self._post(
             "tinkoff.public.invest.api.contract.v1.MarketDataService/GetLastTrades",
@@ -275,12 +284,23 @@ class TinkoffClient:
         if not data or "trades" not in data:
             return None
 
-        # Хронологический порядок (нужен для tick-rule), затем последние `limit`.
-        trades = sorted(data["trades"], key=lambda t: t.get("time", ""))[-limit:]
-        if not trades:
+        # Хронологический порядок (нужен для tick-rule).
+        all_trades = sorted(data["trades"], key=lambda t: t.get("time", ""))
+        if not all_trades:
             return None
-        result = _classify_flow(trades)
-        result["raw"] = trades   # транзитно для накопления footprint (в событии НЕ храним)
+        # Классификация — по последним `limit` сделкам: это ВИТРИНА для Claude
+        # и дашборда, там важна свежесть, а не полнота.
+        result = _classify_flow(all_trades[-limit:])
+        # А в raw кладём ВСЁ ОКНО.
+        #
+        # Раньше здесь стояло all_trades[-limit:], то есть в накопление уходили
+        # те же 50 сделок, что и в витрину, а остальное окно выбрасывалось. При
+        # опросе раз в пять минут это означало, что по ликвидной бумаге в базу
+        # попадали единицы процентов сделок: у SBER за пять минут их тысячи.
+        # Данные приходили из Tinkoff и терялись в коде.
+        result["raw"] = all_trades
+        result["window_trades"] = len(all_trades)
+        result["window_min"] = TRADES_WINDOW_MIN
         return result
 
     async def get_full_snapshot(self, ticker: str) -> dict:
@@ -522,3 +542,78 @@ def _footprint_increment(trades: list[dict], since_ts: Optional[str]) -> dict:
     all_ts = [t.get("time") for t in trades if t.get("time")]
     watermark = max(all_ts) if all_ts else since_ts
     return {"buckets": buckets, "watermark": watermark, "new": new_n}
+
+
+def minute_buckets(trades: list[dict], since_ts: Optional[str],
+                   tz_shift_h: int = 3) -> dict:
+    """
+    Сделки, разложенные по МИНУТАМ. Дедуп тот же, что у footprint: берутся
+    только сделки новее since_ts.
+
+    Зачем отдельно от _footprint_increment. Тот бакетит по ЦЕНЕ и теряет время:
+    из его результата нельзя получить ни 1m/5m/15m, ни число сделок, ни размеры
+    сделок. Здесь ключ — минута, и в ней лежит всё для производных.
+
+    ВРЕМЯ ПЕРЕВОДИТСЯ В МСК. Tinkoff отдаёт UTC, а торговая сессия и остальные
+    данные в системе московские. Две зоны в одной таблице — источник ошибок,
+    которые всплывают через недели.
+
+    Возвращает {"rows": [...], "watermark": max_ts, "new": n}, где строка это
+    {ts "YYYY-MM-DDTHH:MM", session, buy_volume, sell_volume, trade_count,
+     max_trade, vwap_num}.
+    """
+    def _q(t) -> int:
+        try:
+            return int(t.get("quantity", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _price(p) -> float:
+        p = p or {}
+        return float(p.get("units", 0) or 0) + float(p.get("nano", 0) or 0) / 1e9
+
+    def _msk_minute(iso: str):
+        try:
+            dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        return (dt + timedelta(hours=tz_shift_h)).strftime("%Y-%m-%dT%H:%M")
+
+    def _session(mk: str) -> str:
+        m = int(mk[11:13]) * 60 + int(mk[14:16])
+        if m < 9 * 60 + 50:
+            return "morning"
+        if m < 19 * 60:
+            return "main"
+        return "evening"
+
+    acc: dict = {}
+    new_n = 0
+    for t in trades:
+        ts = t.get("time")
+        if not ts or (since_ts is not None and ts <= since_ts):
+            continue
+        q = _q(t)
+        if q <= 0:
+            continue
+        mk = _msk_minute(ts)
+        if not mk:
+            continue
+        new_n += 1
+        price = _price(t.get("price"))
+        cell = acc.setdefault(mk, {"ts": mk, "session": _session(mk),
+                                   "buy_volume": 0, "sell_volume": 0,
+                                   "trade_count": 0, "max_trade": 0,
+                                   "vwap_num": 0.0})
+        cell["trade_count"] += 1
+        cell["max_trade"] = max(cell["max_trade"], q)
+        cell["vwap_num"] += price * q
+        d = t.get("direction")
+        if d == "TRADE_DIRECTION_BUY":
+            cell["buy_volume"] += q
+        elif d == "TRADE_DIRECTION_SELL":
+            cell["sell_volume"] += q
+    all_ts = [t.get("time") for t in trades if t.get("time")]
+    watermark = max(all_ts) if all_ts else since_ts
+    return {"rows": [acc[k] for k in sorted(acc)],
+            "watermark": watermark, "new": new_n}

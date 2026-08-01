@@ -380,6 +380,35 @@ async def get_feed(ticker: Optional[str] = None, source: Optional[str] = None,
     return {"events": events, "count": len(events)}
 
 
+@app.get("/api/flow/{ticker}", summary="Поток сделок по минутам, с дедупом")
+async def get_flow(ticker: str, day: Optional[str] = None, res: str = "1m"):
+    """
+    Поток сделок: buy/sell, дельта, НАКОПЛЕННАЯ дельта, число сделок, средний
+    размер, крупнейшая сделка, дисбаланс, VWAP минуты.
+
+    res: 1m | 5m | 15m | 30m | session
+    day: YYYY-MM-DD по МСК, по умолчанию сегодня
+
+    ПОЧЕМУ ОТДЕЛЬНЫЙ МАРШРУТ, А НЕ /api/feed. Лента отдаёт СНИМКИ, каждый из
+    которых содержит перекрывающееся окно сделок. Суммировать их нельзя:
+    31.07 накопленная дельта, посчитанная сложением снимков, оказалась завышена
+    в разы, и её пришлось выбросить. Здесь данные дедуплицированы на записи —
+    по времени последней учтённой сделки.
+
+    Производные считаются на чтении, а не хранятся: при смене определения
+    «крупной сделки» историю не придётся переписывать.
+    """
+    if not ticker_known(ticker):
+        raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
+    if res not in ("1m", "5m", "15m", "30m", "session"):
+        raise HTTPException(status_code=400,
+                            detail="res должен быть 1m, 5m, 15m, 30m или session")
+    d = day or (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d")
+    rows = await db.flow_series(ticker, d, res)
+    return {"ticker": ticker.upper(), "day": d, "res": res,
+            "count": len(rows), "rows": rows}
+
+
 @app.get("/api/feed/sources", summary="Активность источников базы знаний")
 async def get_feed_sources(minutes: int = 60):
     """Сколько событий по каждому источнику за последние N минут (панель «Источники»)."""
