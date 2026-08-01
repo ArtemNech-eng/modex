@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Стакан Лайв</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0c10; --panel: #12151c; --line: #1f242e;
+    --txt: #d6dae2; --dim: #6b7280; --hot: #e8eaee;
+    --up: #16c784; --down: #ea3943; --warn: #f0b90b; --note: #4d7cfe;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--txt);
+    font: 400 13px/1.5 'JetBrains Mono', ui-monospace, monospace;
+    padding: 0 5%;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 20px; flex-wrap: wrap;
+    padding: 22px 0 16px; border-bottom: 1px solid var(--line);
+  }
+  h1 { font-size: 15px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
+  .meta { color: var(--dim); font-size: 11px; }
+  .meta b { color: var(--txt); font-weight: 500; }
+  input {
+    background: var(--panel); border: 1px solid var(--line); color: var(--txt);
+    font: inherit; font-size: 12px; padding: 5px 9px; border-radius: 3px;
+    width: 340px;
+  }
+  input:focus { outline: none; border-color: var(--note); }
+
+  #grid {
+    display: grid; gap: 12px; padding: 16px 0 40px;
+    grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
+  }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 4px; padding: 13px 15px;
+  }
+  .card.stale { opacity: .45; }
+  .top { display: flex; justify-content: space-between; align-items: baseline; }
+  .tk { font-size: 16px; font-weight: 700; color: var(--hot); letter-spacing: .04em; }
+  .clock { color: var(--dim); font-size: 11px; }
+
+  .lbl {
+    color: var(--dim); font-size: 10px; letter-spacing: .16em;
+    text-transform: uppercase; margin: 12px 0 3px;
+  }
+  .big { font-size: 19px; font-weight: 500; color: var(--hot); }
+  .row { display: flex; justify-content: space-between; gap: 10px; }
+  .row span:last-child { color: var(--hot); }
+  .up { color: var(--up); } .down { color: var(--down); }
+  .warn { color: var(--warn); } .note { color: var(--note); }
+  .dim { color: var(--dim); }
+
+  .ev { border-left: 2px solid var(--warn); padding-left: 9px; margin: 4px 0; }
+  .ev .k { color: var(--warn); font-weight: 500; }
+  .ev .t { color: var(--dim); font-size: 11px; }
+  .ev .w { color: var(--txt); font-size: 11px; }
+  .empty { color: var(--dim); font-size: 11px; }
+  .age { font-size: 10px; }
+  footer { color: var(--dim); font-size: 11px; padding: 0 0 40px; line-height: 1.7; }
+  footer b { color: var(--warn); font-weight: 500; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Стакан Лайв</h1>
+  <span class="meta">память <b id="hz">—</b> · минуты <b id="hz2">—</b> · стрим <b id="st">—</b></span>
+  <input id="tks" spellcheck="false">
+</header>
+
+<div id="grid"></div>
+
+<footer>
+  Карточка <b>описывает состояние</b>, а не советует. Направления, целей и рекомендаций здесь нет:
+  что из этого предшествует движению цены — не измерено.<br>
+  Цена, уровни и текущая минута идут из памяти стрима — доли секунды. Всё, что считается по прошлым
+  минутам (3м, 5м, VWAP, структура, события) — до 20 секунд.<br>
+  «Структура» — описание последних пяти минут. 31.07 требование «структура вверх» для покупки на
+  откате измерялось <b>вредным</b>: t=−12.57, положительных дней 16%.
+</footer>
+
+<script>
+const DEF = "SBER,GAZP,LKOH,MTLR,MVID,DATA,VTBR,TATN";
+const box = document.getElementById("tks");
+box.value = new URLSearchParams(location.search).get("t") || DEF;
+let full = {};                      // тикер -> полная карточка (раз в 10 с)
+let light = {};                     // тикер -> лёгкая (раз в секунду)
+
+const tickers = () => box.value.toUpperCase().split(/[\s,]+/).filter(Boolean).slice(0, 16);
+const money = v => v == null ? "—"
+  : Math.abs(v) >= 1e6 ? (v / 1e6).toFixed(2) + " млн ₽"
+  : Math.abs(v) >= 1e3 ? (v / 1e3).toFixed(0) + " тыс ₽" : Math.round(v) + " ₽";
+const pct = v => v == null ? "—" : (v > 0 ? "+" : "") + v.toFixed(2) + "%";
+const cls = v => v == null ? "" : v > 0 ? "up" : v < 0 ? "down" : "";
+
+async function grab(tk, isLight) {
+  try {
+    const r = await fetch(`/api/book-live/${tk}` + (isLight ? "?light=true" : ""));
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) { return null; }
+}
+
+function level(l) {
+  if (!l) return '<div class="empty">крупных уровней не видно</div>';
+  const side = l.side === "bid" ? "BID" : "ASK";
+  let h = `<div class="row"><span>${side} ${l.price}</span><span>${money(l.peak_rub)}</span></div>`;
+  h += `<div class="row"><span class="dim">исполнено</span><span>${money(l.traded_rub)}</span></div>`;
+  h += `<div class="row"><span class="dim">сейчас стоит</span><span>${money(l.now_rub)}</span></div>`;
+  if (l.restored_count)
+    h += `<div class="row"><span class="dim">восстановился</span><span class="note">${l.restored_count} раз</span></div>`
+       + `<div class="row"><span class="dim">после возврата</span><span>${money(l.traded_since_restore_rub)}</span></div>`;
+  else if (l.gone_count)
+    h += `<div class="row"><span class="dim">уходил</span><span class="note">${l.gone_count} раз</span></div>`;
+  if (l.broken) h += `<div class="row"><span class="warn">уровень пробит</span><span></span></div>`;
+  return h;
+}
+
+function card(tk) {
+  const f = full[tk] || {}, l = light[tk] || {};
+  const age = l.packet_age_sec ?? f.packet_age_sec;
+  const stale = age == null || age > 90;
+  const m = l.minute_now || f.minute_now;
+  const price = (m && m.close) || f.price;
+  const fl = f.flow_5m;
+
+  let h = `<div class="top"><span class="tk">${tk}</span>`
+        + `<span class="clock">${l.at || f.at || "—"} · <span class="age ${age > 15 ? 'warn' : 'dim'}">`
+        + `${age == null ? "нет пакетов" : age.toFixed(1) + " с"}</span></span></div>`;
+
+  h += `<div class="lbl">цена</div><div class="big ${cls(f.change_3m_pct)}">`
+     + `${price != null ? price : "—"} <span style="font-size:12px">${pct(f.change_3m_pct)} / 3м</span></div>`;
+
+  h += `<div class="lbl">крупный уровень</div>${level((f.levels || [])[0])}`;
+
+  h += `<div class="lbl">поток за 5м</div>`;
+  h += fl
+    ? `<div class="row"><span class="dim">покупки</span><span class="${fl.buy_share > .5 ? 'up' : ''}">`
+      + `${(fl.buy_share * 100).toFixed(0)}%</span></div>`
+      + `<div class="row"><span class="dim">дельта</span><span class="${cls(fl.delta)}">${fl.delta}</span></div>`
+    : `<div class="empty">сделок нет</div>`;
+
+  h += `<div class="lbl">структура 5м · vwap</div>`;
+  h += `<div class="row"><span class="dim">${f.structure_5m || "—"}</span>`
+     + `<span class="${cls(f.vwap_dist_pct)}">${f.vwap_dist_atr14m != null ? (f.vwap_dist_atr14m > 0 ? "+" : "") + f.vwap_dist_atr14m + " ATR" : "—"}</span></div>`;
+
+  h += `<div class="lbl">события стакана</div>`;
+  const ev = f.events || [];
+  h += ev.length
+    ? ev.slice(0, 3).map(e => `<div class="ev"><span class="k">${e.kind}</span> `
+        + `<span class="t">${(e.ts || "").slice(11)}</span><div class="w">${e.why}</div></div>`).join("")
+    : `<div class="empty">событий нет</div>`;
+
+  if (f.source_note) h += `<div class="lbl warn">${f.source_note}</div>`;
+  return `<div class="card${stale ? " stale" : ""}">${h}</div>`;
+}
+
+function draw() {
+  document.getElementById("grid").innerHTML = tickers().map(card).join("");
+}
+
+async function tickLight() {
+  const t0 = performance.now();
+  const ts = tickers();
+  const res = await Promise.all(ts.map(tk => grab(tk, true)));
+  ts.forEach((tk, i) => { if (res[i]) light[tk] = res[i]; });
+  document.getElementById("hz").textContent = Math.round(performance.now() - t0) + " мс";
+  const any = res.find(Boolean);
+  document.getElementById("st").textContent = any ? (any.live ? "живой" : (any.reason || "нет")) : "нет ответа";
+  draw();
+}
+
+async function tickFull() {
+  const t0 = performance.now();
+  const ts = tickers();
+  const res = await Promise.all(ts.map(tk => grab(tk, false)));
+  ts.forEach((tk, i) => { if (res[i]) full[tk] = res[i]; });
+  document.getElementById("hz2").textContent = Math.round(performance.now() - t0) + " мс";
+  draw();
+}
+
+box.addEventListener("change", () => { full = {}; light = {}; tickFull(); tickLight(); });
+tickFull(); tickLight();
+setInterval(tickLight, 1000);
+setInterval(tickFull, 10000);
+</script>
+</body>
+</html>

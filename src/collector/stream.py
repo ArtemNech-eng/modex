@@ -338,6 +338,13 @@ class MarketStream:
         # полная, а не сумма.
         self.instance = uuid.uuid4().hex[:6]
         self.agg = Aggregator()
+        # Жизнь конкретных ценовых уровней. В book_minute лежит РАЗМЕР
+        # крупнейшей заявки, но не её ЦЕНА — поэтому «уровень 276.50 держали
+        # или сняли» по базе не узнать. Здесь это считается в памяти из тех же
+        # пакетов стакана, что уже приходят десять раз в секунду.
+        from src.analysis.level_tracker import LevelTracker
+        self.levels = LevelTracker()
+        self.lots: dict = {}          # тикер -> лотность, из ISS
         self.last_msg: dict = {}          # тикер -> время последнего пакета
         self.stats = {"connected_at": None, "reconnects": 0, "messages": 0,
                       "trades": 0, "trades_dealer": 0, "books": 0,
@@ -427,8 +434,11 @@ class MarketStream:
             src = ("dealer" if t.trade_source == TRADE_SOURCE_DEALER
                    else "exchange")
             when = t.time.ToDatetime().replace(tzinfo=timezone.utc)
-            self.agg.add_trade(tk, when, int(t.direction),
-                               quotation(t.price), int(t.quantity), source=src)
+            price = quotation(t.price)
+            self.agg.add_trade(tk, when, int(t.direction), price,
+                               int(t.quantity), source=src)
+            if src == "exchange":
+                self.levels.on_trade(tk, price, int(t.quantity))
             self.stats["trades_dealer" if src == "dealer" else "trades"] += 1
         elif name == "orderbook":
             ob = resp.orderbook
@@ -463,6 +473,13 @@ class MarketStream:
             self.agg.add_book(tk, when, bid, ask, bb, ba, source=src,
                               bid5=bid5, ask5=ask5,
                               bid_top=bid_top, ask_top=ask_top)
+            # Уровни отслеживаем только по БИРЖЕВОМУ стакану: дилерский это
+            # котировки брокера, там нет чужих заявок, которые можно съесть.
+            if src == "exchange":
+                self.levels.on_book(
+                    tk, msk_minute(when),
+                    [(quotation(o.price), int(o.quantity)) for o in bids],
+                    [(quotation(o.price), int(o.quantity)) for o in asks])
             self.stats["books_dealer" if src == "dealer" else "books"] += 1
         elif name == "candle":
             cd = resp.candle
@@ -581,6 +598,12 @@ class MarketStream:
     async def _flusher(self) -> None:
         while not self._stopped:
             await asyncio.sleep(self.flush_sec)
+            # Уровни, которых давно нет, вычищаются: иначе карта растёт весь
+            # день — цена ходит, и за сессию их набегают тысячи на бумагу.
+            try:
+                self.levels.prune(msk_minute(datetime.now(timezone.utc)))
+            except Exception as e:                           # noqa: BLE001
+                logger.debug("чистка уровней: %s", e)
             flow, book, candle = self.agg.drain()
             if not flow and not book and not candle:
                 continue
@@ -667,6 +690,7 @@ class MarketStream:
         return {
             **self.stats,
             "instance": self.instance,
+            "levels": self.levels.stats(),
             "tickers_subscribed": len(self.figis),
             "tickers_with_data": len(ages),
             "tickers_fresh_60s": fresh,

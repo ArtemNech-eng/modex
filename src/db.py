@@ -2535,6 +2535,29 @@ async def candle_series(ticker: str, day: str, res: str = "1m") -> list[dict]:
     return aggregate_candles(plain, step, ticker)
 
 
+async def minute_rows(ticker: str, day: str,
+                      source: str = "exchange") -> list[dict]:
+    """
+    Свести поток, стакан и свечи одной минуты в ОДНУ строку.
+
+    Нужно детектору событий: он смотрит на связки между потоком, стаканом и
+    ценой, а они лежат в трёх таблицах.
+
+    Минуты, которых нет ни в одной таблице, не появляются — пропуск означает
+    отсутствие торгов, и подставлять туда нули нельзя: это создало бы события
+    из ничего.
+    """
+    flow = await flow_series(ticker, day, "1m", source=source)
+    book = await book_series(ticker, day, "1m", source=source)
+    candles = await candle_series(ticker, day, "1m")
+    merged: dict = {}
+    for src in (flow, book, candles):
+        for r in src:
+            merged.setdefault(r["ts"], {"ts": r["ts"]}).update(
+                {k: v for k, v in r.items() if k not in ("ts", "ticker")})
+    return [merged[k] for k in sorted(merged)]
+
+
 async def flow_candle_check(ticker: str, day: str,
                             source: str = "exchange") -> dict:
     """

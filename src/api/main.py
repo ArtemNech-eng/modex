@@ -512,6 +512,161 @@ async def get_flow_check(ticker: str, day: Optional[str] = None,
     return await db.flow_candle_check(ticker, d, source=source)
 
 
+@app.get("/api/events/{ticker}", summary="События стакана: что произошло")
+async def get_book_events(ticker: str, day: Optional[str] = None,
+                          source: str = "exchange", kind: Optional[str] = None):
+    """
+    Детектор событий стакана. ОПИСЫВАЕТ, а не предсказывает.
+
+    «В 11:34 было поглощение» — факт о данных, проверяемый по числам, которые
+    приложены к каждому событию. «Значит цена пойдёт вверх» — утверждение,
+    которого здесь нет и не будет: в событии отсутствуют поля направления и силы
+    сигнала.
+
+    Зачем тогда. Вопрос «предшествует ли перекос стакана движению цены» нельзя
+    проверить, пока события не помечены. Сначала разметка, потом измерение, и
+    только потом правило — если измерение его поддержит. Неделей раньше порядок
+    был обратный: семь шагов с десятью метриками, придуманные до измерений, не
+    дали ничего и были удалены.
+
+    Типы: поглощение, съедание уровня, крупная заявка, снятие ликвидности,
+    восстановление уровня, агрессивные покупки и продажи, ускорение сделок,
+    расхождение цены и стакана, пробой после поглощения, ложный пробой,
+    истощение агрессора.
+
+    ВСЕ ПОРОГИ — ДОГАДКИ, ни один не измерен. Задаются параметрами запроса с тем
+    же именем, что в DEFAULTS модуля, например vol_mult=1.8.
+    """
+    if not ticker_known(ticker):
+        raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
+    if source not in FLOW_SOURCES:
+        raise HTTPException(status_code=400,
+                            detail=f"source: {', '.join(sorted(FLOW_SOURCES))}")
+    from src.analysis.book_events import detect, summarize, KINDS
+    if kind and kind not in KINDS:
+        raise HTTPException(status_code=400,
+                            detail=f"kind: {', '.join(KINDS)}")
+    d = day or (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d")
+    rows = await db.minute_rows(ticker, d, source=source)
+    events = detect(rows)
+    if kind:
+        events = [e for e in events if e["kind"] == kind]
+    return {"ticker": ticker.upper(), "day": d, "source": source,
+            "minutes": len(rows), "summary": summarize(events),
+            "events": events}
+
+
+@app.get("/api/book-live/{ticker}", summary="Стакан Лайв: одна карточка по бумаге")
+async def get_book_live(ticker: str, light: bool = False):
+    """
+    Всё про бумагу СЕЙЧАС одной карточкой: цена, событие стакана, жизнь
+    крупного уровня, односторонность потока, структура последних минут,
+    расстояние от VWAP.
+
+    ДВЕ РАЗНЫЕ СВЕЖЕСТИ, и это важно понимать.
+        доли секунды   цена, уровни, текущая минута — прямо из памяти стрима
+        до 20 секунд   всё, что считается по прошлым минутам: 3м, 5м, VWAP
+    Вторая группа за 20 секунд осмысленно не меняется, поэтому задержка там
+    безобидна. Первая — то, ради чего всё делалось.
+
+    ЧЕГО ЗДЕСЬ НЕТ. Направления, цели, рекомендации. Карточка описывает
+    состояние. Что из этого предсказывает движение — не измерено, и до
+    измерения таких полей не появится.
+
+    СТРУКТУРА последних минут отдаётся как ОПИСАНИЕ, а не как совет. Отдельно
+    стоит помнить: 31.07 требование «структура вверх» для покупки на откате
+    измерялось ВРЕДНЫМ — t=-12.57, положительных дней 16%. Наличие поля не
+    означает, что по нему надо действовать.
+    """
+    if not ticker_known(ticker):
+        raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
+    tk = ticker.upper()
+    from src.collector.stream import CURRENT
+    from src.analysis.book_events import detect
+    from config.settings import STREAM_ENABLED
+
+    now = datetime.now(timezone.utc) + timedelta(hours=3)
+    out = {"ticker": tk, "at": now.strftime("%H:%M:%S"), "live": False}
+    if CURRENT is None:
+        out["reason"] = ("стрим выключен" if not STREAM_ENABLED
+                         else "стрим ещё не поднялся")
+        return out
+    out["live"] = True
+
+    # ── из памяти: доли секунды ──────────────────────────────────────────────
+    snap = CURRENT.agg.snapshot(tk)
+    age = CURRENT.last_msg.get(tk)
+    out["packet_age_sec"] = (round((datetime.now(timezone.utc) - age).total_seconds(), 2)
+                             if age else None)
+    out["minute_now"] = snap.get("candle")
+    lot = int((CURRENT.lots or {}).get(tk) or 1)
+    out["lot"] = lot
+    out["levels"] = CURRENT.levels.notable(tk, lot=lot, top=1)
+
+    # ── по прошлым минутам: до 20 секунд ─────────────────────────────────────
+    #
+    # light=true отдаёт ТОЛЬКО память и не ходит в базу.
+    #
+    # Зачем. Экран обновляется раз в секунду; на восьми бумагах полная карточка
+    # дала бы 24 запроса к SQLite в секунду — на три таблицы каждая. При этом
+    # всё, что считается по прошлым минутам (3м, 5м, VWAP, структура), за
+    # секунду осмысленно не меняется. Поэтому страница берёт лёгкую версию
+    # каждую секунду, а полную раз в десять.
+    if light:
+        return out
+    day = now.strftime("%Y-%m-%d")
+    rows = await db.minute_rows(tk, day, source="exchange")
+    if not rows:
+        # На закрытой бирже биржевых минут нет вовсе. Показываем дилерские, но
+        # ЯВНО помечаем: это котировки брокера, а не рынок.
+        rows = await db.minute_rows(tk, day, source="dealer")
+        out["source_note"] = "биржевых данных нет, показаны дилерские"
+
+    closes = [r["close"] for r in rows if r.get("close")]
+    out["price"] = closes[-1] if closes else None
+    for n in (3, 5, 15):
+        if len(closes) > n and closes[-n - 1]:
+            out[f"change_{n}m_pct"] = round(
+                (closes[-1] - closes[-n - 1]) / closes[-n - 1] * 100, 3)
+
+    # СТРУКТУРА последних пяти минут: описание, не совет.
+    last5 = [r for r in rows[-5:] if r.get("high") and r.get("low")]
+    if len(last5) >= 3:
+        hh = last5[-1]["high"] > last5[0]["high"]
+        hl = last5[-1]["low"] > last5[0]["low"]
+        out["structure_5m"] = ("выше по максимумам и минимумам" if hh and hl
+                               else "ниже по максимумам и минимумам"
+                               if not hh and not hl else "смешанная")
+
+    # ОДНОСТОРОННОСТЬ ПОТОКА за пять минут, относительно своей же нормы.
+    tail = rows[-5:]
+    b = sum((r.get("buy_volume") or 0) for r in tail)
+    sv = sum((r.get("sell_volume") or 0) for r in tail)
+    if b + sv > 0:
+        out["flow_5m"] = {"buy": b, "sell": sv,
+                          "buy_share": round(b / (b + sv), 4),
+                          "delta": b - sv}
+
+    # РАССТОЯНИЕ ОТ VWAP. В процентах и в средних минутных диапазонах — не в
+    # дневном ATR: дневного здесь нет, и подменять одно другим нельзя.
+    vw = [r for r in rows if r.get("vwap")]
+    if vw and closes:
+        v = vw[-1]["vwap"]
+        rngs = [r["high"] - r["low"] for r in rows[-14:]
+                if r.get("high") and r.get("low") and r["high"] > r["low"]]
+        out["vwap"] = v
+        out["vwap_dist_pct"] = round((closes[-1] - v) / v * 100, 3)
+        if rngs:
+            atr = sum(rngs) / len(rngs)
+            out["vwap_dist_atr14m"] = round((closes[-1] - v) / atr, 2) if atr else None
+
+    # СОБЫТИЯ последних минут, свежайшее первым.
+    events = detect(rows)
+    out["events"] = list(reversed(events))[:5]
+    out["minutes_today"] = len(rows)
+    return out
+
+
 @app.get("/api/live/{ticker}", summary="Прямо сейчас: из памяти, без ожидания сброса")
 async def get_live(ticker: str):
     """
@@ -2325,6 +2480,16 @@ async def ai_correlations():
 @app.get("/", include_in_schema=False)
 async def serve_dashboard():
     return FileResponse("dashboard/index.html")
+
+
+@app.get("/book-live", include_in_schema=False)
+async def serve_book_live():
+    """
+    Отдельная страница, а не вкладка в основном дашборде: у неё другой ритм
+    обновления (раз в секунду против минут) и другая задача — смотреть, а не
+    разбираться. Смешивать их значило бы гонять тяжёлый дашборд каждую секунду.
+    """
+    return FileResponse("dashboard/book-live.html")
 
 
 # ─── Запуск ───────────────────────────────────────────────────────────────────

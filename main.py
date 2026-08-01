@@ -559,6 +559,24 @@ async def stream_pipeline():
             logger.debug(f"figi {t}: {e}")
         await asyncio.sleep(0.1)
     logger.info(f"Стрим: разрешено {len(figis)} из {len(tickers)} бумаг")
+
+    # ЛОТНОСТЬ из ISS. Нужна, чтобы отдавать объёмы в рублях: у SBER лот 1, у
+    # GAZP 10, у UGLD 1000 — «1000 лотов» у них отличается на три порядка и само
+    # по себе не значит ничего. ISS отдаёт LOTSIZE бесплатно и без токена, одним
+    # запросом на всю доску, поэтому лишней зависимости от Tinkoff тут нет.
+    def _lots():
+        import urllib.request as u, json as j
+        url = ("https://iss.moex.com/iss/engines/stock/markets/shares/boards/"
+               "TQBR/securities.json?iss.meta=off&securities.columns=SECID,LOTSIZE")
+        d = j.load(u.urlopen(url, timeout=30))["securities"]
+        i = {k: n for n, k in enumerate(d["columns"])}
+        return {r[i["SECID"]]: int(r[i["LOTSIZE"]] or 1) for r in d["data"]}
+    try:
+        lots = await asyncio.to_thread(_lots)
+        logger.info(f"Лотность из ISS: {len(lots)} бумаг")
+    except Exception as e:                                       # noqa: BLE001
+        logger.warning(f"Лотность из ISS не получена ({e}) — объёмы в лотах")
+        lots = {}
     if not figis:
         logger.error("Стрим: ни одной бумаги не разрешено, выхожу")
         return
@@ -590,6 +608,7 @@ async def stream_pipeline():
     # ВЫЗОВА, а первый вызов случится не раньше первого сброса.
     stream = MarketStream(TINKOFF_TOKEN, figis, depth=STREAM_DEPTH,
                           flush_sec=STREAM_FLUSH_SEC, on_flush=_flush)
+    stream.lots = lots
     await stream.run()
 
 
