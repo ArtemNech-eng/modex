@@ -343,6 +343,43 @@ class FlowMinute(Base):
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+class BookMinute(Base):
+    """
+    Стакан, свёрнутый до ОДНОЙ МИНУТЫ.
+
+    Почему не строка на пакет. В потоке стакан приходит до десяти раз в секунду
+    на бумагу: на 80 бумагах это до 800 строк в секунду. Такая подробность не
+    нужна ни для какого решения — важно, каким был перекос в течение минуты и
+    менялся ли он внутри неё.
+
+    Хранятся СУММЫ, а не средние: среднее нельзя усреднить повторно при склейке
+    минут в пятиминутки, а сумму сложить можно. Доли и средний спред считаются
+    на чтении.
+
+    imb_min/imb_max — размах доли покупателей внутри минуты. Одно среднее
+    скрывает разворот: минута, где стакан был сначала 80% на покупку, а потом
+    20%, даёт то же среднее, что и ровные 50%.
+
+    Объёмы в ЛОТАХ, как и всё остальное, что приходит от биржи.
+    """
+    __tablename__ = "book_minute"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)   # "YYYY-MM-DDTHH:MM:TICKER"
+    ts: Mapped[str] = mapped_column(String(16), index=True)          # МСК
+    ticker: Mapped[str] = mapped_column(String(32), index=True)
+    session: Mapped[str] = mapped_column(String(8), default="main")
+    updates: Mapped[int] = mapped_column(Integer, default=0)         # пакетов за минуту
+    bid_vol_sum: Mapped[float] = mapped_column(Float, default=0.0)
+    ask_vol_sum: Mapped[float] = mapped_column(Float, default=0.0)
+    spread_sum: Mapped[float] = mapped_column(Float, default=0.0)
+    best_bid: Mapped[float] = mapped_column(Float, default=0.0)      # на конец минуты
+    best_ask: Mapped[float] = mapped_column(Float, default=0.0)
+    imb_min: Mapped[float] = mapped_column(Float, default=0.0)
+    imb_max: Mapped[float] = mapped_column(Float, default=0.0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 class SignalAttempt(Base):
     """
     ЖУРНАЛ ПОПЫТОК (наблюдаемость воронки сигналов).
@@ -2116,6 +2153,135 @@ async def prune_flow_minute(keep_days: int = 90) -> int:
     async with async_session() as session:
         result = await session.execute(
             delete(FlowMinute).where(FlowMinute.ts < cutoff))
+        await session.commit()
+        return result.rowcount or 0
+
+
+async def merge_book_minutes(ticker: str, rows: list[dict]) -> int:
+    """
+    Влить минутные срезы стакана. Складывает в существующие минуты.
+
+    Задвоения здесь бояться не нужно: поток отдаёт каждый пакет один раз, а
+    накопитель обнуляется при выгрузке. Опасность обратная — дыра при обрыве,
+    и её видно по разрыву минут и счётчику обрывов в диагностике.
+    """
+    if not rows:
+        return 0
+    n = 0
+    try:
+        async with async_session() as session:
+            for r in rows:
+                key = f"{r['ts']}:{ticker.upper()}"
+                row = await session.get(BookMinute, key)
+                if row is None:
+                    # Значения ЯВНО, а не через default колонки: до записи в
+                    # базу они остались бы None и накопление упало бы на
+                    # «NoneType + float». Та же ошибка уже была в flow_minute.
+                    row = BookMinute(key=key, ts=r["ts"], ticker=ticker.upper(),
+                                     session=r.get("session") or "main",
+                                     updates=0, bid_vol_sum=0.0, ask_vol_sum=0.0,
+                                     spread_sum=0.0, best_bid=0.0, best_ask=0.0,
+                                     imb_min=float(r.get("imb_min") or 0.0),
+                                     imb_max=float(r.get("imb_max") or 0.0))
+                    session.add(row)
+                row.updates += int(r.get("updates") or 0)
+                row.bid_vol_sum += float(r.get("bid_vol_sum") or 0.0)
+                row.ask_vol_sum += float(r.get("ask_vol_sum") or 0.0)
+                row.spread_sum += float(r.get("spread_sum") or 0.0)
+                if r.get("best_bid"):
+                    row.best_bid = float(r["best_bid"])
+                if r.get("best_ask"):
+                    row.best_ask = float(r["best_ask"])
+                row.imb_min = min(row.imb_min, float(r.get("imb_min") or 0.0))
+                row.imb_max = max(row.imb_max, float(r.get("imb_max") or 0.0))
+                row.updated_at = datetime.now(timezone.utc)
+                n += 1
+            await session.commit()
+    except Exception as e:                                       # noqa: BLE001
+        logger.debug(f"merge_book_minutes {ticker}: {e}")
+        return 0
+    return n
+
+
+def aggregate_book(rows: list[dict], step: int, ticker: str = "") -> list[dict]:
+    """
+    Склейка минут стакана в бары нужного шага. ЧИСТАЯ функция — тестируется
+    без базы.
+
+    bid_share — доля покупателей в объёме стакана. Это и есть ответ на вопрос
+    «объёмы продавцы или покупатели». Считается из СУММ, поэтому склейка
+    корректна: доли усреднять нельзя, суммы складываются.
+
+    flipped — был ли внутри интервала разворот перекоса через середину. Ровная
+    минута и минута с разворотом дают одинаковое среднее, но означают разное.
+    """
+    if not rows:
+        return []
+    buckets: dict = {}
+    order: list = []
+    for r in rows:
+        ts = r["ts"]
+        mm = int(ts[11:13]) * 60 + int(ts[14:16])
+        k = mm // step
+        if k not in buckets:
+            buckets[k] = {"ts": ts, "upd": 0, "bid": 0.0, "ask": 0.0,
+                          "spread": 0.0, "bb": 0.0, "ba": 0.0,
+                          "lo": r.get("imb_min", 0.5), "hi": r.get("imb_max", 0.5),
+                          "session": r.get("session") or "main"}
+            order.append(k)
+        b = buckets[k]
+        b["upd"] += r.get("updates") or 0
+        b["bid"] += r.get("bid_vol_sum") or 0.0
+        b["ask"] += r.get("ask_vol_sum") or 0.0
+        b["spread"] += r.get("spread_sum") or 0.0
+        if r.get("best_bid"):
+            b["bb"] = r["best_bid"]
+        if r.get("best_ask"):
+            b["ba"] = r["best_ask"]
+        b["lo"] = min(b["lo"], r.get("imb_min", 0.5))
+        b["hi"] = max(b["hi"], r.get("imb_max", 0.5))
+    out = []
+    for k in order:
+        b = buckets[k]
+        tot = b["bid"] + b["ask"]
+        out.append({
+            "ts": b["ts"], "ticker": ticker.upper(), "session": b["session"],
+            "updates": b["upd"],
+            "bid_volume": round(b["bid"], 1), "ask_volume": round(b["ask"], 1),
+            "bid_share": round(b["bid"] / tot, 4) if tot else None,
+            "imbalance": round((b["bid"] - b["ask"]) / tot, 4) if tot else None,
+            "imb_min": round(b["lo"], 4), "imb_max": round(b["hi"], 4),
+            "flipped": bool(b["lo"] < 0.5 < b["hi"]),
+            "avg_spread": round(b["spread"] / b["upd"], 6) if b["upd"] else None,
+            "best_bid": b["bb"] or None, "best_ask": b["ba"] or None,
+        })
+    return out
+
+
+async def book_series(ticker: str, day: str, res: str = "1m") -> list[dict]:
+    """Стакан по бумаге за день. res: 1m | 5m | 15m | 30m | session."""
+    step = FLOW_RES.get(res, 1)
+    async with async_session() as session:
+        q = (select(BookMinute)
+             .where(BookMinute.ticker == ticker.upper(),
+                    BookMinute.ts.like(f"{day}%"))
+             .order_by(BookMinute.ts))
+        rows = (await session.execute(q)).scalars().all()
+    plain = [{"ts": r.ts, "session": r.session, "updates": r.updates,
+              "bid_vol_sum": r.bid_vol_sum, "ask_vol_sum": r.ask_vol_sum,
+              "spread_sum": r.spread_sum, "best_bid": r.best_bid,
+              "best_ask": r.best_ask, "imb_min": r.imb_min,
+              "imb_max": r.imb_max} for r in rows]
+    return aggregate_book(plain, step, ticker)
+
+
+async def prune_book_minute(keep_days: int = 90) -> int:
+    """Чистка минутного стакана, тем же сроком, что и поток сделок."""
+    cutoff = (datetime.now(timezone.utc) + timedelta(hours=3)
+              - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+    async with async_session() as session:
+        result = await session.execute(
+            delete(BookMinute).where(BookMinute.ts < cutoff))
         await session.commit()
         return result.rowcount or 0
 

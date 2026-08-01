@@ -327,7 +327,8 @@ async def market_snapshot_pipeline():
     """
     from config.settings import (TINKOFF_TOKEN, MOEX_TICKERS, SNAPSHOT_MAX,
                                   SNAPSHOT_PACING_SEC, SNAPSHOT_CORE,
-                                  SNAPSHOT_TAIL_PER_CYCLE, FLOW_MINUTE_KEEP_DAYS)
+                                  SNAPSHOT_TAIL_PER_CYCLE, FLOW_MINUTE_KEEP_DAYS,
+                                  STREAM_ENABLED, BOOK_MINUTE_KEEP_DAYS)
     from src.analysis.intraday import session_phase
     from src.analysis.universe import cached_universe, split_core_tail
     await db.setup_db()
@@ -445,16 +446,22 @@ async def market_snapshot_pipeline():
                             # Footprint группирует по цене и живёт три дня; из него
                             # нельзя получить ни 1m/5m/15m, ни число сделок, ни
                             # размеры. Здесь ключ — минута, хранение 90 дней.
-                            try:
-                                from src.collector.tinkoff_client import minute_buckets
-                                wm = await db.get_flow_watermark(t, day)
-                                mb = minute_buckets(raw, wm)
-                                if mb["new"]:
-                                    n = await db.merge_flow_minutes(
-                                        t, mb["rows"], mb["watermark"])
-                                    written["flow_min"] = written.get("flow_min", 0) + n
-                            except Exception as e:
-                                logger.debug(f"flow_minute {t}: {e}")
+                            #
+                            # При включённом стриме ЭТУ запись делает он, и
+                            # опрос сюда не пишет: обе ветки складывают объём в
+                            # ту же минуту, и вместе они дали бы двойной счёт.
+                            if not STREAM_ENABLED:
+                                try:
+                                    from src.collector.tinkoff_client import minute_buckets
+                                    wm = await db.get_flow_watermark(t, day)
+                                    mb = minute_buckets(raw, wm)
+                                    if mb["new"]:
+                                        n = await db.merge_flow_minutes(
+                                            t, mb["rows"], mb["watermark"])
+                                        written["flow_min"] = (
+                                            written.get("flow_min", 0) + n)
+                                except Exception as e:
+                                    logger.debug(f"flow_minute {t}: {e}")
                         await db.add_event({"source": "tinkoff", "kind": "trades",
                                             "ticker": t, "payload": tr, "ts": ts})
                         written["trades"] += 1
@@ -499,11 +506,73 @@ async def market_snapshot_pipeline():
                 # Минутный поток живёт дольше: ради него всё и затевалось,
                 # на трёх днях проверить нельзя ничего.
                 await db.prune_flow_minute(keep_days=FLOW_MINUTE_KEEP_DAYS)
+                await db.prune_book_minute(keep_days=BOOK_MINUTE_KEEP_DAYS)
         except Exception as e:
             logger.debug(f"market snapshot: {e}")
         # В сессию — частые снимки (90с); вне сессии — редкие (300с): экономим API,
         # т.к. стакан/поток вне торгов не меняются.
         await asyncio.sleep(90 if open_now else 300)
+
+
+async def stream_pipeline():
+    """
+    Постоянное соединение с биржей: сделки и стакан по ВСЕМ бумагам сразу.
+
+    Заменяет опрос по кругу, который давал ядру снимок раз в ~5 минут, а хвосту
+    раз в ~43 (замер 01.08). Опрос при этом продолжает работать рядом: он
+    собирает свечи и котировки и остаётся страховкой, если стрим не пойдёт.
+    Чтобы поток сделок не записался дважды, при включённом стриме опрос НЕ
+    пишет flow_minute — см. market_snapshot_pipeline.
+    """
+    from config.settings import (TINKOFF_TOKEN, STREAM_ENABLED, STREAM_DEPTH,
+                                 STREAM_FLUSH_SEC, MOEX_TICKERS, SNAPSHOT_MAX)
+    if not STREAM_ENABLED:
+        logger.info("Стрим выключен (STREAM_ENABLED=false), работает опрос")
+        return
+    if not TINKOFF_TOKEN:
+        logger.warning("Стрим включён, но токена нет — пропускаю")
+        return
+
+    from src.analysis.universe import cached_universe
+    from src.collector.stream import MarketStream
+    from src.collector.tinkoff_client import TinkoffClient
+
+    static_tickers = list(MOEX_TICKERS.keys())
+    uni = await asyncio.to_thread(
+        cached_universe,
+        max_n=(SNAPSHOT_MAX if SNAPSHOT_MAX > 0 else 80),
+        fallback=static_tickers)
+    tickers = uni["tickers"]
+
+    # FIGI резолвится ТОЛЬКО через API. Рукописной таблицы здесь нет: 30.07
+    # выяснилось, что в прежней 22 записи из 43 указывали на чужие инструменты.
+    client = TinkoffClient(TINKOFF_TOKEN)
+    figis: dict = {}
+    for t in tickers:
+        try:
+            f = await client.get_figi(t)
+            if f:
+                figis[t] = f
+        except Exception as e:                                   # noqa: BLE001
+            logger.debug(f"figi {t}: {e}")
+        await asyncio.sleep(0.1)
+    logger.info(f"Стрим: разрешено {len(figis)} из {len(tickers)} бумаг")
+    if not figis:
+        logger.error("Стрим: ни одной бумаги не разрешено, выхожу")
+        return
+
+    async def _flush(flow: dict, book: dict):
+        nf = nb = 0
+        for tk, rows in flow.items():
+            nf += await db.merge_flow_minutes(tk, rows, None)
+        for tk, rows in book.items():
+            nb += await db.merge_book_minutes(tk, rows)
+        if nf or nb:
+            logger.debug(f"стрим записал: поток {nf}, стакан {nb}")
+
+    stream = MarketStream(TINKOFF_TOKEN, figis, depth=STREAM_DEPTH,
+                          flush_sec=STREAM_FLUSH_SEC, on_flush=_flush)
+    await stream.run()
 
 
 async def run():
@@ -538,6 +607,7 @@ async def run():
         _safe("pulse", pulse_pipeline()),
         _safe("rss", rss_pipeline()),
         _safe("market", market_snapshot_pipeline()),
+        _safe("stream", stream_pipeline()),
     )
 
 

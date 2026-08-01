@@ -409,6 +409,57 @@ async def get_flow(ticker: str, day: Optional[str] = None, res: str = "1m"):
             "count": len(rows), "rows": rows}
 
 
+@app.get("/api/book/{ticker}", summary="Стакан по минутам: кого больше, покупателей или продавцов")
+async def get_book(ticker: str, day: Optional[str] = None, res: str = "1m"):
+    """
+    Перекос стакана с разрешением до минуты.
+
+    bid_share — доля покупателей в объёме стакана. Это прямой ответ на вопрос
+    «объёмы продавцы или покупатели».
+
+    flipped — был ли внутри интервала разворот перекоса через середину. Одно
+    среднее это скрывает: минута, где стакан был сначала 80% на покупку, а
+    потом 20%, даёт то же среднее, что и ровные 50%.
+
+    ОТКУДА ДАННЫЕ. Только из постоянного соединения (STREAM_ENABLED). Опрос
+    REST сюда не пишет: он давал один снимок раз в 5-43 минуты, а по одной
+    точке нельзя увидеть ни перекоса в течение минуты, ни разворота.
+
+    res: 1m | 5m | 15m | 30m | session
+    """
+    if not ticker_known(ticker):
+        raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
+    if res not in ("1m", "5m", "15m", "30m", "session"):
+        raise HTTPException(status_code=400,
+                            detail="res должен быть 1m, 5m, 15m, 30m или session")
+    d = day or (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d")
+    rows = await db.book_series(ticker, d, res)
+    return {"ticker": ticker.upper(), "day": d, "res": res,
+            "count": len(rows), "rows": rows}
+
+
+@app.get("/api/stream/health", summary="Жив ли поток и по каким бумагам")
+async def stream_health():
+    """
+    Возраст последнего пакета ПО КАЖДОЙ бумаге.
+
+    Без этого «работает ли сбор» узнаётся только по косвенным признакам. На
+    прошлой неделе полдня ушло на то, чтобы понять, что сбор молча стоял, и
+    ещё раз — что стакана нет у половины списка. Здесь это видно сразу.
+
+    Ключевые поля: tickers_fresh_60s (сколько бумаг обновлялись за последнюю
+    минуту), oldest_sec (самая застоявшаяся), reconnects (обрывы — каждый это
+    ДЫРА в данных, а не задвоение).
+    """
+    from src.collector.stream import CURRENT
+    from config.settings import STREAM_ENABLED
+    if CURRENT is None:
+        return {"enabled": STREAM_ENABLED, "running": False,
+                "reason": ("выключен флагом STREAM_ENABLED" if not STREAM_ENABLED
+                           else "включён, но ещё не поднялся или упал при старте")}
+    return {"enabled": True, "running": True, **CURRENT.health()}
+
+
 @app.get("/api/feed/sources", summary="Активность источников базы знаний")
 async def get_feed_sources(minutes: int = 60):
     """Сколько событий по каждому источнику за последние N минут (панель «Источники»)."""
