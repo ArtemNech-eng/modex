@@ -437,8 +437,7 @@ class MarketStream:
             price = quotation(t.price)
             self.agg.add_trade(tk, when, int(t.direction), price,
                                int(t.quantity), source=src)
-            if src == "exchange":
-                self.levels.on_trade(tk, price, int(t.quantity))
+            self.levels.on_trade(tk, price, int(t.quantity), source=src)
             self.stats["trades_dealer" if src == "dealer" else "trades"] += 1
         elif name == "orderbook":
             ob = resp.orderbook
@@ -473,13 +472,14 @@ class MarketStream:
             self.agg.add_book(tk, when, bid, ask, bb, ba, source=src,
                               bid5=bid5, ask5=ask5,
                               bid_top=bid_top, ask_top=ask_top)
-            # Уровни отслеживаем только по БИРЖЕВОМУ стакану: дилерский это
-            # котировки брокера, там нет чужих заявок, которые можно съесть.
-            if src == "exchange":
-                self.levels.on_book(
-                    tk, msk_minute(when),
-                    [(quotation(o.price), int(o.quantity)) for o in bids],
-                    [(quotation(o.price), int(o.quantity)) for o in asks])
+            # Оба источника, но РАЗДЕЛЬНО. Первая версия брала только биржевой
+            # и на закрытой бирже оставалась пустой: проверить механику до
+            # понедельника было нельзя, а непроверенное лучше не считать готовым.
+            self.levels.on_book(
+                tk, msk_minute(when),
+                [(quotation(o.price), int(o.quantity)) for o in bids],
+                [(quotation(o.price), int(o.quantity)) for o in asks],
+                source=src)
             self.stats["books_dealer" if src == "dealer" else "books"] += 1
         elif name == "candle":
             cd = resp.candle

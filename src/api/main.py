@@ -615,12 +615,28 @@ async def get_book_live(ticker: str, light: bool = False):
     if light:
         return out
     day = now.strftime("%Y-%m-%d")
-    rows = await db.minute_rows(tk, day, source="exchange")
-    if not rows:
-        # На закрытой бирже биржевых минут нет вовсе. Показываем дилерские, но
-        # ЯВНО помечаем: это котировки брокера, а не рынок.
-        rows = await db.minute_rows(tk, day, source="dealer")
-        out["source_note"] = "биржевых данных нет, показаны дилерские"
+    src = "exchange"
+    rows = await db.minute_rows(tk, day, source=src)
+
+    # ОТКАТ НА ДИЛЕРСКИЕ проверяется по НАЛИЧИЮ ПОТОКА И СТАКАНА, а не по тому,
+    # пусты ли строки вообще.
+    #
+    # Здесь была ошибка. Свечи источником не фильтруются — они одни на бумагу.
+    # Поэтому при закрытой бирже minute_rows возвращал 51 строку из одних свечей,
+    # проверка «если строк нет» не срабатывала, и наружу шла картина без потока,
+    # без стакана и без VWAP — но и без пометки, что биржевых данных нет.
+    # Молчаливая пустота хуже честной пометки.
+    def _has_flow(rs):
+        return any(r.get("buy_volume") or r.get("bid_share") for r in rs)
+    if not _has_flow(rows):
+        dealer = await db.minute_rows(tk, day, source="dealer")
+        if _has_flow(dealer):
+            rows, src = dealer, "dealer"
+            out["source_note"] = "биржевых данных нет, показаны дилерские"
+        else:
+            out["source_note"] = "ни биржевых, ни дилерских данных потока нет"
+    out["source"] = src
+    out["levels"] = CURRENT.levels.notable(tk, lot=lot, top=1, source=src)
 
     closes = [r["close"] for r in rows if r.get("close")]
     out["price"] = closes[-1] if closes else None

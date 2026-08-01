@@ -241,18 +241,22 @@ def test_no_direction_or_recommendation_in_output():
 
 # ─── подключение к стриму и экрану ────────────────────────────────────────────
 
-def test_tracker_is_fed_only_by_exchange_book():
+def test_tracker_is_fed_with_the_source_label():
     """
-    Дилерский стакан — котировки брокера. Там нет чужих заявок, которые можно
-    съесть, и жизнь уровня в нём означает не то же самое.
+    Дилерский стакан — котировки брокера, и жизнь уровня в нём означает не то же
+    самое. Но отбрасывать его нельзя: первая версия так и делала, и на закрытой
+    бирже трекер оставался пустым — механику нельзя было проверить до
+    понедельника. Пишем оба, помечая источник.
     """
     import pathlib
     root = pathlib.Path(__file__).resolve().parents[1]
     src = (root / "src/collector/stream.py").read_text()
     i = src.index("self.levels.on_book")
-    assert 'if src == "exchange"' in src[max(0, i - 300):i]
+    assert "source=src" in src[i:i + 400], "источник передаётся в трекер"
     j = src.index("self.levels.on_trade")
-    assert 'if src == "exchange"' in src[max(0, j - 200):j]
+    assert "source=src" in src[j:j + 200]
+    assert 'if src == "exchange":\n                self.levels' not in src, \
+        "дилерский больше не отбрасывается"
 
 
 def test_lot_size_comes_from_iss_not_from_a_hand_table():
@@ -293,3 +297,36 @@ def test_page_says_it_describes_and_does_not_advise():
     assert "описывает состояние" in page
     assert "не измерено" in page
     assert "вредным" in page, "и про измеренный вред структуры тоже"
+
+
+def test_sources_are_tracked_separately():
+    """
+    Первая версия кормила трекер ТОЛЬКО биржевым стаканом, и на закрытой бирже он
+    оставался пустым — проверить механику до понедельника было нельзя. Теперь
+    отслеживаются оба, но раздельно: дилерский это котировки брокера, там нет
+    чужих заявок, которые можно съесть.
+    """
+    t = LevelTracker()
+    t.on_book("SBER", "2026-08-03T10:00", [(276.50, 900)], [(276.60, 10)],
+              source="exchange")
+    t.on_book("SBER", "2026-08-03T10:00", [(276.50, 33)], [(276.60, 10)],
+              source="dealer")
+    ex = [x for x in t.notable("SBER", source="exchange") if x["side"] == "bid"][0]
+    de = [x for x in t.notable("SBER", source="dealer") if x["side"] == "bid"][0]
+    assert ex["peak_lots"] == 900 and de["peak_lots"] == 33
+    assert t.stats()["by_source"] == {"exchange": 2, "dealer": 2}
+    assert t.stats()["tickers"] == 1, "тикер один, источников два"
+
+
+def test_fallback_checks_for_flow_not_just_for_rows():
+    """
+    Регрессия. Свечи источником не фильтруются, поэтому при закрытой бирже
+    minute_rows возвращал строки из одних свечей: проверка «если строк нет» не
+    срабатывала, и наружу шла картина без потока и без пометки об этом.
+    """
+    import pathlib
+    api = (pathlib.Path(__file__).resolve().parents[1]
+           / "src/api/main.py").read_text()
+    assert "def _has_flow(rs)" in api
+    assert "if not _has_flow(rows):" in api
+    assert 'out["source"] = src' in api, "источник должен быть виден в ответе"

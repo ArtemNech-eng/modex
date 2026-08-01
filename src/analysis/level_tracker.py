@@ -49,7 +49,8 @@ class LevelTracker:
 
     # ─── приём данных ────────────────────────────────────────────────────────
 
-    def on_book(self, ticker: str, minute: str, bids: list, asks: list) -> None:
+    def on_book(self, ticker: str, minute: str, bids: list, asks: list,
+                source: str = "exchange") -> None:
         """
         bids/asks — списки (цена, лоты). Порядок не важен, сортируем сами.
 
@@ -62,6 +63,12 @@ class LevelTracker:
         tk = (ticker or "").upper()
         if not tk:
             return
+        # Источник в ключе. Дилерский стакан отслеживается ТОЖЕ, но отдельно:
+        # первая версия кормила трекер только биржевым, и на закрытой бирже он
+        # оставался пустым — проверить механику до понедельника было нельзя.
+        # Смешивать нельзя по той же причине, что и везде: дилерский это
+        # котировки брокера, там нет чужих заявок, которые можно съесть.
+        tk = f"{tk}|{source}"
         bb = max((p for p, q in bids if q > 0), default=0.0)
         ba = min((p for p, q in asks if q > 0), default=0.0)
         self.best[tk] = (bb, ba)
@@ -117,7 +124,8 @@ class LevelTracker:
         lv["peak"] = max(lv["peak"], qty)
         lv["last_seen"] = minute
 
-    def on_trade(self, ticker: str, price: float, qty: int) -> None:
+    def on_trade(self, ticker: str, price: float, qty: int,
+                 source: str = "exchange") -> None:
         """
         Сделка приписывается уровню по ТОЧНОЙ цене: биржевые цены стоят на сетке
         шага, поэтому совпадение точное и обходится без допусков.
@@ -130,6 +138,7 @@ class LevelTracker:
         p = round(float(price or 0), 6)
         if not tk or p <= 0 or qty <= 0:
             return
+        tk = f"{tk}|{source}"
         for side in ("bid", "ask"):
             lv = self.levels.get((tk, side, p))
             if lv is not None:
@@ -138,7 +147,8 @@ class LevelTracker:
 
     # ─── выдача ──────────────────────────────────────────────────────────────
 
-    def notable(self, ticker: str, lot: int = 1, top: int = 1) -> list:
+    def notable(self, ticker: str, lot: int = 1, top: int = 1,
+                source: str = "exchange") -> list:
         """
         Самые заметные уровни бумаги: по максимальному размеру, который на них
         когда-либо стоял.
@@ -146,7 +156,7 @@ class LevelTracker:
         Отдаётся в РУБЛЯХ. Лотность обязательна: у UGLD лот 1000, у SBER 1, и
         сравнивать их в лотах бессмысленно.
         """
-        tk = (ticker or "").upper()
+        tk = f"{(ticker or '').upper()}|{source}"
         lot = max(1, int(lot or 1))
         out = []
         for side in ("bid", "ask"):
@@ -194,5 +204,10 @@ class LevelTracker:
         return len(dead)
 
     def stats(self) -> dict:
+        by_source: dict = {}
+        for t, _, _ in self.levels:
+            src = t.split("|")[-1]
+            by_source[src] = by_source.get(src, 0) + 1
         return {"levels_tracked": len(self.levels),
-                "tickers": len({t for t, _, _ in self.levels})}
+                "tickers": len({t.split("|")[0] for t, _, _ in self.levels}),
+                "by_source": by_source}
