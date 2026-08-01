@@ -352,6 +352,7 @@ class MarketStream:
         self.ticks = TickRing()
         self.lots: dict = {}          # тикер -> лотность, из ISS
         self.steps: dict = {}         # тикер -> шаг цены, из ISS
+        self.atr: dict = {}           # тикер -> дневной ATR, из ISS
         self.last_msg: dict = {}          # тикер -> время последнего пакета
         self.stats = {"connected_at": None, "reconnects": 0, "messages": 0,
                       "trades": 0, "trades_dealer": 0, "books": 0,

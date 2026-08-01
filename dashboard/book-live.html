@@ -83,6 +83,10 @@
   Секундный ряд в базу не пишется: 4.9 млн строк в день и <b>35 ГБ за 90 дней</b> при 20 ГБ свободных.
   В базу уходят его свойства по минутам — размах перекоса, сколько лотов пришло и ушло, исполнение
   относительно лучшей цены.<br>
+  «Уровни с графика» — места, где цена разворачивалась, отсортированы по БЛИЗОСТИ к текущей цене.
+  Пометок «сильный» и «слабый» нет: сколько касаний делает уровень значимым — не измерено.<br>
+  ATR дня берётся из дневных свечей ISS; если его ещё нет, показывается средний диапазон за 14 минут
+  и это помечено.<br>
   «Структура» — описание последних пяти минут. 31.07 требование «структура вверх» для покупки на
   откате измерялось <b>вредным</b>: t=−12.57, положительных дней 16%.
 </footer>
@@ -136,8 +140,32 @@ function card(tk) {
         + `<span class="clock">${l.at || f.at || "—"} · <span class="age ${age > 15 ? 'warn' : 'dim'}">`
         + `${age == null ? "нет пакетов" : age.toFixed(1) + " с"}</span></span></div>`;
 
-  h += `<div class="lbl">цена</div><div class="big ${cls(f.change_3m_pct)}">`
-     + `${price != null ? price : "—"} <span style="font-size:12px">${pct(f.change_3m_pct)} / 3м</span></div>`;
+  h += `<div class="lbl">цена · 1м / 3м / 5м</div><div class="big ${cls(f.change_3m_pct)}">`
+     + `${price != null ? price : "—"}</div>`;
+  h += `<div class="row"><span class="${cls(f.change_1m_pct)}">${pct(f.change_1m_pct)}</span>`
+     + `<span class="${cls(f.change_3m_pct)}">${pct(f.change_3m_pct)}</span>`
+     + `<span class="${cls(f.change_5m_pct)}">${pct(f.change_5m_pct)}</span></div>`;
+
+  // КРАЙНОСТИ ДНЯ со временем: максимум на открытии и максимум минуту назад —
+  // разные ситуации, и без времени их не отличить.
+  const dy = f.day || {};
+  h += `<div class="lbl">день · где цена в диапазоне</div>`;
+  h += dy.high
+    ? `<div class="row"><span class="dim">макс ${dy.high} · ${(dy.high_ts||"").slice(11)}</span>`
+      + `<span>${dy.position != null ? (dy.position * 100).toFixed(0) + "%" : "—"}</span></div>`
+      + `<div class="row"><span class="dim">мин ${dy.low} · ${(dy.low_ts||"").slice(11)}</span>`
+      + `<span>${f.atr_day ? "ATR " + f.atr_day + " (" + f.atr_pct + "%)" : "—"}</span></div>`
+    : `<div class="empty">данных дня нет</div>`;
+
+  // ЛОКАЛЬНЫЕ УРОВНИ С ГРАФИКА — не из стакана. Порядок по близости к цене:
+  // сколько касаний делает уровень значимым, не измерено.
+  const pl = f.price_levels || [];
+  h += `<div class="lbl">уровни с графика · касаний</div>`;
+  h += pl.length
+    ? pl.slice(0, 3).map(x => `<div class="row"><span class="${x.side === "above" ? "down" : "up"}">`
+        + `${x.price} ${x.kind === "both" ? "оба" : x.kind === "high" ? "сверху" : "снизу"}</span>`
+        + `<span>${x.touches}× · ${x.dist_pct > 0 ? "+" : ""}${x.dist_pct}%</span></div>`).join("")
+    : `<div class="empty">разворотов пока нет</div>`;
 
   h += `<div class="lbl">крупный уровень</div>${level((f.levels || [])[0])}`;
 
@@ -175,9 +203,20 @@ function card(tk) {
       + `<div class="row"><span class="dim">дельта</span><span class="${cls(fl.delta)}">${fl.delta}</span></div>`
     : `<div class="empty">сделок нет</div>`;
 
+  // ИЗМЕНЕНИЕ потока, а не сам поток: −500 после −2000 это ослабление,
+  // а −500 после +300 — начало давления.
+  const fc = f.flow_change || {};
+  if (fc.delta_change != null)
+    h += `<div class="row"><span class="dim">было / стало</span>`
+       + `<span class="${cls(fc.delta_now)}">${fc.delta_prev} → ${fc.delta_now}`
+       + `${fc.flipped ? ' <span class="warn">разворот</span>' : ""}</span></div>`;
+
   h += `<div class="lbl">структура 5м · vwap</div>`;
   h += `<div class="row"><span class="dim">${f.structure_5m || "—"}</span>`
-     + `<span class="${cls(f.vwap_dist_pct)}">${f.vwap_dist_atr14m != null ? (f.vwap_dist_atr14m > 0 ? "+" : "") + f.vwap_dist_atr14m + " ATR" : "—"}</span></div>`;
+     + `<span class="${cls(f.vwap_dist_pct)}">`
+     + `${f.vwap_dist_atr_day != null ? (f.vwap_dist_atr_day > 0 ? "+" : "") + f.vwap_dist_atr_day + " ATR дня"
+         : f.vwap_dist_atr14m != null ? (f.vwap_dist_atr14m > 0 ? "+" : "") + f.vwap_dist_atr14m + " ATR 14м"
+         : "—"}</span></div>`;
 
   h += `<div class="lbl">события стакана</div>`;
   const ev = f.events || [];

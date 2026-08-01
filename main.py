@@ -620,10 +620,49 @@ async def stream_pipeline():
     # ВЫЗОВА, а первый вызов случится не раньше первого сброса.
     stream = MarketStream(TINKOFF_TOKEN, figis, depth=STREAM_DEPTH,
                           flush_sec=STREAM_FLUSH_SEC, on_flush=_flush)
+    # ДНЕВНОЙ ATR. Он нужен для риска: стоп и цель считаются от дневного хода, а
+    # не от минутного. В минутных данных его нет — на карточке до сих пор был
+    # средний диапазон за 14 МИНУТ, что для стопа бесполезно.
+    #
+    # Берём дневные свечи из ISS: бесплатно, без токена, по бумаге сразу все дни.
+    # Запрос «все бумаги за дату» тоже есть, но он листается по 100 штук, и на 14
+    # дней вышло бы 70 запросов против 80 — выгоды нет, а кода больше.
+    #
+    # Считается в фоне и не задерживает стрим: без ATR карточка работает, просто
+    # без одного поля.
+    async def _atr_background():
+        import urllib.request as u, json as j
+        from src.analysis.intraday import volatility_state
+        base = ("https://iss.moex.com/iss/engines/stock/markets/shares/boards/"
+                "TQBR/securities/{}/candles.json?iss.meta=off&interval=24"
+                "&from={}")
+        frm = (datetime.now(timezone.utc) - timedelta(days=60)).strftime("%Y-%m-%d")
+        ok = 0
+        for tk in tickers:
+            try:
+                def _one(t=tk):
+                    d = j.load(u.urlopen(base.format(t, frm), timeout=30))["candles"]
+                    i = {k: n for n, k in enumerate(d["columns"])}
+                    return ([r[i["high"]] for r in d["data"]],
+                            [r[i["low"]] for r in d["data"]],
+                            [r[i["close"]] for r in d["data"]])
+                h, l, c = await asyncio.to_thread(_one)
+                v = volatility_state(h, l, c)
+                if v.get("atr"):
+                    stream.atr[tk] = {"atr": v["atr"], "state": v.get("state"),
+                                      "rank": v.get("atr_rank"), "days": len(c)}
+                    ok += 1
+            except Exception as e:                               # noqa: BLE001
+                logger.debug(f"дневной ATR {tk}: {e}")
+            await asyncio.sleep(0.3)
+        logger.info(f"Дневной ATR посчитан по {ok} бумагам")
+
     stream.lots = lots
     # Шаг цены у бумаг разный: SBER 0.01, VTBR 0.005, MVID 0.05, UGLD 0.0001.
     # Единый порог «возле лучшей цены» был бы неверен почти везде.
     stream.steps = steps
+    stream.atr = {}
+    asyncio.create_task(_atr_background())
     await stream.run()
 
 

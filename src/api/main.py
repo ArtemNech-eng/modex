@@ -658,7 +658,7 @@ async def get_book_live(ticker: str, light: bool = False):
 
     closes = [r["close"] for r in rows if r.get("close")]
     out["price"] = closes[-1] if closes else None
-    for n in (3, 5, 15):
+    for n in (1, 3, 5, 15):
         if len(closes) > n and closes[-n - 1]:
             out[f"change_{n}m_pct"] = round(
                 (closes[-1] - closes[-n - 1]) / closes[-n - 1] * 100, 3)
@@ -693,6 +693,37 @@ async def get_book_live(ticker: str, light: bool = False):
         if rngs:
             atr = sum(rngs) / len(rngs)
             out["vwap_dist_atr14m"] = round((closes[-1] - v) / atr, 2) if atr else None
+
+    # КРАЙНОСТИ ДНЯ со временем. Время важно: максимум, поставленный на открытии,
+    # и максимум минуту назад — разные ситуации. 30.07 по FLOT «максимум дня»
+    # стоял в 10:00, а сигнал на его пробой выдали в 23:30.
+    from src.analysis.price_levels import day_extremes, flow_change, levels
+    out["day"] = day_extremes(rows)
+
+    # ИЗМЕНЕНИЕ ПОТОКА, а не сам поток. Дельта −500 после −2000 означает, что
+    # давление СЛАБЕЕТ, а −500 после +300 — что оно только началось.
+    out["flow_change"] = flow_change(rows, window=5)
+
+    # ЛОКАЛЬНЫЕ УРОВНИ С ГРАФИКА. Уровень в стакане — чья-то заявка сейчас, её
+    # могут снять за секунду. Уровень на графике — место, где цена уже
+    # разворачивалась, и оно остаётся, даже когда в стакане там пусто.
+    # Пометок «сильный» и «слабый» здесь нет: сколько касаний делает уровень
+    # значимым — не измерено.
+    out["price_levels"] = levels(rows, tick=out.get("step") or 0.01,
+                                 price_now=out.get("price"), top=6)
+
+    # ДНЕВНОЙ ATR — от него считается риск. На карточке до этого был средний
+    # диапазон за 14 МИНУТ, что для стопа бесполезно; он остаётся отдельным полем.
+    a = (getattr(CURRENT, "atr", None) or {}).get(tk)
+    if a:
+        out["atr_day"] = a["atr"]
+        out["atr_state"] = a.get("state")
+        out["atr_days"] = a.get("days")
+        if out.get("vwap") and out.get("price") and a["atr"]:
+            out["vwap_dist_atr_day"] = round(
+                (out["price"] - out["vwap"]) / a["atr"], 3)
+        if out.get("price") and a["atr"]:
+            out["atr_pct"] = round(a["atr"] / out["price"] * 100, 2)
 
     # СОБЫТИЯ последних минут, свежайшее первым.
     events = detect(rows)
