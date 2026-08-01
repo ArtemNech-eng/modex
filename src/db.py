@@ -329,9 +329,12 @@ class FlowMinute(Base):
     """
     __tablename__ = "flow_minute"
 
-    key: Mapped[str] = mapped_column(String(64), primary_key=True)   # "YYYY-MM-DDTHH:MM:TICKER"
+    key: Mapped[str] = mapped_column(String(72), primary_key=True)   # "ts:TICKER:source"
     ts: Mapped[str] = mapped_column(String(16), index=True)          # "YYYY-MM-DDTHH:MM" МСК
     ticker: Mapped[str] = mapped_column(String(32), index=True)
+    # exchange — биржевые сделки, dealer — внутренний рынок брокера,
+    # mixed — собрано до 01.08, когда источник не различался вовсе.
+    source: Mapped[str] = mapped_column(String(8), default="exchange", index=True)
     session: Mapped[str] = mapped_column(String(8), default="main")  # morning|main|evening
     buy_volume: Mapped[int] = mapped_column(Integer, default=0)
     sell_volume: Mapped[int] = mapped_column(Integer, default=0)
@@ -364,9 +367,12 @@ class BookMinute(Base):
     """
     __tablename__ = "book_minute"
 
-    key: Mapped[str] = mapped_column(String(64), primary_key=True)   # "YYYY-MM-DDTHH:MM:TICKER"
+    key: Mapped[str] = mapped_column(String(72), primary_key=True)   # "ts:TICKER:source"
     ts: Mapped[str] = mapped_column(String(16), index=True)          # МСК
     ticker: Mapped[str] = mapped_column(String(32), index=True)
+    # exchange — биржевой стакан, dealer — котировки брокера. Подписка по
+    # умолчанию отдаёт ORDERBOOK_TYPE_ALL, то есть оба вперемешку.
+    source: Mapped[str] = mapped_column(String(8), default="exchange", index=True)
     session: Mapped[str] = mapped_column(String(8), default="main")
     updates: Mapped[int] = mapped_column(Integer, default=0)         # пакетов за минуту
     bid_vol_sum: Mapped[float] = mapped_column(Float, default=0.0)
@@ -512,28 +518,46 @@ _PREDICTION_ADDED_COLUMNS = {
 }
 
 
+# Колонки, дописываемые в УЖЕ СУЩЕСТВУЮЩИЕ таблицы.
+#
+# Про 'mixed' у flow_minute и book_minute. Строки, собранные до 01.08, писались
+# без различения источника: опрос REST отдавал поле trade_source в каждой
+# сделке, а код его ни разу не читал. Значит в них смешаны биржевые и дилерские
+# сделки в НЕИЗВЕСТНОЙ пропорции. Пометить их 'exchange' было бы неправдой,
+# поэтому им ставится 'mixed': данные никуда не деваются, но по умолчанию в
+# анализ не попадают.
+_ADDED_COLUMNS = {
+    "predictions": _PREDICTION_ADDED_COLUMNS,
+    "flow_minute": {"source": "VARCHAR(8) DEFAULT 'mixed'"},
+    "book_minute": {"source": "VARCHAR(8) DEFAULT 'mixed'"},
+}
+
+
 async def migrate_schema():
     """
-    Мягкая миграция: дописать новые колонки в существующую таблицу predictions.
+    Мягкая миграция: дописать новые колонки в существующие таблицы.
 
     create_all() создаёт недостающие ТАБЛИЦЫ, но не добавляет колонки в уже
-    существующие. Здесь добавляем колонки post-mortem, если их ещё нет —
-    и на SQLite, и на PostgreSQL, идемпотентно.
+    существующие. Здесь добавляем их post-mortem, если их ещё нет — и на
+    SQLite, и на PostgreSQL, идемпотентно.
     """
     is_sqlite = "sqlite" in DATABASE_URL
     async with engine.begin() as conn:
-        if is_sqlite:
-            res = await conn.exec_driver_sql("PRAGMA table_info(predictions)")
-            existing = {row[1] for row in res.fetchall()}
-            for col, typ in _PREDICTION_ADDED_COLUMNS.items():
-                if col not in existing:
+        for table, cols in _ADDED_COLUMNS.items():
+            if is_sqlite:
+                res = await conn.exec_driver_sql(f"PRAGMA table_info({table})")
+                existing = {row[1] for row in res.fetchall()}
+                if not existing:
+                    continue                      # таблицы ещё нет — создаст create_all
+                for col, typ in cols.items():
+                    if col not in existing:
+                        await conn.exec_driver_sql(
+                            f'ALTER TABLE {table} ADD COLUMN "{col}" {typ}')
+                        logger.info(f"🧩 Добавлена колонка {table}.{col}")
+            else:
+                for col, typ in cols.items():
                     await conn.exec_driver_sql(
-                        f'ALTER TABLE predictions ADD COLUMN "{col}" {typ}')
-                    logger.info(f"🧩 Добавлена колонка predictions.{col}")
-        else:
-            for col, typ in _PREDICTION_ADDED_COLUMNS.items():
-                await conn.exec_driver_sql(
-                    f'ALTER TABLE predictions ADD COLUMN IF NOT EXISTS "{col}" {typ}')
+                        f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS "{col}" {typ}')
 
 
 async def migrate_from_json():
@@ -2026,7 +2050,8 @@ async def get_flow_watermark(ticker: str, day: str) -> Optional[str]:
 
 
 async def merge_flow_minutes(ticker: str, rows: list[dict],
-                             watermark: Optional[str]) -> int:
+                             watermark: Optional[str],
+                             source: str = "exchange") -> int:
     """
     Влить минутные срезы потока. rows: [{ts, session, buy_volume, sell_volume,
     trade_count, max_trade, vwap_num}], ts вида "YYYY-MM-DDTHH:MM" (МСК).
@@ -2041,13 +2066,14 @@ async def merge_flow_minutes(ticker: str, rows: list[dict],
     try:
         async with async_session() as session:
             for r in rows:
-                key = f"{r['ts']}:{ticker.upper()}"
+                key = f"{r['ts']}:{ticker.upper()}:{source}"
                 row = await session.get(FlowMinute, key)
                 if row is None:
                     # Значения задаются ЯВНО, а не через default колонки:
                     # до записи в базу они остались бы None, и накопление
                     # падало бы на «NoneType + int».
                     row = FlowMinute(key=key, ts=r["ts"], ticker=ticker.upper(),
+                                     source=source,
                                      session=r.get("session") or "main",
                                      buy_volume=0, sell_volume=0, trade_count=0,
                                      max_trade=0, vwap_num=0.0)
@@ -2125,14 +2151,24 @@ def aggregate_flow(rows: list[dict], step: int, ticker: str = "") -> list[dict]:
     return out
 
 
-async def flow_series(ticker: str, day: str, res: str = "1m") -> list[dict]:
-    """Поток по бумаге за день. res: 1m | 5m | 15m | 30m | session."""
+async def flow_series(ticker: str, day: str, res: str = "1m",
+                      source: str = "exchange") -> list[dict]:
+    """
+    Поток по бумаге за день. res: 1m | 5m | 15m | 30m | session.
+
+    source: exchange (по умолчанию) | dealer | mixed | all.
+
+    По умолчанию БИРЖЕВОЙ. Дилерские сделки — внутренний рынок брокера, цена
+    там не формируется биржевым стаканом: 01.08 при закрытой бирже пришло 2812
+    таких сделок, и старый код записал бы их как настоящие. mixed — то, что
+    собрано до 01.08, когда источник не различался.
+    """
     step = FLOW_RES.get(res, 1)
     async with async_session() as session:
-        q = (select(FlowMinute)
-             .where(FlowMinute.ticker == ticker.upper(),
-                    FlowMinute.ts.like(f"{day}%"))
-             .order_by(FlowMinute.ts))
+        conds = [FlowMinute.ticker == ticker.upper(), FlowMinute.ts.like(f"{day}%")]
+        if source != "all":
+            conds.append(FlowMinute.source == source)
+        q = select(FlowMinute).where(*conds).order_by(FlowMinute.ts)
         rows = (await session.execute(q)).scalars().all()
     plain = [{"ts": r.ts, "session": r.session, "buy_volume": r.buy_volume,
               "sell_volume": r.sell_volume, "trade_count": r.trade_count,
@@ -2157,7 +2193,8 @@ async def prune_flow_minute(keep_days: int = 90) -> int:
         return result.rowcount or 0
 
 
-async def merge_book_minutes(ticker: str, rows: list[dict]) -> int:
+async def merge_book_minutes(ticker: str, rows: list[dict],
+                             source: str = "exchange") -> int:
     """
     Влить минутные срезы стакана. Складывает в существующие минуты.
 
@@ -2171,13 +2208,14 @@ async def merge_book_minutes(ticker: str, rows: list[dict]) -> int:
     try:
         async with async_session() as session:
             for r in rows:
-                key = f"{r['ts']}:{ticker.upper()}"
+                key = f"{r['ts']}:{ticker.upper()}:{source}"
                 row = await session.get(BookMinute, key)
                 if row is None:
                     # Значения ЯВНО, а не через default колонки: до записи в
                     # базу они остались бы None и накопление упало бы на
                     # «NoneType + float». Та же ошибка уже была в flow_minute.
                     row = BookMinute(key=key, ts=r["ts"], ticker=ticker.upper(),
+                                     source=source,
                                      session=r.get("session") or "main",
                                      updates=0, bid_vol_sum=0.0, ask_vol_sum=0.0,
                                      spread_sum=0.0, best_bid=0.0, best_ask=0.0,
@@ -2258,14 +2296,19 @@ def aggregate_book(rows: list[dict], step: int, ticker: str = "") -> list[dict]:
     return out
 
 
-async def book_series(ticker: str, day: str, res: str = "1m") -> list[dict]:
-    """Стакан по бумаге за день. res: 1m | 5m | 15m | 30m | session."""
+async def book_series(ticker: str, day: str, res: str = "1m",
+                      source: str = "exchange") -> list[dict]:
+    """
+    Стакан по бумаге за день. res: 1m | 5m | 15m | 30m | session.
+
+    source: exchange (по умолчанию) | dealer | mixed | all.
+    """
     step = FLOW_RES.get(res, 1)
     async with async_session() as session:
-        q = (select(BookMinute)
-             .where(BookMinute.ticker == ticker.upper(),
-                    BookMinute.ts.like(f"{day}%"))
-             .order_by(BookMinute.ts))
+        conds = [BookMinute.ticker == ticker.upper(), BookMinute.ts.like(f"{day}%")]
+        if source != "all":
+            conds.append(BookMinute.source == source)
+        q = select(BookMinute).where(*conds).order_by(BookMinute.ts)
         rows = (await session.execute(q)).scalars().all()
     plain = [{"ts": r.ts, "session": r.session, "updates": r.updates,
               "bid_vol_sum": r.bid_vol_sum, "ask_vol_sum": r.ask_vol_sum,

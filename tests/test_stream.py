@@ -66,7 +66,7 @@ def test_trades_land_in_their_own_minutes():
     a.add_trade("SBER", _utc(7, 0, 10), 1, 100.0, 5)
     a.add_trade("SBER", _utc(7, 1, 5), 1, 101.0, 7)
     flow, _ = a.drain()
-    assert [r["ts"] for r in flow["SBER"]] == ["2026-08-03T10:00", "2026-08-03T10:01"]
+    assert [r["ts"] for r in flow["exchange"]["SBER"]] == ["2026-08-03T10:00", "2026-08-03T10:01"]
 
 
 def test_buy_and_sell_are_split_by_exchange_flag():
@@ -77,14 +77,14 @@ def test_buy_and_sell_are_split_by_exchange_flag():
     a = Aggregator()
     a.add_trade("SBER", _utc(7, 0, 10), 1, 100.0, 7)     # BUY
     a.add_trade("SBER", _utc(7, 0, 20), 2, 100.0, 3)     # SELL
-    r = a.drain()[0]["SBER"][0]
+    r = a.drain()[0]["exchange"]["SBER"][0]
     assert r["buy_volume"] == 7 and r["sell_volume"] == 3
 
 
 def test_unknown_direction_counts_in_trades_but_not_in_sides():
     a = Aggregator()
     a.add_trade("SBER", _utc(7, 0, 10), 0, 100.0, 9)     # UNSPECIFIED
-    r = a.drain()[0]["SBER"][0]
+    r = a.drain()[0]["exchange"]["SBER"][0]
     assert r["trade_count"] == 1
     assert r["buy_volume"] == 0 and r["sell_volume"] == 0
 
@@ -94,7 +94,7 @@ def test_biggest_trade_is_kept():
     a = Aggregator()
     for q in (100, 900, 50):
         a.add_trade("SBER", _utc(7, 0, 10), 1, 100.0, q)
-    assert a.drain()[0]["SBER"][0]["max_trade"] == 900
+    assert a.drain()[0]["exchange"]["SBER"][0]["max_trade"] == 900
 
 
 def test_vwap_numerator_lets_price_be_recovered():
@@ -102,7 +102,7 @@ def test_vwap_numerator_lets_price_be_recovered():
     a = Aggregator()
     a.add_trade("X", _utc(7, 0, 10), 1, 100.0, 1)
     a.add_trade("X", _utc(7, 0, 20), 1, 200.0, 3)
-    r = a.drain()[0]["X"][0]
+    r = a.drain()[0]["exchange"]["X"][0]
     assert r["vwap_num"] == pytest.approx(700.0)
     assert r["vwap_num"] / (r["buy_volume"] + r["sell_volume"]) == pytest.approx(175.0)
 
@@ -124,7 +124,7 @@ def test_book_keeps_sums_not_averages():
     a = Aggregator()
     a.add_book("SBER", _utc(7, 0, 10), 600, 400, 271.5, 271.6)
     a.add_book("SBER", _utc(7, 0, 40), 200, 800, 271.4, 271.5)
-    r = a.drain()[1]["SBER"][0]
+    r = a.drain()[1]["exchange"]["SBER"][0]
     assert r["updates"] == 2
     assert r["bid_vol_sum"] == 800 and r["ask_vol_sum"] == 1200
     assert r["bid_vol_sum"] / (r["bid_vol_sum"] + r["ask_vol_sum"]) == pytest.approx(0.4)
@@ -138,7 +138,7 @@ def test_book_records_the_swing_inside_the_minute():
     a = Aggregator()
     a.add_book("SBER", _utc(7, 0, 10), 800, 200, 1.0, 1.1)   # 0.8
     a.add_book("SBER", _utc(7, 0, 50), 200, 800, 1.0, 1.1)   # 0.2
-    r = a.drain()[1]["SBER"][0]
+    r = a.drain()[1]["exchange"]["SBER"][0]
     assert r["imb_max"] == pytest.approx(0.8)
     assert r["imb_min"] == pytest.approx(0.2)
 
@@ -147,7 +147,7 @@ def test_last_best_prices_win_inside_the_minute():
     a = Aggregator()
     a.add_book("X", _utc(7, 0, 10), 10, 10, 100.0, 100.5)
     a.add_book("X", _utc(7, 0, 50), 10, 10, 101.0, 101.5)
-    r = a.drain()[1]["X"][0]
+    r = a.drain()[1]["exchange"]["X"][0]
     assert r["best_bid"] == 101.0 and r["best_ask"] == 101.5
 
 
@@ -419,8 +419,12 @@ def test_trade_source_is_not_set_in_the_request():
     assert req.subscribe_trades_request.trade_source == pb.TRADE_SOURCE_UNSPECIFIED
 
 
-def test_dealer_trades_are_counted_but_not_added_to_flow():
-    """Дилерские сделки не проходят через стакан — в поток они не идут."""
+def test_dealer_trades_go_to_their_own_bucket():
+    """
+    Дилерские сделки не смешиваются с биржевыми, но и НЕ выбрасываются:
+    01.08 в них оказались перекосы до 98% по 57 бумагам, и проверить, значит ли
+    это что-нибудь, можно только на накопленных данных.
+    """
     from src.collector.stream import MarketStream, TRADE_SOURCE_DEALER
     assert TRADE_SOURCE_DEALER == pb.TRADE_SOURCE_DEALER, "число разошлось с контрактом"
 
@@ -432,7 +436,9 @@ def test_dealer_trades_are_counted_but_not_added_to_flow():
         t.time.FromSeconds(1785000000)
         s._handle(pb.MarketDataResponse(trade=t))
     assert s.stats["trades"] == 1 and s.stats["trades_dealer"] == 1
-    assert s.agg.drain()[0]["SBER"][0]["buy_volume"] == 10, "дилерская не в потоке"
+    flow = s.agg.drain()[0]
+    assert flow["exchange"]["SBER"][0]["buy_volume"] == 10
+    assert flow["dealer"]["SBER"][0]["buy_volume"] == 999, "дилерская сохранена отдельно"
 
 
 def test_dealer_orderbook_is_separated_too():
@@ -455,7 +461,9 @@ def test_dealer_orderbook_is_separated_too():
         ob.time.FromSeconds(1785000000)
         s._handle(pb.MarketDataResponse(orderbook=ob))
     assert s.stats["books"] == 1 and s.stats["books_dealer"] == 1
-    assert s.agg.drain()[1]["SBER"][0]["bid_vol_sum"] == 10, "дилерский не в стакане"
+    book = s.agg.drain()[1]
+    assert book["exchange"]["SBER"][0]["bid_vol_sum"] == 10
+    assert book["dealer"]["SBER"][0]["bid_vol_sum"] == 999, "дилерский отдельно"
 
 
 def test_incoming_source_mix_is_visible():
@@ -475,6 +483,74 @@ def test_incoming_source_mix_is_visible():
         s._handle(pb.MarketDataResponse(trade=t))
     assert s.health()["sources"]["trade_source"] == {
         "TRADE_SOURCE_DEALER": 2, "TRADE_SOURCE_EXCHANGE": 1}
+
+
+# ─── колонка источника: хранить оба, по умолчанию отдавать биржевой ───────────
+
+def test_key_includes_source_so_two_sources_never_collide():
+    """
+    Ключ строки — минута, тикер И источник. Без источника в ключе биржевая и
+    дилерская минуты писались бы в ОДНУ строку и складывались: ровно то
+    смешивание, ради устранения которого всё и делается.
+    """
+    src = (ROOT / "src/db.py").read_text()
+    assert src.count('{ticker.upper()}:{source}') == 2, "ключ в обеих таблицах"
+
+
+def test_historical_rows_are_labelled_mixed_not_exchange():
+    """
+    Строки до 01.08 собраны без различения источника — в них биржевые и
+    дилерские сделки в НЕИЗВЕСТНОЙ пропорции. Пометить их 'exchange' значило бы
+    соврать: анализ по умолчанию взял бы загрязнённое как чистое.
+    """
+    src = (ROOT / "src/db.py").read_text()
+    for table in ("flow_minute", "book_minute"):
+        i = src.index(f'"{table}": {{"source"')
+        assert "'mixed'" in src[i:i + 90], f"{table}: историю метим mixed"
+
+
+def test_migration_covers_the_new_tables():
+    """
+    create_all создаёт таблицы, но НЕ добавляет колонки в существующие. Обе
+    таблицы уже живут в базе, значит колонка добавляется миграцией — иначе
+    приложение упадёт на первом же запросе.
+    """
+    src = (ROOT / "src/db.py").read_text()
+    i = src.index("\n_ADDED_COLUMNS = {")     # \n, иначе совпадёт _PREDICTION_ADDED_COLUMNS
+    block = src[i:i + 400]
+    assert '"flow_minute"' in block and '"book_minute"' in block
+    assert "for table, cols in _ADDED_COLUMNS.items()" in src, "миграция по всем таблицам"
+
+
+def test_reads_default_to_exchange():
+    """Забыть указать источник должно быть безопасно: молча вернётся биржевой."""
+    src = (ROOT / "src/db.py").read_text()
+    assert src.count('source: str = "exchange"') == 4, \
+        "две записи и два чтения — везде умолчание биржевое"
+    api = (ROOT / "src/api/main.py").read_text()
+    assert api.count('source: str = "exchange"') == 2
+
+
+def test_endpoints_reject_unknown_source():
+    """Опечатка в источнике не должна молча отдавать пустой список."""
+    api = (ROOT / "src/api/main.py").read_text()
+    assert 'FLOW_SOURCES = ("exchange", "dealer", "mixed", "all")' in api
+    assert api.count("if source not in FLOW_SOURCES:") == 2
+
+
+def test_dealer_data_is_stored_not_dropped():
+    """
+    Регрессия на мою же правку. Первая версия дилерские данные считала и
+    ВЫБРАСЫВАЛА. Проверить, значит ли что-нибудь выходное позиционирование
+    розницы, можно только на накопленных данных — выброшенное не накопится.
+    """
+    stream = (ROOT / "src/collector/stream.py").read_text()
+    assert 'source=src' in stream, "источник передаётся в накопитель"
+    assert 'self.stats["trades_dealer"] += 1\n                return' not in stream, \
+        "дилерские больше не отбрасываются"
+    main = (ROOT / "main.py").read_text()
+    assert "merge_flow_minutes(tk, rows, None, source=src)" in main
+    assert "merge_book_minutes(tk, rows, source=src)" in main
 
 
 def test_handler_failure_is_not_swallowed():

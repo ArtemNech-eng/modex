@@ -380,8 +380,14 @@ async def get_feed(ticker: Optional[str] = None, source: Optional[str] = None,
     return {"events": events, "count": len(events)}
 
 
+# exchange — биржа, dealer — внутренний рынок брокера, mixed — собранное до
+# 01.08 без различения источника, all — всё вместе (для сверки, не для анализа).
+FLOW_SOURCES = ("exchange", "dealer", "mixed", "all")
+
+
 @app.get("/api/flow/{ticker}", summary="Поток сделок по минутам, с дедупом")
-async def get_flow(ticker: str, day: Optional[str] = None, res: str = "1m"):
+async def get_flow(ticker: str, day: Optional[str] = None, res: str = "1m",
+                   source: str = "exchange"):
     """
     Поток сделок: buy/sell, дельта, НАКОПЛЕННАЯ дельта, число сделок, средний
     размер, крупнейшая сделка, дисбаланс, VWAP минуты.
@@ -397,20 +403,31 @@ async def get_flow(ticker: str, day: Optional[str] = None, res: str = "1m"):
 
     Производные считаются на чтении, а не хранятся: при смене определения
     «крупной сделки» историю не придётся переписывать.
+
+    source: exchange (по умолчанию) | dealer | mixed | all
+
+    Дилерские сделки — внутренний рынок брокера, цена там не формируется
+    биржевым стаканом. 01.08 при ЗАКРЫТОЙ бирже пришло 2812 таких сделок, и
+    старый код записал бы их как настоящие. mixed — собранное до 01.08, когда
+    источник не различался вовсе.
     """
+    if source not in FLOW_SOURCES:
+        raise HTTPException(status_code=400,
+                            detail=f"source: {', '.join(sorted(FLOW_SOURCES))}")
     if not ticker_known(ticker):
         raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
     if res not in ("1m", "5m", "15m", "30m", "session"):
         raise HTTPException(status_code=400,
                             detail="res должен быть 1m, 5m, 15m, 30m или session")
     d = day or (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d")
-    rows = await db.flow_series(ticker, d, res)
-    return {"ticker": ticker.upper(), "day": d, "res": res,
+    rows = await db.flow_series(ticker, d, res, source=source)
+    return {"ticker": ticker.upper(), "day": d, "res": res, "source": source,
             "count": len(rows), "rows": rows}
 
 
 @app.get("/api/book/{ticker}", summary="Стакан по минутам: кого больше, покупателей или продавцов")
-async def get_book(ticker: str, day: Optional[str] = None, res: str = "1m"):
+async def get_book(ticker: str, day: Optional[str] = None, res: str = "1m",
+                   source: str = "exchange"):
     """
     Перекос стакана с разрешением до минуты.
 
@@ -426,15 +443,22 @@ async def get_book(ticker: str, day: Optional[str] = None, res: str = "1m"):
     точке нельзя увидеть ни перекоса в течение минуты, ни разворота.
 
     res: 1m | 5m | 15m | 30m | session
+    source: exchange (по умолчанию) | dealer | mixed | all
+
+    Подписка отдаёт стакан «биржевой И дилера» вместе, поэтому источник
+    разбирается по каждому пакету. Дилерский — котировки брокера.
     """
+    if source not in FLOW_SOURCES:
+        raise HTTPException(status_code=400,
+                            detail=f"source: {', '.join(sorted(FLOW_SOURCES))}")
     if not ticker_known(ticker):
         raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
     if res not in ("1m", "5m", "15m", "30m", "session"):
         raise HTTPException(status_code=400,
                             detail="res должен быть 1m, 5m, 15m, 30m или session")
     d = day or (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d")
-    rows = await db.book_series(ticker, d, res)
-    return {"ticker": ticker.upper(), "day": d, "res": res,
+    rows = await db.book_series(ticker, d, res, source=source)
+    return {"ticker": ticker.upper(), "day": d, "res": res, "source": source,
             "count": len(rows), "rows": rows}
 
 

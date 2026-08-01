@@ -21,10 +21,18 @@
     ЧУЖИЕ инструменты: HYDR получал данные FEES, MAGN — данные UPRO. Теперь
     биржа называет бумагу в каждом пакете, и сверять нечего.
 
-    trade_source. Сделки бывают биржевые и дилерские (внутренние сделки
-    брокера). Подписываемся ТОЛЬКО на биржевые: дилерские не проходят через
-    стакан и завышают поток. В REST-выдаче этого разделения у нас не было
-    вообще, то есть накопленный поток мог быть замусорен.
+    Источник — и у сделок, и у стакана. Бывает биржевой и дилерский (внутренний
+    рынок брокера). Пишем ОБА, но в РАЗНЫЕ строки: колонка source. Весь анализ
+    по умолчанию берёт биржевой.
+
+    Отбрасывать дилерский нельзя: 01.08 при закрытой бирже пришло 2812 таких
+    сделок с перекосами до 98% в разные стороны по 57 бумагам — это похоже на
+    позиционирование розницы перед понедельником. Значит ли оно что-нибудь,
+    проверяется только на накопленных данных, а выброшенное не накопится.
+
+    Смешивать тоже нельзя: от смешивания бесполезны обе половины. Именно так и
+    было в REST — поле trade_source приходило в каждой сделке, а наш код не
+    читал его ни разу.
 
     is_consistent у стакана. Биржа сама помечает пакет, в котором дошли не все
     заявки. Такие пропускаем, а не считаем как настоящий перекос.
@@ -143,11 +151,11 @@ class Aggregator:
         self.books_skipped = 0
 
     def add_trade(self, ticker: str, when: datetime, direction: int,
-                  price: float, qty: int) -> None:
+                  price: float, qty: int, source: str = "exchange") -> None:
         if not ticker or qty <= 0:
             return
         mk = msk_minute(when)
-        k = (ticker.upper(), mk)
+        k = (source, ticker.upper(), mk)
         r = self.flow.get(k)
         if r is None:
             r = {"ts": mk, "session": session_of(mk), "buy_volume": 0,
@@ -166,14 +174,15 @@ class Aggregator:
         self.trades_seen += 1
 
     def add_book(self, ticker: str, when: datetime, bid_vol: int, ask_vol: int,
-                 best_bid: float, best_ask: float) -> None:
+                 best_bid: float, best_ask: float,
+                 source: str = "exchange") -> None:
         if not ticker:
             return
         total = bid_vol + ask_vol
         if total <= 0:
             return
         mk = msk_minute(when)
-        k = (ticker.upper(), mk)
+        k = (source, ticker.upper(), mk)
         share = bid_vol / total
         r = self.book.get(k)
         if r is None:
@@ -195,18 +204,24 @@ class Aggregator:
 
     def drain(self) -> tuple[dict, dict]:
         """
-        Отдать накопленное и обнулить. Возвращает две карты тикер -> строки.
+        Отдать накопленное и обнулить. Две карты вида источник -> тикер -> строки.
+
+        РАЗДЕЛЕНИЕ ПО ИСТОЧНИКУ, А НЕ ОТБРАСЫВАНИЕ. Первая версия дилерские
+        данные считала и выкидывала. Это ошибка в другую сторону: проверить,
+        значит ли что-нибудь выходное позиционирование розницы, можно только на
+        накопленных данных, а выброшенное не накопится. 01.08 дилерский поток
+        оказался не шумом — перекосы до 98% в разные стороны по 57 бумагам.
 
         Обнуление здесь, а не после успешной записи, сознательно: при сбое базы
         потеряется минута данных, но накопитель не будет расти без предела и не
         задвоит уже записанное. Потерю видно в диагностике по разрыву минут.
         """
         f: dict = {}
-        for (tk, _), r in self.flow.items():
-            f.setdefault(tk, []).append(r)
+        for (src, tk, _), r in self.flow.items():
+            f.setdefault(src, {}).setdefault(tk, []).append(r)
         b: dict = {}
-        for (tk, _), r in self.book.items():
-            b.setdefault(tk, []).append(r)
+        for (src, tk, _), r in self.book.items():
+            b.setdefault(src, {}).setdefault(tk, []).append(r)
         self.flow, self.book = {}, {}
         return f, b
 
@@ -299,13 +314,12 @@ class MarketStream:
             # биржевой стакан и завысили бы поток. Отсекаем ЗДЕСЬ, а не в
             # подписке: фильтр виден, измеряем и снимается одной строкой.
             self._seen("trade_source", int(t.trade_source))
-            if t.trade_source == TRADE_SOURCE_DEALER:
-                self.stats["trades_dealer"] += 1
-                return
+            src = ("dealer" if t.trade_source == TRADE_SOURCE_DEALER
+                   else "exchange")
             when = t.time.ToDatetime().replace(tzinfo=timezone.utc)
             self.agg.add_trade(tk, when, int(t.direction),
-                               quotation(t.price), int(t.quantity))
-            self.stats["trades"] += 1
+                               quotation(t.price), int(t.quantity), source=src)
+            self.stats["trades_dealer" if src == "dealer" else "trades"] += 1
         elif name == "orderbook":
             ob = resp.orderbook
             tk = (ob.ticker or "").upper()
@@ -313,9 +327,8 @@ class MarketStream:
             # Умолчание подписки — стакан «биржевой И дилера» вместе. Дилерский
             # это котировки брокера, а не место, где формируется цена.
             self._seen("order_book_type", int(ob.order_book_type))
-            if ob.order_book_type == ORDERBOOK_TYPE_DEALER:
-                self.stats["books_dealer"] += 1
-                return
+            src = ("dealer" if ob.order_book_type == ORDERBOOK_TYPE_DEALER
+                   else "exchange")
             if not ob.is_consistent:
                 # Биржа сама говорит, что дошли не все заявки. Считать такой
                 # пакет настоящим перекосом нельзя.
@@ -327,8 +340,8 @@ class MarketStream:
             bb = quotation(ob.bids[0].price) if ob.bids else 0.0
             ba = quotation(ob.asks[0].price) if ob.asks else 0.0
             when = ob.time.ToDatetime().replace(tzinfo=timezone.utc)
-            self.agg.add_book(tk, when, bid, ask, bb, ba)
-            self.stats["books"] += 1
+            self.agg.add_book(tk, when, bid, ask, bb, ba, source=src)
+            self.stats["books_dealer" if src == "dealer" else "books"] += 1
         elif name in SUB_FIELD:
             self._handle_subscription(name, getattr(resp, name))
         self.stats["messages"] += 1

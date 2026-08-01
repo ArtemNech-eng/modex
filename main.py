@@ -562,13 +562,22 @@ async def stream_pipeline():
         return
 
     async def _flush(flow: dict, book: dict):
-        nf = nb = 0
-        for tk, rows in flow.items():
-            nf += await db.merge_flow_minutes(tk, rows, None)
-        for tk, rows in book.items():
-            nb += await db.merge_book_minutes(tk, rows)
-        if nf or nb:
-            logger.debug(f"стрим записал: поток {nf}, стакан {nb}")
+        """
+        Карты приходят видом источник -> тикер -> строки. Биржевое и дилерское
+        пишутся в РАЗНЫЕ строки, а не складываются: от смешивания бесполезны
+        обе половины.
+        """
+        counts: dict = {}
+        for src, per_ticker in flow.items():
+            for tk, rows in per_ticker.items():
+                n = await db.merge_flow_minutes(tk, rows, None, source=src)
+                counts[f"поток/{src}"] = counts.get(f"поток/{src}", 0) + n
+        for src, per_ticker in book.items():
+            for tk, rows in per_ticker.items():
+                n = await db.merge_book_minutes(tk, rows, source=src)
+                counts[f"стакан/{src}"] = counts.get(f"стакан/{src}", 0) + n
+        if counts:
+            logger.debug("стрим записал: %s", counts)
 
     stream = MarketStream(TINKOFF_TOKEN, figis, depth=STREAM_DEPTH,
                           flush_sec=STREAM_FLUSH_SEC, on_flush=_flush)
