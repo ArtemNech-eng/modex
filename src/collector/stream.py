@@ -65,9 +65,19 @@ SILENCE_SEC = int(os.getenv("STREAM_SILENCE_SEC", "60"))
 # Я этого не заметил и читал общее «subscriptions», которого нет ни у одного:
 # обработчик падал на AttributeError, падение уходило в debug-лог, а наружу это
 # выглядело как «подписано 0» при исправно идущем стакане.
-# Числами, а не через pb2: обработчик сделок вызывается на каждый тик, и тянуть
-# туда импорт protobuf незачем. Совпадение с контрактом сторожит тест.
+# Числами, а не через pb2: обработчик вызывается на каждый тик, и тянуть туда
+# импорт protobuf незачем. Совпадение с контрактом сторожат тесты.
+#
+# ДИЛЕРСКОЕ ОТДЕЛЯЕТСЯ И В СДЕЛКАХ, И В СТАКАНЕ. У обеих подписок умолчание —
+# «биржевое И дилерское вместе». Дилер это внутренний рынок брокера: цена там
+# не формируется в биржевом стакане.
+#
+# Насколько это не мелочь, показала суббота 01.08. Биржа была закрыта (ISS: ноль
+# минутных баров против 500 в пятницу), а Tinkoff отдал 102 сделки — все до
+# единой дилерские. Опрос REST такие сделки не отличал вообще и писал их в поток
+# как настоящие.
 TRADE_SOURCE_DEALER = 2
+ORDERBOOK_TYPE_DEALER = 2
 
 SUB_FIELD = {
     "subscribe_trades_response": "trade_subscriptions",
@@ -220,8 +230,9 @@ class MarketStream:
         self.last_msg: dict = {}          # тикер -> время последнего пакета
         self.stats = {"connected_at": None, "reconnects": 0, "messages": 0,
                       "trades": 0, "trades_dealer": 0, "books": 0,
-                      "books_skipped": 0, "last_error": None, "subscribed": 0,
-                      "subscriptions": {}, "handler_errors": 0,
+                      "books_dealer": 0, "books_skipped": 0,
+                      "last_error": None, "subscribed": 0, "subscriptions": {},
+                      "sources": {}, "handler_errors": 0,
                       "last_handler_error": None}
         # Простой флаг, а НЕ asyncio.Event. Event в Python 3.9 привязывается
         # к циклу событий прямо в конструкторе, и объект нельзя создать до
@@ -284,9 +295,10 @@ class MarketStream:
             t = resp.trade
             tk = (t.ticker or "").upper()
             self.last_msg[tk] = datetime.now(timezone.utc)
-            # Дилерские сделки (внутренние сделки брокера) не проходят через
-            # стакан и завысили бы поток. Отсекаем ЗДЕСЬ, а не в подписке, и
-            # считаем отдельно — чтобы знать их долю, а не предполагать.
+            # Дилерские сделки (внутренний рынок брокера) не проходят через
+            # биржевой стакан и завысили бы поток. Отсекаем ЗДЕСЬ, а не в
+            # подписке: фильтр виден, измеряем и снимается одной строкой.
+            self._seen("trade_source", int(t.trade_source))
             if t.trade_source == TRADE_SOURCE_DEALER:
                 self.stats["trades_dealer"] += 1
                 return
@@ -297,6 +309,13 @@ class MarketStream:
         elif name == "orderbook":
             ob = resp.orderbook
             tk = (ob.ticker or "").upper()
+            self.last_msg[tk] = datetime.now(timezone.utc)
+            # Умолчание подписки — стакан «биржевой И дилера» вместе. Дилерский
+            # это котировки брокера, а не место, где формируется цена.
+            self._seen("order_book_type", int(ob.order_book_type))
+            if ob.order_book_type == ORDERBOOK_TYPE_DEALER:
+                self.stats["books_dealer"] += 1
+                return
             if not ob.is_consistent:
                 # Биржа сама говорит, что дошли не все заявки. Считать такой
                 # пакет настоящим перекосом нельзя.
@@ -309,7 +328,6 @@ class MarketStream:
             ba = quotation(ob.asks[0].price) if ob.asks else 0.0
             when = ob.time.ToDatetime().replace(tzinfo=timezone.utc)
             self.agg.add_book(tk, when, bid, ask, bb, ba)
-            self.last_msg[tk] = datetime.now(timezone.utc)
             self.stats["books"] += 1
         elif name in SUB_FIELD:
             self._handle_subscription(name, getattr(resp, name))
@@ -350,6 +368,24 @@ class MarketStream:
                            name, ok, len(subs), counts)
         else:
             logger.info("подписка %s: принято %d", name, ok)
+
+    def _seen(self, kind: str, value: int) -> None:
+        """
+        Гистограмма встреченных типов источника — по ИМЕНАМ, не по числам.
+
+        Нужна, чтобы не гадать, а видеть. Я уже дважды ошибся именно на
+        предположениях: сначала решил, что явный TRADE_SOURCE_EXCHANGE в
+        подписке безопасен, потом — что стакан приходит только биржевой.
+        Теперь состав входящего видно в /api/stream/health.
+        """
+        from .tinkoff_pb import marketdata_pb2 as md
+        enum = md.TradeSourceType if kind == "trade_source" else md.OrderBookType
+        try:
+            key = enum.Name(value)
+        except ValueError:
+            key = f"НЕИЗВЕСТНЫЙ_{value}"
+        h = self.stats["sources"].setdefault(kind, {})
+        h[key] = h.get(key, 0) + 1
 
     def _note_error(self, msg: str) -> None:
         """

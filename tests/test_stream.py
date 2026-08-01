@@ -435,6 +435,48 @@ def test_dealer_trades_are_counted_but_not_added_to_flow():
     assert s.agg.drain()[0]["SBER"][0]["buy_volume"] == 10, "дилерская не в потоке"
 
 
+def test_dealer_orderbook_is_separated_too():
+    """
+    Тот же изъян, что у сделок, только в стакане: умолчание подписки —
+    ORDERBOOK_TYPE_ALL, «биржевой И дилера вместе». Дилерский стакан это
+    котировки брокера, а не место, где формируется цена.
+    """
+    from src.collector.stream import MarketStream, ORDERBOOK_TYPE_DEALER
+    assert ORDERBOOK_TYPE_DEALER == pb.ORDERBOOK_TYPE_DEALER
+
+    s = MarketStream("x", {"SBER": "F1"})
+    for typ, qty in ((pb.ORDERBOOK_TYPE_EXCHANGE, 10), (pb.ORDERBOOK_TYPE_DEALER, 999)):
+        ob = pb.OrderBook(ticker="SBER", depth=20, is_consistent=True,
+                          order_book_type=typ,
+                          bids=[pb.Order(price=common.Quotation(units=100, nano=0),
+                                         quantity=qty)],
+                          asks=[pb.Order(price=common.Quotation(units=101, nano=0),
+                                         quantity=qty)])
+        ob.time.FromSeconds(1785000000)
+        s._handle(pb.MarketDataResponse(orderbook=ob))
+    assert s.stats["books"] == 1 and s.stats["books_dealer"] == 1
+    assert s.agg.drain()[1]["SBER"][0]["bid_vol_sum"] == 10, "дилерский не в стакане"
+
+
+def test_incoming_source_mix_is_visible():
+    """
+    Состав входящего видно, а не предполагается. Я дважды ошибся на догадках:
+    что явный EXCHANGE в подписке безопасен и что стакан приходит только
+    биржевой. Суббота 01.08 показала 102 сделки, все дилерские, при закрытой
+    бирже — такое должно быть видно показателем.
+    """
+    from src.collector.stream import MarketStream
+    s = MarketStream("x", {"SBER": "F1"})
+    for src in (pb.TRADE_SOURCE_DEALER, pb.TRADE_SOURCE_DEALER,
+                pb.TRADE_SOURCE_EXCHANGE):
+        t = pb.Trade(ticker="SBER", direction=pb.TRADE_DIRECTION_BUY, quantity=1,
+                     price=common.Quotation(units=1, nano=0), trade_source=src)
+        t.time.FromSeconds(1785000000)
+        s._handle(pb.MarketDataResponse(trade=t))
+    assert s.health()["sources"]["trade_source"] == {
+        "TRADE_SOURCE_DEALER": 2, "TRADE_SOURCE_EXCHANGE": 1}
+
+
 def test_handler_failure_is_not_swallowed():
     """
     Проглоченное исключение и скрыло всю историю. Ошибка разбора обязана
