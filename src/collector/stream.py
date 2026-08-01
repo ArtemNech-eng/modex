@@ -344,7 +344,14 @@ class MarketStream:
         # пакетов стакана, что уже приходят десять раз в секунду.
         from src.analysis.level_tracker import LevelTracker
         self.levels = LevelTracker()
+        # Секундный ряд стакана. Стрим получает пакеты до десяти раз в секунду,
+        # а минутная корзина сохраняла из них только размах перекоса. Из-за этого
+        # не работали изменение перекоса за 10 и 30 секунд, скорость ликвидности
+        # и исполнение возле лучших цен: данные приходили, но не сохранялись.
+        from src.analysis.book_ticks import TickRing
+        self.ticks = TickRing()
         self.lots: dict = {}          # тикер -> лотность, из ISS
+        self.steps: dict = {}         # тикер -> шаг цены, из ISS
         self.last_msg: dict = {}          # тикер -> время последнего пакета
         self.stats = {"connected_at": None, "reconnects": 0, "messages": 0,
                       "trades": 0, "trades_dealer": 0, "books": 0,
@@ -438,6 +445,9 @@ class MarketStream:
             self.agg.add_trade(tk, when, int(t.direction), price,
                                int(t.quantity), source=src)
             self.levels.on_trade(tk, price, int(t.quantity), source=src)
+            bb, ba = self.levels.best.get(f"{tk}|{src}", (0.0, 0.0))
+            self.ticks.on_trade(tk, src, price, int(t.quantity), bb, ba,
+                                tick=float(self.steps.get(tk) or 0))
             self.stats["trades_dealer" if src == "dealer" else "trades"] += 1
         elif name == "orderbook":
             ob = resp.orderbook
@@ -480,6 +490,8 @@ class MarketStream:
                 [(quotation(o.price), int(o.quantity)) for o in bids],
                 [(quotation(o.price), int(o.quantity)) for o in asks],
                 source=src)
+            self.ticks.on_book(tk, src, int(when.timestamp()), bid, ask,
+                               bid5, ask5, bb, ba, bid_top, ask_top)
             self.stats["books_dealer" if src == "dealer" else "books"] += 1
         elif name == "candle":
             cd = resp.candle
@@ -605,11 +617,30 @@ class MarketStream:
             except Exception as e:                           # noqa: BLE001
                 logger.debug("чистка уровней: %s", e)
             flow, book, candle = self.agg.drain()
-            if not flow and not book and not candle:
+
+            # Свёртка секундного ряда: по бумагам, у которых он есть. Счётчики
+            # исполнения ОБНУЛЯЮТСЯ после свёртки — они накопительные, и без
+            # обнуления минутные значения превратились бы в суммы с начала дня.
+            micro: dict = {}
+            now_sec = int(datetime.now(timezone.utc).timestamp())
+            mk = msk_minute(datetime.now(timezone.utc))
+            for (tk, src) in list(self.ticks.ring.keys()):
+                try:
+                    m = self.ticks.minute_summary(tk, src, now_sec)
+                except Exception:                                # noqa: BLE001
+                    continue
+                if not m:
+                    continue
+                m["ts"] = mk
+                m["session"] = session_of(mk)
+                micro.setdefault(src, {})[tk] = [m]
+            self.ticks.reset_trades()
+
+            if not flow and not book and not candle and not micro:
                 continue
             if self.on_flush:
                 try:
-                    await self.on_flush(flow, book, candle)
+                    await self.on_flush(flow, book, candle, micro)
                 except Exception as e:                       # noqa: BLE001
                     logger.warning("запись потока не удалась: %s", e)
 
@@ -691,6 +722,7 @@ class MarketStream:
             **self.stats,
             "instance": self.instance,
             "levels": self.levels.stats(),
+            "ticks": self.ticks.stats(),
             "tickers_subscribed": len(self.figis),
             "tickers_with_data": len(ages),
             "tickers_fresh_60s": fresh,

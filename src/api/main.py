@@ -601,7 +601,25 @@ async def get_book_live(ticker: str, light: bool = False):
     out["minute_now"] = snap.get("candle")
     lot = int((CURRENT.lots or {}).get(tk) or 1)
     out["lot"] = lot
+    out["step"] = float((getattr(CURRENT, "steps", None) or {}).get(tk) or 0)
     out["levels"] = CURRENT.levels.notable(tk, lot=lot, top=1)
+
+    # СЕКУНДНЫЕ ПОКАЗАТЕЛИ — из кольца в памяти, доли секунды.
+    #
+    # До них минутная корзина сохраняла из десяти пакетов в секунду только размах
+    # перекоса, и три вещи были недоступны: изменение перекоса за 10 и 30 секунд,
+    # скорость ликвидности, исполнение возле лучших цен. Данные приходили, но не
+    # сохранялись.
+    #
+    # Источник выбирается по наличию: на закрытой бирже биржевого ряда нет вовсе.
+    now_sec = int(datetime.now(timezone.utc).timestamp())
+    tick_src = "exchange"
+    if not CURRENT.ticks.deltas(tk, "exchange", now_sec):
+        tick_src = "dealer"
+    out["tick_source"] = tick_src
+    out["imbalance"] = CURRENT.ticks.deltas(tk, tick_src, now_sec)
+    out["liquidity_speed"] = CURRENT.ticks.speed(tk, tick_src, now_sec)
+    out["execution"] = CURRENT.ticks.near_best(tk, tick_src)
 
     # ── по прошлым минутам: до 20 секунд ─────────────────────────────────────
     #
@@ -681,6 +699,34 @@ async def get_book_live(ticker: str, light: bool = False):
     out["events"] = list(reversed(events))[:5]
     out["minutes_today"] = len(rows)
     return out
+
+
+@app.get("/api/micro/{ticker}", summary="Секундная микроструктура, свёрнутая по минутам")
+async def get_micro(ticker: str, day: Optional[str] = None,
+                    source: str = "exchange"):
+    """
+    Производные СЕКУНДНОГО ряда стакана: размах перекоса за 10 и 30 секунд,
+    сколько лотов пришло и ушло, пиковая скорость за секунду, исполнение у лучшей
+    цены и глубже.
+
+    ПОЧЕМУ ПРОИЗВОДНЫЕ, А НЕ САМ РЯД. Каждую секунду по каждой бумаге — 4.9 млн
+    строк в день, 440 млн за 90 дней, около 35 ГБ при 20 ГБ свободных. Не
+    помещается. Здесь 80 тысяч строк в день и 0.9 ГБ за 90 дней.
+
+    Теряется точный ряд трёхнедельной давности. Сохраняется главное: НАСКОЛЬКО
+    быстро и НАСКОЛЬКО сильно менялся стакан.
+
+    Живой секундный ряд — в /api/book-live/{ticker}, там задержка доли секунды.
+    """
+    if not ticker_known(ticker):
+        raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
+    if source not in FLOW_SOURCES:
+        raise HTTPException(status_code=400,
+                            detail=f"source: {', '.join(sorted(FLOW_SOURCES))}")
+    d = day or (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d")
+    rows = await db.micro_series(ticker, d, source=source)
+    return {"ticker": ticker.upper(), "day": d, "source": source,
+            "count": len(rows), "rows": rows}
 
 
 @app.get("/api/live/{ticker}", summary="Прямо сейчас: из памяти, без ожидания сброса")

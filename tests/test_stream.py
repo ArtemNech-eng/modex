@@ -495,7 +495,8 @@ def test_key_includes_source_so_two_sources_never_collide():
     смешивание, ради устранения которого всё и делается.
     """
     src = (ROOT / "src/db.py").read_text()
-    assert src.count('{ticker.upper()}:{source}') == 2, "ключ в обеих таблицах"
+    assert src.count('{ticker.upper()}:{source}') >= 2, \
+        "источник в ключе у всех таблиц, где он есть: поток, стакан, секунды"
 
 
 def test_historical_rows_are_labelled_mixed_not_exchange():

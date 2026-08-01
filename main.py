@@ -509,6 +509,7 @@ async def market_snapshot_pipeline():
                 await db.prune_flow_minute(keep_days=FLOW_MINUTE_KEEP_DAYS)
                 await db.prune_book_minute(keep_days=BOOK_MINUTE_KEEP_DAYS)
                 await db.prune_candle_minute(keep_days=BOOK_MINUTE_KEEP_DAYS)
+                await db.prune_micro_minute(keep_days=BOOK_MINUTE_KEEP_DAYS)
         except Exception as e:
             logger.debug(f"market snapshot: {e}")
         # В сессию — частые снимки (90с); вне сессии — редкие (300с): экономим API,
@@ -567,21 +568,28 @@ async def stream_pipeline():
     def _lots():
         import urllib.request as u, json as j
         url = ("https://iss.moex.com/iss/engines/stock/markets/shares/boards/"
-               "TQBR/securities.json?iss.meta=off&securities.columns=SECID,LOTSIZE")
+               "TQBR/securities.json?iss.meta=off"
+               "&securities.columns=SECID,LOTSIZE,MINSTEP")
         d = j.load(u.urlopen(url, timeout=30))["securities"]
         i = {k: n for n, k in enumerate(d["columns"])}
-        return {r[i["SECID"]]: int(r[i["LOTSIZE"]] or 1) for r in d["data"]}
+        lt, st = {}, {}
+        for r in d["data"]:
+            sid = r[i["SECID"]]
+            lt[sid] = int(r[i["LOTSIZE"]] or 1)
+            st[sid] = float(r[i["MINSTEP"]] or 0)
+        return lt, st
     try:
-        lots = await asyncio.to_thread(_lots)
-        logger.info(f"Лотность из ISS: {len(lots)} бумаг")
+        lots, steps = await asyncio.to_thread(_lots)
+        logger.info(f"Из ISS: лотность и шаг цены по {len(lots)} бумагам")
     except Exception as e:                                       # noqa: BLE001
-        logger.warning(f"Лотность из ISS не получена ({e}) — объёмы в лотах")
-        lots = {}
+        logger.warning(f"Справочник ISS не получен ({e}) — объёмы в лотах, "
+                       f"«возле лучшей цены» выродится в «точно по цене»")
+        lots, steps = {}, {}
     if not figis:
         logger.error("Стрим: ни одной бумаги не разрешено, выхожу")
         return
 
-    async def _flush(flow: dict, book: dict, candle: dict):
+    async def _flush(flow: dict, book: dict, candle: dict, micro: dict):
         """
         Карты приходят видом источник -> тикер -> строки. Биржевое и дилерское
         пишутся в РАЗНЫЕ строки, а не складываются: от смешивания бесполезны
@@ -601,6 +609,10 @@ async def stream_pipeline():
         for tk, rows in candle.items():
             n = await db.merge_candle_minutes(tk, rows)
             counts["свечи"] = counts.get("свечи", 0) + n
+        for src, per_ticker in micro.items():
+            for tk, rows in per_ticker.items():
+                n = await db.merge_micro_minutes(tk, rows, source=src)
+                counts[f"секунды/{src}"] = counts.get(f"секунды/{src}", 0) + n
         if counts:
             logger.debug("стрим записал: %s", counts)
 
@@ -609,6 +621,9 @@ async def stream_pipeline():
     stream = MarketStream(TINKOFF_TOKEN, figis, depth=STREAM_DEPTH,
                           flush_sec=STREAM_FLUSH_SEC, on_flush=_flush)
     stream.lots = lots
+    # Шаг цены у бумаг разный: SBER 0.01, VTBR 0.005, MVID 0.05, UGLD 0.0001.
+    # Единый порог «возле лучшей цены» был бы неверен почти везде.
+    stream.steps = steps
     await stream.run()
 
 

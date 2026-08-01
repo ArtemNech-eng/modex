@@ -430,6 +430,57 @@ class CandleMinute(Base):
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+class MicroMinute(Base):
+    """
+    Производные СЕКУНДНОГО ряда стакана, свёрнутые до минуты.
+
+    Почему производные, а не сам ряд. Арифметика:
+        каждую секунду по каждой бумаге     4.9 млн строк в день
+        за 90 дней                          440 млн строк, около 35 ГБ
+        свободно на сервере                 20 ГБ
+    Не помещается и не будет. Здесь 80 тысяч строк в день и 0.9 ГБ за 90 дней.
+
+    Что теряется: точный ряд трёхнедельной давности. Что сохраняется: НАСКОЛЬКО
+    быстро и НАСКОЛЬКО сильно менялся стакан — а именно это и нужно, чтобы потом
+    измерить, значит ли оно что-нибудь.
+
+    Размах перекоса берётся крайними значениями, а не средним: одно среднее
+    скрывает разворот, а резкая смена и интересна.
+
+    Добавленное и снятое считаются РАЗДЕЛЬНО. Разность скрывает главное: стакан,
+    где за минуту добавили и сняли по миллиону, и стакан, где не было ничего,
+    дают одинаковый ноль.
+    """
+    __tablename__ = "micro_minute"
+
+    key: Mapped[str] = mapped_column(String(72), primary_key=True)   # "ts:TICKER:source"
+    ts: Mapped[str] = mapped_column(String(16), index=True)          # МСК
+    ticker: Mapped[str] = mapped_column(String(32), index=True)
+    source: Mapped[str] = mapped_column(String(8), default="exchange", index=True)
+    session: Mapped[str] = mapped_column(String(8), default="main")
+    samples: Mapped[int] = mapped_column(Integer, default=0)         # секундных слепков
+    # Размах изменения перекоса за 10 и 30 секунд ВНУТРИ минуты.
+    imb_d10_max: Mapped[float] = mapped_column(Float, default=0.0)
+    imb_d10_min: Mapped[float] = mapped_column(Float, default=0.0)
+    imb_d30_max: Mapped[float] = mapped_column(Float, default=0.0)
+    imb_d30_min: Mapped[float] = mapped_column(Float, default=0.0)
+    # Скорость ликвидности: сколько лотов пришло и ушло, и пиковая секунда.
+    bid_added: Mapped[float] = mapped_column(Float, default=0.0)
+    bid_removed: Mapped[float] = mapped_column(Float, default=0.0)
+    ask_added: Mapped[float] = mapped_column(Float, default=0.0)
+    ask_removed: Mapped[float] = mapped_column(Float, default=0.0)
+    bid_peak_add: Mapped[float] = mapped_column(Float, default=0.0)
+    bid_peak_remove: Mapped[float] = mapped_column(Float, default=0.0)
+    ask_peak_add: Mapped[float] = mapped_column(Float, default=0.0)
+    ask_peak_remove: Mapped[float] = mapped_column(Float, default=0.0)
+    # Исполнение относительно лучших цен, в лотах.
+    traded_at_best: Mapped[int] = mapped_column(Integer, default=0)
+    traded_near: Mapped[int] = mapped_column(Integer, default=0)
+    traded_deep: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 class SignalAttempt(Base):
     """
     ЖУРНАЛ ПОПЫТОК (наблюдаемость воронки сигналов).
@@ -2601,6 +2652,98 @@ async def flow_candle_check(ticker: str, day: str,
         })
     return {"ticker": ticker.upper(), "day": day, "source": source,
             "minutes": len(out), "suspect_minutes": bad, "rows": out}
+
+
+async def merge_micro_minutes(ticker: str, rows: list[dict],
+                              source: str = "exchange") -> int:
+    """
+    Влить производные секундного ряда. Размах расширяется, суммы складываются,
+    пиковая скорость берётся максимумом.
+    """
+    if not rows:
+        return 0
+    n = 0
+    SUMS = ("bid_added", "bid_removed", "ask_added", "ask_removed")
+    PEAKS = ("bid_peak_add", "bid_peak_remove", "ask_peak_add", "ask_peak_remove")
+    COUNTS = ("traded_at_best", "traded_near", "traded_deep", "samples")
+    try:
+        async with async_session() as session:
+            for r in rows:
+                key = f"{r['ts']}:{ticker.upper()}:{source}"
+                row = await session.get(MicroMinute, key)
+                if row is None:
+                    row = MicroMinute(
+                        key=key, ts=r["ts"], ticker=ticker.upper(), source=source,
+                        session=r.get("session") or "main", samples=0,
+                        imb_d10_max=0.0, imb_d10_min=0.0,
+                        imb_d30_max=0.0, imb_d30_min=0.0,
+                        **{k: 0.0 for k in SUMS + PEAKS},
+                        traded_at_best=0, traded_near=0, traded_deep=0)
+                    session.add(row)
+                for k in ("imb_d10", "imb_d30"):
+                    if r.get(f"{k}_max") is not None:
+                        setattr(row, f"{k}_max",
+                                max(getattr(row, f"{k}_max"), float(r[f"{k}_max"])))
+                    if r.get(f"{k}_min") is not None:
+                        setattr(row, f"{k}_min",
+                                min(getattr(row, f"{k}_min"), float(r[f"{k}_min"])))
+                for k in SUMS:
+                    setattr(row, k, getattr(row, k) + float(r.get(k) or 0.0))
+                for k in PEAKS:
+                    setattr(row, k, max(getattr(row, k), float(r.get(k) or 0.0)))
+                for k in COUNTS:
+                    setattr(row, k, getattr(row, k) + int(r.get(k) or 0))
+                row.updated_at = datetime.now(timezone.utc)
+                n += 1
+            await session.commit()
+    except Exception as e:                                       # noqa: BLE001
+        logger.debug(f"merge_micro_minutes {ticker}: {e}")
+        return 0
+    return n
+
+
+async def micro_series(ticker: str, day: str,
+                       source: str = "exchange") -> list[dict]:
+    """Производные секундного ряда за день, по минутам."""
+    async with async_session() as session:
+        conds = [MicroMinute.ticker == ticker.upper(),
+                 MicroMinute.ts.like(f"{day}%")]
+        if source != "all":
+            conds.append(MicroMinute.source == source)
+        q = select(MicroMinute).where(*conds).order_by(MicroMinute.ts)
+        rows = (await session.execute(q)).scalars().all()
+    out = []
+    for r in rows:
+        traded = r.traded_at_best + r.traded_near + r.traded_deep
+        out.append({
+            "ts": r.ts, "ticker": r.ticker, "source": r.source,
+            "session": r.session, "samples": r.samples,
+            "imb_d10_max": r.imb_d10_max, "imb_d10_min": r.imb_d10_min,
+            "imb_d30_max": r.imb_d30_max, "imb_d30_min": r.imb_d30_min,
+            # Наибольший сдвиг перекоса за минуту, знак сохранён.
+            "imb_swing_10s": (r.imb_d10_max if abs(r.imb_d10_max) >= abs(r.imb_d10_min)
+                              else r.imb_d10_min),
+            "bid_added": r.bid_added, "bid_removed": r.bid_removed,
+            "ask_added": r.ask_added, "ask_removed": r.ask_removed,
+            "bid_peak_add": r.bid_peak_add, "bid_peak_remove": r.bid_peak_remove,
+            "ask_peak_add": r.ask_peak_add, "ask_peak_remove": r.ask_peak_remove,
+            "traded_at_best": r.traded_at_best, "traded_near": r.traded_near,
+            "traded_deep": r.traded_deep,
+            "at_best_share": round(r.traded_at_best / traded, 4) if traded else None,
+            "deep_share": round(r.traded_deep / traded, 4) if traded else None,
+        })
+    return out
+
+
+async def prune_micro_minute(keep_days: int = 90) -> int:
+    """Чистка производных тем же сроком, что поток, стакан и свечи."""
+    cutoff = (datetime.now(timezone.utc) + timedelta(hours=3)
+              - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+    async with async_session() as session:
+        result = await session.execute(
+            delete(MicroMinute).where(MicroMinute.ts < cutoff))
+        await session.commit()
+        return result.rowcount or 0
 
 
 async def prune_candle_minute(keep_days: int = 90) -> int:

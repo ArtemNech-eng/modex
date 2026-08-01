@@ -78,8 +78,11 @@
 <footer>
   Карточка <b>описывает состояние</b>, а не советует. Направления, целей и рекомендаций здесь нет:
   что из этого предшествует движению цены — не измерено.<br>
-  Цена, уровни и текущая минута идут из памяти стрима — доли секунды. Всё, что считается по прошлым
-  минутам (3м, 5м, VWAP, структура, события) — до 20 секунд.<br>
+  Цена, уровни, перекос за 10с/30с, скорость ликвидности и исполнение идут из памяти стрима — доли
+  секунды. Всё, что считается по прошлым минутам (3м, 5м, VWAP, структура, события) — до 20 секунд.<br>
+  Секундный ряд в базу не пишется: 4.9 млн строк в день и <b>35 ГБ за 90 дней</b> при 20 ГБ свободных.
+  В базу уходят его свойства по минутам — размах перекоса, сколько лотов пришло и ушло, исполнение
+  относительно лучшей цены.<br>
   «Структура» — описание последних пяти минут. 31.07 требование «структура вверх» для покупки на
   откате измерялось <b>вредным</b>: t=−12.57, положительных дней 16%.
 </footer>
@@ -137,6 +140,33 @@ function card(tk) {
      + `${price != null ? price : "—"} <span style="font-size:12px">${pct(f.change_3m_pct)} / 3м</span></div>`;
 
   h += `<div class="lbl">крупный уровень</div>${level((f.levels || [])[0])}`;
+
+  // Секундные показатели идут из ЛЁГКОГО ответа — они обновляются раз в
+  // секунду, в отличие от минутных, которые раз в десять.
+  const im = l.imbalance || f.imbalance, sp = l.liquidity_speed || f.liquidity_speed,
+        ex = l.execution || f.execution;
+  h += `<div class="lbl">перекос стакана · за 10с / 30с</div>`;
+  h += im && im.imb != null
+    ? `<div class="row"><span class="${im.imb > .5 ? 'up' : 'down'}">`
+      + `${(im.imb * 100).toFixed(1)}% покупателей</span><span>`
+      + `${im.imb_d10s != null ? (im.imb_d10s > 0 ? "+" : "") + (im.imb_d10s * 100).toFixed(1) : "—"}`
+      + ` / ${im.imb_d30s != null ? (im.imb_d30s > 0 ? "+" : "") + (im.imb_d30s * 100).toFixed(1) : "—"} п.п.</span></div>`
+    : `<div class="empty">секундного ряда нет</div>`;
+
+  h += `<div class="lbl">скорость ликвидности, лот/с</div>`;
+  h += sp && sp.bid_added_per_sec != null
+    ? `<div class="row"><span class="dim">bid +/−</span><span>`
+      + `<span class="up">${sp.bid_added_per_sec}</span> / <span class="down">${sp.bid_removed_per_sec}</span></span></div>`
+      + `<div class="row"><span class="dim">ask +/−</span><span>`
+      + `<span class="up">${sp.ask_added_per_sec}</span> / <span class="down">${sp.ask_removed_per_sec}</span></span></div>`
+    : `<div class="empty">стакан не менялся</div>`;
+
+  h += `<div class="lbl">исполнение относительно лучшей</div>`;
+  h += ex && ex.traded_lots
+    ? `<div class="row"><span class="dim">по лучшей / рядом / глубже</span><span>`
+      + `${(ex.at_best_share * 100).toFixed(0)}% / ${(ex.near_share * 100).toFixed(0)}%`
+      + ` / <span class="${ex.deep_share > .3 ? 'warn' : ''}">${(ex.deep_share * 100).toFixed(0)}%</span></span></div>`
+    : `<div class="empty">сделок в окне нет</div>`;
 
   h += `<div class="lbl">поток за 5м</div>`;
   h += fl
