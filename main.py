@@ -508,6 +508,7 @@ async def market_snapshot_pipeline():
                 # на трёх днях проверить нельзя ничего.
                 await db.prune_flow_minute(keep_days=FLOW_MINUTE_KEEP_DAYS)
                 await db.prune_book_minute(keep_days=BOOK_MINUTE_KEEP_DAYS)
+                await db.prune_candle_minute(keep_days=BOOK_MINUTE_KEEP_DAYS)
         except Exception as e:
             logger.debug(f"market snapshot: {e}")
         # В сессию — частые снимки (90с); вне сессии — редкие (300с): экономим API,
@@ -562,7 +563,7 @@ async def stream_pipeline():
         logger.error("Стрим: ни одной бумаги не разрешено, выхожу")
         return
 
-    async def _flush(flow: dict, book: dict):
+    async def _flush(flow: dict, book: dict, candle: dict):
         """
         Карты приходят видом источник -> тикер -> строки. Биржевое и дилерское
         пишутся в РАЗНЫЕ строки, а не складываются: от смешивания бесполезны
@@ -577,6 +578,9 @@ async def stream_pipeline():
             for tk, rows in per_ticker.items():
                 n = await db.merge_book_minutes(tk, rows, source=src)
                 counts[f"стакан/{src}"] = counts.get(f"стакан/{src}", 0) + n
+        for tk, rows in candle.items():
+            n = await db.merge_candle_minutes(tk, rows)
+            counts["свечи"] = counts.get("свечи", 0) + n
         if counts:
             logger.debug("стрим записал: %s", counts)
 

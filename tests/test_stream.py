@@ -65,7 +65,7 @@ def test_trades_land_in_their_own_minutes():
     a = Aggregator()
     a.add_trade("SBER", _utc(7, 0, 10), 1, 100.0, 5)
     a.add_trade("SBER", _utc(7, 1, 5), 1, 101.0, 7)
-    flow, _ = a.drain()
+    flow, _, _ = a.drain()
     assert [r["ts"] for r in flow["exchange"]["SBER"]] == ["2026-08-03T10:00", "2026-08-03T10:01"]
 
 
@@ -111,7 +111,7 @@ def test_zero_quantity_and_empty_ticker_are_ignored():
     a = Aggregator()
     a.add_trade("SBER", _utc(7, 0, 10), 1, 100.0, 0)
     a.add_trade("", _utc(7, 0, 10), 1, 100.0, 5)
-    assert a.drain() == ({}, {})
+    assert a.drain() == ({}, {}, {})
 
 
 # ─── стакан ───────────────────────────────────────────────────────────────────
@@ -165,7 +165,7 @@ def test_drain_empties_the_buffer():
     a = Aggregator()
     a.add_trade("SBER", _utc(7, 0, 10), 1, 100.0, 5)
     assert a.drain()[0]
-    assert a.drain() == ({}, {})
+    assert a.drain() == ({}, {}, {})
 
 
 # ─── склейка стакана в 5m/session ─────────────────────────────────────────────
@@ -310,10 +310,11 @@ def test_subscription_requests_are_built_and_serialize():
     s = MarketStream("нет-токена",
                      {"SBER": "BBG004730N88", "MVID": "BBG004S68CP5"}, depth=20)
     reqs = list(s._subscribe_requests())
-    assert len(reqs) == 2, "две подписки: сделки и стаканы"
+    assert len(reqs) == 3, "три подписки: сделки, стаканы, свечи"
 
     kinds = [r.WhichOneof("payload") for r in reqs]
-    assert kinds == ["subscribe_trades_request", "subscribe_order_book_request"]
+    assert kinds == ["subscribe_trades_request", "subscribe_order_book_request",
+                     "subscribe_candles_request"]
 
     tr = reqs[0].subscribe_trades_request
     assert len(tr.instruments) == 2
@@ -336,7 +337,7 @@ def test_all_instruments_go_in_one_request_per_type():
     from src.collector.stream import MarketStream
     figis = {f"T{i:02d}": f"FIGI{i:08d}" for i in range(80)}
     reqs = list(MarketStream("x", figis)._subscribe_requests())
-    assert len(reqs) == 2
+    assert len(reqs) == 3
     assert len(reqs[0].subscribe_trades_request.instruments) == 80
 
 
@@ -648,6 +649,140 @@ def test_level_columns_are_migrated():
         assert col in block, f"{col} не мигрируется"
 
 
+# ─── свечи: объём накопительный, его нельзя складывать ────────────────────────
+#
+# Без свечей минутного бара у нас не было вовсе: поток сделок даёт VWAP и объём,
+# но не open/high/low/close. За OHLC система ходила в REST, а ISS отдаёт минутки
+# с задержкой около 15 минут — для интрадея бесполезно.
+
+def test_candle_volume_is_replaced_not_summed():
+    """
+    САМАЯ ОПАСНАЯ ЛОВУШКА. Биржа присылает свечу многократно по ходу минуты, и в
+    каждой версии volume уже включает всё предыдущее. Сложение версий завысило бы
+    объём в разы — и выглядело бы правдоподобно, как уже было с накопленной
+    дельтой 31.07.
+    """
+    a = Aggregator()
+    for vol in (100, 250, 400):            # одна и та же минута, объём растёт
+        a.add_candle("SBER", _utc(7, 0, 10), 100.0, 101.0, 99.0, 100.5,
+                     volume=vol, vol_buy=vol // 2, vol_sell=vol // 2)
+    r = a.drain()[2]["SBER"][0]
+    assert r["volume"] == 400, "последняя версия, а не 100+250+400"
+    assert r["updates"] == 3, "число версий при этом считается"
+
+
+def test_candle_borders_expand_and_close_is_last():
+    """
+    high и low берутся крайними: пакеты могут прийти не по порядку, а
+    «корректирующая» свеча приходит уже после закрытия интервала.
+    """
+    a = Aggregator()
+    a.add_candle("X", _utc(7, 0, 10), 100.0, 101.0, 99.5, 100.5, 10, 5, 5)
+    a.add_candle("X", _utc(7, 0, 40), 100.0, 103.0, 98.0, 102.0, 20, 12, 8)
+    a.add_candle("X", _utc(7, 0, 50), 100.0, 102.0, 99.0, 101.5, 25, 15, 10)
+    r = a.drain()[2]["X"][0]
+    assert r["open"] == 100.0, "открытие не меняется"
+    assert r["high"] == 103.0 and r["low"] == 98.0, "границы крайние"
+    assert r["close"] == 101.5, "закрытие — последнее"
+
+
+def test_candle_carries_exchange_side_split():
+    """
+    volume_buy и volume_sell приходят от биржи В САМОЙ СВЕЧЕ. Это независимая
+    сверка нашего разбора направлений: заметное расхождение означает ошибку в
+    одном из двух расчётов.
+    """
+    a = Aggregator()
+    a.add_candle("X", _utc(7, 0, 10), 1.0, 1.0, 1.0, 1.0, 100, 70, 30)
+    r = a.drain()[2]["X"][0]
+    assert r["volume_buy"] == 70 and r["volume_sell"] == 30
+
+
+from src.db import aggregate_candles                              # noqa: E402
+
+CANDLES = [
+    {"ts": "2026-08-03T10:00", "session": "main", "open": 100.0, "high": 101.0,
+     "low": 99.0, "close": 100.5, "volume": 500, "volume_buy": 300,
+     "volume_sell": 200},
+    {"ts": "2026-08-03T10:01", "session": "main", "open": 100.5, "high": 103.0,
+     "low": 100.0, "close": 102.0, "volume": 700, "volume_buy": 500,
+     "volume_sell": 200},
+]
+
+
+def test_glued_bar_takes_first_open_and_last_close():
+    r = aggregate_candles(CANDLES, 5, "X")
+    assert len(r) == 1
+    assert r[0]["open"] == 100.0, "открытие ПЕРВОЙ минуты"
+    assert r[0]["close"] == 102.0, "закрытие ПОСЛЕДНЕЙ"
+    assert r[0]["high"] == 103.0 and r[0]["low"] == 99.0
+
+
+def test_volume_across_minutes_is_summed():
+    """
+    Внутри одной минуты объём накопительный, а РАЗНЫЕ минуты не пересекаются —
+    там складывать и нужно. Легко перепутать одно с другим.
+    """
+    r = aggregate_candles(CANDLES, 5, "X")[0]
+    assert r["volume"] == 1200
+    assert r["volume_buy"] == 800 and r["volume_sell"] == 400
+    assert r["buy_ratio"] == pytest.approx(800 / 1200, abs=1e-4)   # округляем до 4 знаков
+
+
+def test_range_and_change_are_derived_on_read():
+    r = aggregate_candles(CANDLES, 5, "X")[0]
+    assert r["range"] == pytest.approx(4.0)     # 103 - 99
+    assert r["change"] == pytest.approx(2.0)    # 102 - 100
+
+
+# ─── живое состояние: минуя базу ──────────────────────────────────────────────
+
+def test_snapshot_does_not_empty_the_buffer():
+    """
+    Сброс в базу идёт раз в 20 секунд, и до него минута существует только в
+    памяти. Живой запрос обязан читать, НЕ забирая: иначе он украл бы данные у
+    записи, и минута не попала бы в базу вовсе.
+    """
+    a = Aggregator()
+    a.add_trade("SBER", _utc(7, 0, 10), 1, 100.0, 5)
+    a.add_book("SBER", _utc(7, 0, 10), 600, 400, 100.0, 100.1)
+    a.add_candle("SBER", _utc(7, 0, 10), 100.0, 101.0, 99.0, 100.5, 50, 30, 20)
+
+    snap = a.snapshot("SBER")
+    assert snap["flow"]["exchange"]["buy_volume"] == 5
+    assert snap["book"]["exchange"]["bid_vol_sum"] == 600
+    assert snap["candle"]["close"] == 100.5
+
+    flow, book, candle = a.drain()
+    assert flow and book and candle, "после снимка данные ОСТАЛИСЬ для записи"
+
+
+def test_snapshot_is_a_copy_not_a_reference():
+    """Правка ответа не должна менять накопитель."""
+    a = Aggregator()
+    a.add_trade("X", _utc(7, 0, 10), 1, 100.0, 5)
+    snap = a.snapshot("X")
+    snap["flow"]["exchange"]["buy_volume"] = 999999
+    assert a.drain()[0]["exchange"]["X"][0]["buy_volume"] == 5
+
+
+def test_snapshot_filters_by_ticker():
+    a = Aggregator()
+    a.add_trade("SBER", _utc(7, 0, 10), 1, 100.0, 5)
+    a.add_trade("GAZP", _utc(7, 0, 10), 1, 100.0, 7)
+    assert a.snapshot("SBER")["flow"]["exchange"]["buy_volume"] == 5
+    assert a.snapshot("MVID") == {"flow": {}, "book": {}, "candle": None}
+
+
+def test_candle_and_live_endpoints_exist():
+    src = (ROOT / "src/api/main.py").read_text()
+    assert "/api/candles/{ticker}" in src
+    assert "/api/live/{ticker}" in src
+    main = (ROOT / "main.py").read_text()
+    assert "merge_candle_minutes" in main, "свечи должны писаться при сбросе"
+    assert "prune_candle_minute" in main, "и чиститься по сроку"
+
+
 def test_handler_failure_is_not_swallowed():
     """
     Проглоченное исключение и скрыло всю историю. Ошибка разбора обязана
@@ -714,9 +849,21 @@ def test_broken_task_takes_the_others_down_with_it():
 
 
 def test_subscription_count_fits_one_connection():
-    """160 подписок на 80 бумаг против лимита в 300 на соединение."""
+    """240 подписок на 80 бумаг против лимита в 300 на соединение."""
     from src.collector.stream import MarketStream
     figis = {f"T{i:02d}": f"FIGI{i:08d}" for i in range(80)}
     reqs = list(MarketStream("x", figis)._subscribe_requests())
     total = sum(len(getattr(r, r.WhichOneof("payload")).instruments) for r in reqs)
-    assert total == 160 and total <= 300
+    assert total == 240, "80 бумаг на три типа данных"
+    assert total <= 300, "лимит на одно соединение"
+
+
+def test_candles_are_one_minute():
+    """Интервал минутный: на нём и строится вся интрадей-картина."""
+    from src.collector.stream import MarketStream
+    reqs = list(MarketStream("x", {"SBER": "F1"})._subscribe_requests())
+    cd = reqs[2].subscribe_candles_request
+    assert all(i.interval == pb.SUBSCRIPTION_INTERVAL_ONE_MINUTE
+               for i in cd.instruments)
+    assert cd.waiting_close is False, \
+        "нужна свеча, обновляемая ПО ХОДУ минуты, а не только на закрытии"

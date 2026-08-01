@@ -462,6 +462,63 @@ async def get_book(ticker: str, day: Optional[str] = None, res: str = "1m",
             "count": len(rows), "rows": rows}
 
 
+@app.get("/api/candles/{ticker}", summary="Минутные бары из потока (OHLC)")
+async def get_stream_candles(ticker: str, day: Optional[str] = None,
+                             res: str = "1m"):
+    """
+    OHLC каждой минуты из ПОТОКА, без задержки.
+
+    Зачем отдельно от /api/technical/{ticker}/candles. Тот маршрут ходит в REST
+    и ISS; ISS отдаёт минутки с задержкой около 15 минут, что для интрадея
+    бесполезно. Здесь бар обновляется по ходу минуты.
+
+    volume_buy и volume_sell приходят от биржи В САМОЙ СВЕЧЕ. Это независимая
+    сверка нашего разбора направлений в /api/flow: расхождение означает ошибку
+    в одном из двух.
+
+    res: 1m | 5m | 15m | 30m | session
+    """
+    if not ticker_known(ticker):
+        raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
+    if res not in ("1m", "5m", "15m", "30m", "session"):
+        raise HTTPException(status_code=400,
+                            detail="res должен быть 1m, 5m, 15m, 30m или session")
+    d = day or (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d")
+    rows = await db.candle_series(ticker, d, res)
+    return {"ticker": ticker.upper(), "day": d, "res": res,
+            "count": len(rows), "rows": rows}
+
+
+@app.get("/api/live/{ticker}", summary="Прямо сейчас: из памяти, без ожидания сброса")
+async def get_live(ticker: str):
+    """
+    Текущая минута ИЗ ПАМЯТИ накопителя, минуя базу.
+
+    Сброс в базу идёт раз в 20 секунд, поэтому маршруты /api/flow, /api/book и
+    /api/candles отстают на эти 20 секунд. Здесь отдаётся то, что накопилось
+    прямо сейчас — минута ещё не закрыта и данные частичные, зато свежие.
+
+    Замер 01.08: отставание базы от реальности 16-64 секунды. Здесь — доли
+    секунды.
+    """
+    if not ticker_known(ticker):
+        raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
+    from src.collector.stream import CURRENT
+    from config.settings import STREAM_ENABLED
+    if CURRENT is None:
+        return {"ticker": ticker.upper(), "live": False,
+                "reason": ("стрим выключен" if not STREAM_ENABLED
+                           else "стрим ещё не поднялся")}
+    snap = CURRENT.agg.snapshot(ticker)
+    age = CURRENT.last_msg.get(ticker.upper())
+    return {
+        "ticker": ticker.upper(), "live": True,
+        "last_packet_sec": (round((datetime.now(timezone.utc) - age).total_seconds(), 2)
+                            if age else None),
+        **snap,
+    }
+
+
 @app.get("/api/stream/health", summary="Жив ли поток и по каким бумагам")
 async def stream_health():
     """

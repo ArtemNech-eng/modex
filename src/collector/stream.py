@@ -9,8 +9,8 @@
 
 Лимиты стрима (проверено по документации 01.08):
     подписок на одно соединение     300   свечи + стаканы + сделки суммарно
-    нам нужно                       160   80 бумаг × 2 типа
-    запросов на подписку в минуту   100   мы шлём 2
+    нам нужно                       240   80 бумаг × 3 типа
+    запросов на подписку в минуту   100   мы шлём 3
     доставка сделок                 без ограничения частоты
     доставка стакана                не чаще раза в 100 мс
 
@@ -146,9 +146,46 @@ class Aggregator:
     def __init__(self):
         self.flow: dict = {}
         self.book: dict = {}
+        self.candle: dict = {}
         self.trades_seen = 0
         self.books_seen = 0
         self.books_skipped = 0
+        self.candles_seen = 0
+
+    def add_candle(self, ticker: str, when: datetime, o: float, h: float,
+                   lo: float, c: float, volume: int, vol_buy: int,
+                   vol_sell: int) -> None:
+        """
+        Свеча минуты. Хранится ПОСЛЕДНЯЯ версия, а не сумма версий.
+
+        ГЛАВНАЯ ТОНКОСТЬ. Объём в свече НАКОПИТЕЛЬНЫЙ за интервал: биржа
+        присылает свечу многократно по ходу минуты, и в каждой версии volume уже
+        включает всё предыдущее. Складывать версии — значит завысить объём в
+        разы. Поэтому здесь замена, а не сложение.
+
+        Границы high и low всё же берутся крайними значениями: пакеты могут
+        прийти не по порядку, а «корректирующая» свеча после закрытия периода
+        приходит отдельно.
+        """
+        if not ticker:
+            return
+        mk = msk_minute(when)
+        k = (ticker.upper(), mk)
+        r = self.candle.get(k)
+        if r is None:
+            r = {"ts": mk, "session": session_of(mk), "open": o, "high": h,
+                 "low": lo, "close": c, "volume": volume,
+                 "volume_buy": vol_buy, "volume_sell": vol_sell, "updates": 0}
+            self.candle[k] = r
+        else:
+            r["high"] = max(r["high"], h)
+            r["low"] = min(r["low"], lo) if r["low"] > 0 else lo
+            r["close"] = c
+            r["volume"] = volume                    # НЕ +=, объём накопительный
+            r["volume_buy"] = vol_buy
+            r["volume_sell"] = vol_sell
+        r["updates"] += 1
+        self.candles_seen += 1
 
     def add_trade(self, ticker: str, when: datetime, direction: int,
                   price: float, qty: int, source: str = "exchange") -> None:
@@ -223,7 +260,28 @@ class Aggregator:
         r["imb_max"] = max(r["imb_max"], share)
         self.books_seen += 1
 
-    def drain(self) -> tuple[dict, dict]:
+    def snapshot(self, ticker: str) -> dict:
+        """
+        Текущее состояние по бумаге БЕЗ обнуления — для живого запроса.
+
+        Сброс в базу идёт раз в 20 секунд, и до него минута существует только
+        здесь. Эндпоинт, который читает базу, отстаёт на эти 20 секунд; этот
+        метод отдаёт то, что есть прямо сейчас.
+        """
+        tk = ticker.upper()
+        out: dict = {"flow": {}, "book": {}, "candle": None}
+        for (src, t, _), r in self.flow.items():
+            if t == tk:
+                out["flow"][src] = dict(r)
+        for (src, t, _), r in self.book.items():
+            if t == tk:
+                out["book"][src] = dict(r)
+        for (t, _), r in self.candle.items():
+            if t == tk:
+                out["candle"] = dict(r)
+        return out
+
+    def drain(self) -> tuple[dict, dict, dict]:
         """
         Отдать накопленное и обнулить. Две карты вида источник -> тикер -> строки.
 
@@ -243,8 +301,11 @@ class Aggregator:
         b: dict = {}
         for (src, tk, _), r in self.book.items():
             b.setdefault(src, {}).setdefault(tk, []).append(r)
-        self.flow, self.book = {}, {}
-        return f, b
+        c: dict = {}
+        for (tk, _), r in self.candle.items():
+            c.setdefault(tk, []).append(r)
+        self.flow, self.book, self.candle = {}, {}, {}
+        return f, b, c
 
 
 class MarketStream:
@@ -266,7 +327,7 @@ class MarketStream:
         self.last_msg: dict = {}          # тикер -> время последнего пакета
         self.stats = {"connected_at": None, "reconnects": 0, "messages": 0,
                       "trades": 0, "trades_dealer": 0, "books": 0,
-                      "books_dealer": 0, "books_skipped": 0,
+                      "candles": 0, "books_dealer": 0, "books_skipped": 0,
                       "last_error": None, "subscribed": 0, "subscriptions": {},
                       "sources": {}, "handler_errors": 0,
                       "last_handler_error": None}
@@ -308,6 +369,20 @@ class MarketStream:
                 instruments=[md.OrderBookInstrument(instrument_id=f,
                                                     depth=self.depth)
                              for f in ids],
+            ))
+        # Свечи. Без них минутного бара у нас нет вовсе: поток сделок даёт VWAP
+        # и объём, но не open/high/low/close. За OHLC система ходила в REST, а
+        # ISS отдаёт минутки с задержкой ~15 минут — для интрадея бесполезно.
+        #
+        # waiting_close НЕ ставим: нужна свеча, обновляемая по ходу минуты, а не
+        # только на её закрытии. Биржа шлёт её не чаще раза в 100 мс плюс
+        # отдельную «корректирующую», если сделки дошли после конца интервала.
+        yield md.MarketDataRequest(
+            subscribe_candles_request=md.SubscribeCandlesRequest(
+                subscription_action=md.SUBSCRIPTION_ACTION_SUBSCRIBE,
+                instruments=[md.CandleInstrument(
+                    instrument_id=f,
+                    interval=md.SUBSCRIPTION_INTERVAL_ONE_MINUTE) for f in ids],
             ))
 
     async def _request_iter(self, queue: asyncio.Queue):
@@ -375,6 +450,16 @@ class MarketStream:
                               bid5=bid5, ask5=ask5,
                               bid_top=bid_top, ask_top=ask_top)
             self.stats["books_dealer" if src == "dealer" else "books"] += 1
+        elif name == "candle":
+            cd = resp.candle
+            tk = (cd.ticker or "").upper()
+            self.last_msg[tk] = datetime.now(timezone.utc)
+            when = cd.time.ToDatetime().replace(tzinfo=timezone.utc)
+            self.agg.add_candle(tk, when, quotation(cd.open), quotation(cd.high),
+                                quotation(cd.low), quotation(cd.close),
+                                int(cd.volume), int(cd.volume_buy),
+                                int(cd.volume_sell))
+            self.stats["candles"] += 1
         elif name in SUB_FIELD:
             self._handle_subscription(name, getattr(resp, name))
         self.stats["messages"] += 1
@@ -482,12 +567,12 @@ class MarketStream:
     async def _flusher(self) -> None:
         while not self._stopped:
             await asyncio.sleep(self.flush_sec)
-            flow, book = self.agg.drain()
-            if not flow and not book:
+            flow, book, candle = self.agg.drain()
+            if not flow and not book and not candle:
                 continue
             if self.on_flush:
                 try:
-                    await self.on_flush(flow, book)
+                    await self.on_flush(flow, book, candle)
                 except Exception as e:                       # noqa: BLE001
                     logger.warning("запись потока не удалась: %s", e)
 

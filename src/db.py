@@ -395,6 +395,41 @@ class BookMinute(Base):
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+class CandleMinute(Base):
+    """
+    Минутный бар из ПОТОКА, а не из REST.
+
+    Зачем отдельно от flow_minute. Там лежит поток сделок: объёмы, дельта,
+    крупнейшая сделка, VWAP. Но там НЕТ open/high/low/close — по потоку их не
+    восстановить. За OHLC система ходила в REST, а ISS отдаёт минутки с
+    задержкой около 15 минут, что для интрадея бесполезно.
+
+    ОБЪЁМ НАКОПИТЕЛЬНЫЙ. Биржа присылает свечу многократно по ходу минуты, и в
+    каждой версии volume уже включает всё предыдущее. При обновлении строки
+    объём ЗАМЕНЯЕТСЯ, а не прибавляется — иначе он вырос бы в разы.
+
+    volume_buy и volume_sell приходят от биржи в самой свече. Это независимая
+    сверка нашего разбора направлений в flow_minute: если разойдутся заметно,
+    значит где-то ошибка в одном из двух.
+    """
+    __tablename__ = "candle_minute"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)   # "ts:TICKER"
+    ts: Mapped[str] = mapped_column(String(16), index=True)          # МСК
+    ticker: Mapped[str] = mapped_column(String(32), index=True)
+    session: Mapped[str] = mapped_column(String(8), default="main")
+    open: Mapped[float] = mapped_column(Float, default=0.0)
+    high: Mapped[float] = mapped_column(Float, default=0.0)
+    low: Mapped[float] = mapped_column(Float, default=0.0)
+    close: Mapped[float] = mapped_column(Float, default=0.0)
+    volume: Mapped[int] = mapped_column(Integer, default=0)          # лоты
+    volume_buy: Mapped[int] = mapped_column(Integer, default=0)
+    volume_sell: Mapped[int] = mapped_column(Integer, default=0)
+    updates: Mapped[int] = mapped_column(Integer, default=0)         # версий свечи
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 class SignalAttempt(Base):
     """
     ЖУРНАЛ ПОПЫТОК (наблюдаемость воронки сигналов).
@@ -2355,6 +2390,122 @@ async def book_series(ticker: str, day: str, res: str = "1m",
               "ask5_sum": r.ask5_sum, "bid_top_max": r.bid_top_max,
               "ask_top_max": r.ask_top_max} for r in rows]
     return aggregate_book(plain, step, ticker)
+
+
+async def merge_candle_minutes(ticker: str, rows: list[dict]) -> int:
+    """
+    Влить минутные свечи. Объём ЗАМЕНЯЕТСЯ, границы расширяются.
+
+    Складывать объём нельзя: в свече он накопительный за интервал, и каждая
+    следующая версия уже содержит предыдущую.
+    """
+    if not rows:
+        return 0
+    n = 0
+    try:
+        async with async_session() as session:
+            for r in rows:
+                key = f"{r['ts']}:{ticker.upper()}"
+                row = await session.get(CandleMinute, key)
+                if row is None:
+                    row = CandleMinute(
+                        key=key, ts=r["ts"], ticker=ticker.upper(),
+                        session=r.get("session") or "main",
+                        open=float(r.get("open") or 0.0),
+                        high=float(r.get("high") or 0.0),
+                        low=float(r.get("low") or 0.0),
+                        close=float(r.get("close") or 0.0),
+                        volume=0, volume_buy=0, volume_sell=0, updates=0)
+                    session.add(row)
+                else:
+                    row.high = max(row.high, float(r.get("high") or 0.0))
+                    lo = float(r.get("low") or 0.0)
+                    row.low = min(row.low, lo) if row.low > 0 and lo > 0 else (lo or row.low)
+                    row.close = float(r.get("close") or row.close)
+                # ЗАМЕНА, не сложение: объём в свече накопительный
+                row.volume = int(r.get("volume") or 0)
+                row.volume_buy = int(r.get("volume_buy") or 0)
+                row.volume_sell = int(r.get("volume_sell") or 0)
+                row.updates += int(r.get("updates") or 1)
+                row.updated_at = datetime.now(timezone.utc)
+                n += 1
+            await session.commit()
+    except Exception as e:                                       # noqa: BLE001
+        logger.debug(f"merge_candle_minutes {ticker}: {e}")
+        return 0
+    return n
+
+
+def aggregate_candles(rows: list[dict], step: int, ticker: str = "") -> list[dict]:
+    """
+    Склейка минутных свечей в бары нужного шага. ЧИСТАЯ функция.
+
+    open берётся ПЕРВОЙ минуты, close — ПОСЛЕДНЕЙ, high и low крайними,
+    объём складывается. Здесь объём складывать МОЖНО и НУЖНО: накопительный он
+    внутри одной минуты, а разные минуты не пересекаются.
+    """
+    if not rows:
+        return []
+    buckets: dict = {}
+    order: list = []
+    for r in rows:
+        ts = r["ts"]
+        mm = int(ts[11:13]) * 60 + int(ts[14:16])
+        k = mm // step
+        if k not in buckets:
+            buckets[k] = {"ts": ts, "o": r.get("open") or 0.0,
+                          "h": r.get("high") or 0.0, "l": r.get("low") or 0.0,
+                          "c": r.get("close") or 0.0, "v": 0, "vb": 0, "vs": 0,
+                          "session": r.get("session") or "main"}
+            order.append(k)
+        b = buckets[k]
+        b["h"] = max(b["h"], r.get("high") or 0.0)
+        lo = r.get("low") or 0.0
+        b["l"] = min(b["l"], lo) if b["l"] > 0 and lo > 0 else (lo or b["l"])
+        b["c"] = r.get("close") or b["c"]
+        b["v"] += r.get("volume") or 0
+        b["vb"] += r.get("volume_buy") or 0
+        b["vs"] += r.get("volume_sell") or 0
+    out = []
+    for k in order:
+        b = buckets[k]
+        tot = b["vb"] + b["vs"]
+        out.append({
+            "ts": b["ts"], "ticker": ticker.upper(), "session": b["session"],
+            "open": b["o"], "high": b["h"], "low": b["l"], "close": b["c"],
+            "volume": b["v"], "volume_buy": b["vb"], "volume_sell": b["vs"],
+            "buy_ratio": round(b["vb"] / tot, 4) if tot else None,
+            "range": round(b["h"] - b["l"], 6) if b["h"] and b["l"] else None,
+            "change": round(b["c"] - b["o"], 6) if b["o"] else None,
+        })
+    return out
+
+
+async def candle_series(ticker: str, day: str, res: str = "1m") -> list[dict]:
+    """Минутные бары из потока за день. res: 1m | 5m | 15m | 30m | session."""
+    step = FLOW_RES.get(res, 1)
+    async with async_session() as session:
+        q = (select(CandleMinute)
+             .where(CandleMinute.ticker == ticker.upper(),
+                    CandleMinute.ts.like(f"{day}%"))
+             .order_by(CandleMinute.ts))
+        rows = (await session.execute(q)).scalars().all()
+    plain = [{"ts": r.ts, "session": r.session, "open": r.open, "high": r.high,
+              "low": r.low, "close": r.close, "volume": r.volume,
+              "volume_buy": r.volume_buy, "volume_sell": r.volume_sell}
+             for r in rows]
+    return aggregate_candles(plain, step, ticker)
+
+
+async def prune_candle_minute(keep_days: int = 90) -> int:
+    """Чистка минутных свечей тем же сроком, что поток и стакан."""
+    cutoff = (datetime.now(timezone.utc) + timedelta(hours=3)
+              - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+    async with async_session() as session:
+        result = await session.execute(
+            delete(CandleMinute).where(CandleMinute.ts < cutoff))
+        await session.commit()
+        return result.rowcount or 0
 
 
 async def prune_book_minute(keep_days: int = 90) -> int:
