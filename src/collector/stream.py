@@ -357,6 +357,17 @@ class MarketStream:
         # минуте: суммы одинаковые, события разные.
         from src.analysis.trade_tape import TradeTape
         self.tape = TradeTape()
+        # МИНУТНАЯ ИСТОРИЯ ЗАКРЫТИЙ по всем бумагам, в памяти.
+        #
+        # Нужна для широты рынка: сколько бумаг растёт и падает прямо сейчас.
+        # Считать это из базы значило бы 80 запросов на каждую карточку — а
+        # ответ один и тот же для всех. Здесь он готов и стоит 1600 чисел.
+        #
+        # Именно широта отвечает на то, что индекс СКРЫВАЕТ: он может расти на
+        # двух тяжёлых бумагах при том, что падают шестьдесят.
+        self.minutes: dict = {}       # тикер -> deque[(минута, закрытие)]
+        self.imoex: dict = {}         # индекс из ISS, с возрастом
+        self.sectors: dict = {}       # тикер -> сектор, из индексов MOEX
         self.lots: dict = {}          # тикер -> лотность, из ISS
         self.steps: dict = {}         # тикер -> шаг цены, из ISS
         self.atr: dict = {}           # тикер -> дневной ATR, из ISS
@@ -722,6 +733,30 @@ class MarketStream:
     def stop(self) -> None:
         self._stopped = True
 
+    def note_minute(self, ticker: str, ts: str, close) -> None:
+        """
+        Запомнить закрытие минуты по бумаге — для широты рынка.
+
+        Держится в памяти, потому что ответ ОДИН И ТОТ ЖЕ для всех карточек:
+        считать его из базы значило бы 80 запросов на каждый запрос экрана.
+        Здесь он стоит полторы тысячи чисел.
+
+        Минута может прийти повторно — сброс идёт чаще, чем раз в минуту.
+        Тогда значение перезаписывается, а не дублируется: иначе «за 5 минут»
+        означало бы «за пять последних записей», то есть за полторы минуты.
+        """
+        from collections import deque
+        tk = (ticker or "").upper()
+        if not tk or not ts or not close:
+            return
+        dq = self.minutes.get(tk)
+        if dq is None:
+            dq = self.minutes[tk] = deque(maxlen=40)
+        if dq and dq[-1][0] == ts:
+            dq[-1] = (ts, close)
+        else:
+            dq.append((ts, close))
+
     def health(self) -> dict:
         """Что показывать в диагностике: возраст данных по каждой бумаге."""
         now = datetime.now(timezone.utc)
@@ -738,6 +773,9 @@ class MarketStream:
             "level_logs": self.levels.history.stats(),
             "ticks": self.ticks.stats(),
             "tape": self.tape.stats(),
+            "market": {"tickers_with_minutes": len(self.minutes),
+                       "sectors_known": len(self.sectors),
+                       "imoex": bool(self.imoex)},
             "tickers_subscribed": len(self.figis),
             "tickers_with_data": len(ages),
             "tickers_fresh_60s": fresh,

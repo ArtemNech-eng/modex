@@ -263,6 +263,51 @@ function card(tk) {
   // ПЯТЬ ТАЙМФРЕЙМОВ и согласие. Расхождение младшего со старшим — то, что
   // одна цифра изменения не показывает.
   const tf = f.timeframes || {}, ag = tf.agreement, fr = tf.frames || {};
+  // КОНТЕКСТ РЫНКА. «IMOEX −0.4%, а SBER +0.8%» говорит больше, чем одна
+  // цифра по бумаге: одно и то же движение означает разное в зависимости от
+  // того, куда идёт всё остальное.
+  //
+  // Два эталона рядом: медиана НАШЕЙ корзины (та же секунда) и IMOEX (настоящий
+  // индекс, но опрошенный, с возрастом).
+  const mk = l.market || f.market || {}, mfr = mk.frames || {};
+  const m5 = mfr["5m"] || mfr["1m"] || {};
+  if (m5.breadth) {
+    h += `<div class="lbl">рынок вокруг</div>`;
+    const b = m5.breadth;
+    h += `<div class="row"><span class="dim">растёт / падает / стоит</span><span>`
+       + `<span class="up">${b.up}</span> / <span class="down">${b.down}</span>`
+       + ` / <span class="dim">${b.flat}</span> из ${b.total}</span></div>`;
+    if (mk.index && mk.index.change_pct != null)
+      h += `<div class="row"><span class="dim">IMOEX${
+             mk.index.age_sec != null ? ` · ${Math.round(mk.index.age_sec)}с назад` : ""
+           }</span><span class="${cls(mk.index.change_pct)}">`
+         + `${pct(mk.index.change_pct)}</span></div>`;
+    // Расхождение с корзиной — без задержки, поэтому оно первое.
+    const vb = m5.vs_basket;
+    if (vb && vb.diff_pp != null)
+      h += `<div class="row"><span class="dim">против корзины</span>`
+         + `<span class="${vb.diff_pp > 0 ? "up" : vb.diff_pp < 0 ? "down" : "dim"}">`
+         + `${vb.vs_bench} на ${Math.abs(vb.diff_pp).toFixed(2)} п.п.`
+         + `${vb.opposite ? ' <span class="warn">в разные стороны</span>' : ""}</span></div>`;
+    const vi = m5.vs_index;
+    if (vi && vi.diff_pp != null)
+      h += `<div class="row"><span class="dim">против IMOEX</span>`
+         + `<span class="${vi.diff_pp > 0 ? "up" : vi.diff_pp < 0 ? "down" : "dim"}">`
+         + `${vi.vs_bench} на ${Math.abs(vi.diff_pp).toFixed(2)} п.п.`
+         + `${vi.opposite ? ' <span class="warn">в разные стороны</span>' : ""}</span></div>`;
+    if (m5.rank)
+      h += `<div class="row"><span class="dim">обгоняет бумаг</span>`
+         + `<span>${m5.rank.beats} из ${m5.rank.of}`
+         + ` · ${(m5.rank.percentile * 100).toFixed(0)}%</span></div>`;
+    const sc = mk.sector;
+    if (sc && sc.sector)
+      h += `<div class="row"><span class="dim">${sc.sector}</span><span>`
+         + `<span class="up">${sc.up ?? 0}</span>/<span class="down">${sc.down ?? 0}</span>`
+         + ` из ${sc.peers ?? 0}${sc.too_few ? ' <span class="warn">мало бумаг</span>' : ""}`
+         + `${sc.vs_sector && sc.vs_sector.diff_pp != null
+              ? ` · ${sc.vs_sector.vs_bench}` : ""}</span></div>`;
+  }
+
   h += `<div class="lbl">таймфреймы · согласие</div>`;
   if (ag) {
     const arrow = d => d === "up" ? "↑" : d === "down" ? "↓" : "→";

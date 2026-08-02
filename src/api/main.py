@@ -660,6 +660,25 @@ async def get_book_live(ticker: str, light: bool = False):
             out["pressure"] = tape.pressure_vs_resting(
                 tk, tick_src, now_sec, resting_lots=resting, back=60)
 
+    # КОНТЕКСТ РЫНКА. «IMOEX −0.4%, а SBER +0.8%» говорит больше, чем «SBER
+    # +0.8%»: одно и то же движение бумаги означает разное в зависимости от
+    # того, куда идёт всё остальное.
+    #
+    # ДВА ЭТАЛОНА, и путать их нельзя. Медиана корзины считается из НАШЕГО
+    # потока — та же секунда, задержки нет, но это наши восемьдесят бумаг
+    # равным весом. IMOEX настоящий и взвешенный, но опрошенный, и у него есть
+    # ВОЗРАСТ. На быстром движении задержка переворачивает знак разницы.
+    mins = getattr(CURRENT, "minutes", None)
+    if mins:
+        from src.analysis.market_context import context
+        idx = dict(getattr(CURRENT, "imoex", None) or {})
+        if idx.get("fetched_at"):
+            idx["age_sec"] = round(
+                datetime.now(timezone.utc).timestamp() - idx["fetched_at"], 1)
+        out["market"] = context(mins, tk,
+                                sectors=getattr(CURRENT, "sectors", None),
+                                index=idx or None)
+
     # ── по прошлым минутам: до 20 секунд ─────────────────────────────────────
     #
     # light=true отдаёт ТОЛЬКО память и не ходит в базу.

@@ -610,6 +610,11 @@ async def stream_pipeline():
         for tk, rows in candle.items():
             n = await db.merge_candle_minutes(tk, rows)
             counts["свечи"] = counts.get("свечи", 0) + n
+            # МИНУТНАЯ ИСТОРИЯ в память — для широты рынка. Считать её из базы
+            # значило бы 80 запросов на каждую карточку, а ответ один и тот же
+            # для всех. Здесь он готов и стоит полторы тысячи чисел.
+            for r in rows:
+                stream.note_minute(tk, r.get("ts"), r.get("close"))
         for src, per_ticker in micro.items():
             for tk, rows in per_ticker.items():
                 n = await db.merge_micro_minutes(tk, rows, source=src)
@@ -706,7 +711,104 @@ async def stream_pipeline():
     # Единый порог «возле лучшей цены» был бы неверен почти везде.
     stream.steps = steps
     stream.atr = {}
+
+    # КОНТЕКСТ РЫНКА: индекс IMOEX и отраслевая принадлежность бумаг.
+    #
+    # Оба берутся из ISS — бесплатно и без токена, как лотность и дневные свечи.
+    # Сектор берётся из отраслевых индексов САМОЙ биржи, а не из моей догадки,
+    # кто чем занимается.
+    #
+    # Индекс опрашивается, а не приходит потоком, поэтому у него ЕСТЬ ВОЗРАСТ, и
+    # он отдаётся наружу: на быстром движении задержка способна перевернуть знак
+    # разницы «бумага против рынка».
+    async def _market_background():
+        import urllib.request as u, json as j
+        from datetime import datetime as _dt
+        SECTORS = {
+            "MOEXOG": "нефть и газ", "MOEXEU": "электроэнергетика",
+            "MOEXTL": "телекомы", "MOEXMM": "металлы и добыча",
+            "MOEXFN": "финансы", "MOEXCN": "потребительский",
+            "MOEXCH": "химия", "MOEXTN": "транспорт",
+            "MOEXIT": "информационные технологии", "MOEXRE": "строительство",
+        }
+
+        def _fetch_sectors():
+            out = {}
+            base = ("https://iss.moex.com/iss/statistics/engines/stock/markets/"
+                    "index/analytics/{}.json?iss.meta=off&limit=100")
+            for idx, name in SECTORS.items():
+                try:
+                    d = j.load(u.urlopen(base.format(idx), timeout=25))
+                    a = d.get("analytics") or {}
+                    cols = {c: i for i, c in enumerate(a.get("columns") or [])}
+                    if "ticker" not in cols:
+                        continue
+                    for row in a.get("data") or []:
+                        t = row[cols["ticker"]]
+                        if t:
+                            out[str(t).upper()] = name
+                except Exception:
+                    continue
+            return out
+
+        def _fetch_index():
+            url = ("https://iss.moex.com/iss/engines/stock/markets/index/"
+                   "securities/IMOEX.json?iss.meta=off")
+            d = j.load(u.urlopen(url, timeout=25))
+            md = d.get("marketdata") or {}
+            cols = {c: i for i, c in enumerate(md.get("columns") or [])}
+            rows = md.get("data") or []
+            if not rows:
+                return {}
+            r = rows[0]
+            def g(k):
+                i = cols.get(k)
+                return r[i] if i is not None else None
+            out = {"name": "IMOEX", "value": g("CURRENTVALUE"),
+                   "change_pct": g("LASTCHANGEPRC"), "ts": g("SYSTIME")}
+            # Направление за 1/5/15 минут — из МИНУТНЫХ свечей индекса, а не из
+            # дневного изменения: это разные вопросы.
+            try:
+                today = (datetime.now(timezone.utc) + timedelta(hours=3)
+                         ).strftime("%Y-%m-%d")
+                cu = ("https://iss.moex.com/iss/engines/stock/markets/index/"
+                      f"securities/IMOEX/candles.json?iss.meta=off&interval=1"
+                      f"&from={today}")
+                cd = (j.load(u.urlopen(cu, timeout=25)).get("candles") or {})
+                cc = {c: i for i, c in enumerate(cd.get("columns") or [])}
+                data = cd.get("data") or []
+                closes = [row[cc["close"]] for row in data if cc.get("close") is not None]
+                ch = {}
+                for n in (1, 5, 15):
+                    if len(closes) > n and closes[-n - 1]:
+                        ch[n] = round((closes[-1] - closes[-n - 1])
+                                      / closes[-n - 1] * 100, 4)
+                if ch:
+                    out["changes"] = ch
+                    out["minutes_today"] = len(closes)
+            except Exception:
+                pass
+            return out
+
+        try:
+            sect = await asyncio.to_thread(_fetch_sectors)
+            if sect:
+                stream.sectors = sect
+                logger.info(f"Из ISS: сектор известен по {len(sect)} бумагам")
+        except Exception as e:                                   # noqa: BLE001
+            logger.debug(f"секторы: {e}")
+        while True:
+            try:
+                got = await asyncio.to_thread(_fetch_index)
+                if got:
+                    got["fetched_at"] = datetime.now(timezone.utc).timestamp()
+                    stream.imoex = got
+            except Exception as e:                               # noqa: BLE001
+                logger.debug(f"IMOEX: {e}")
+            await asyncio.sleep(30)
+
     asyncio.create_task(_atr_background())
+    asyncio.create_task(_market_background())
     await stream.run()
 
 
