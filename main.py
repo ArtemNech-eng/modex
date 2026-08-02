@@ -614,7 +614,7 @@ async def stream_pipeline():
             # значило бы 80 запросов на каждую карточку, а ответ один и тот же
             # для всех. Здесь он готов и стоит полторы тысячи чисел.
             for r in rows:
-                stream.note_minute(tk, r.get("ts"), r.get("close"))
+                stream.note_minute(tk, r)
         for src, per_ticker in micro.items():
             for tk, rows in per_ticker.items():
                 n = await db.merge_micro_minutes(tk, rows, source=src)

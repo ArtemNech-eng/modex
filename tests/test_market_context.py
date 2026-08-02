@@ -41,8 +41,20 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 def series(*closes, start=0):
-    """Минутный ряд закрытий с метками времени."""
-    return [(f"2026-08-03T10:{start + i:02d}", c) for i, c in enumerate(closes)]
+    """
+    Минутный ряд БАРОВ: форма та же, что у timeframes.bars.
+
+    Терпит нечисловое закрытие: в жизни оно приходит, и проверять поведение на
+    таком ряду надо.
+    """
+    def bar(i, c):
+        try:
+            hi, lo = float(c) * 1.001, float(c) * 0.999
+        except (TypeError, ValueError):
+            hi = lo = c
+        return {"ts": f"2026-08-03T10:{start + i:02d}", "open": c,
+                "high": hi, "low": lo, "close": c, "volume": 10}
+    return [bar(i, c) for i, c in enumerate(closes)]
 
 
 # ─── изменения по бумагам ─────────────────────────────────────────────────────
@@ -272,11 +284,11 @@ def test_repeated_minute_overwrites_instead_of_duplicating():
     from src.collector.stream import MarketStream
     s = MarketStream.__new__(MarketStream)      # без сети и токена
     s.minutes = {}
-    s.note_minute("SBER", "2026-08-03T10:00", 100.0)
-    s.note_minute("SBER", "2026-08-03T10:00", 100.5)   # та же минута
-    s.note_minute("SBER", "2026-08-03T10:01", 101.0)
-    assert list(s.minutes["SBER"]) == [("2026-08-03T10:00", 100.5),
-                                       ("2026-08-03T10:01", 101.0)]
+    s.note_minute("SBER", {"ts": "2026-08-03T10:00", "close": 100.0})
+    s.note_minute("SBER", {"ts": "2026-08-03T10:00", "close": 100.5})  # та же
+    s.note_minute("SBER", {"ts": "2026-08-03T10:01", "close": 101.0})
+    got = [(b["ts"], b["close"]) for b in s.minutes["SBER"]]
+    assert got == [("2026-08-03T10:00", 100.5), ("2026-08-03T10:01", 101.0)]
 
 
 def test_minute_history_is_bounded_and_skips_junk():
@@ -284,11 +296,13 @@ def test_minute_history_is_bounded_and_skips_junk():
     s = MarketStream.__new__(MarketStream)
     s.minutes = {}
     for i in range(100):
-        s.note_minute("SBER", f"2026-08-03T{10 + i // 60:02d}:{i % 60:02d}", 100.0 + i)
-    assert len(s.minutes["SBER"]) <= 40
-    s.note_minute("", "2026-08-03T10:00", 100.0)
-    s.note_minute("GAZP", None, 100.0)
-    s.note_minute("GAZP", "2026-08-03T10:00", None)
+        s.note_minute("SBER", {"ts": f"2026-08-03T{10 + i // 60:02d}:{i % 60:02d}",
+                               "close": 100.0 + i})
+    assert len(s.minutes["SBER"]) <= 60
+    s.note_minute("", {"ts": "2026-08-03T10:00", "close": 100.0})
+    s.note_minute("GAZP", {"ts": None, "close": 100.0})
+    s.note_minute("GAZP", {"ts": "2026-08-03T10:00", "close": None})
+    s.note_minute("GAZP", None)
     assert "GAZP" not in s.minutes and "" not in s.minutes
 
 

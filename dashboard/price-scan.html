@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Сканер цены</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0c10; --panel: #12151c; --line: #1f242e;
+    --txt: #d6dae2; --dim: #6b7280; --hot: #e8eaee;
+    --up: #16c784; --down: #ea3943; --warn: #f0b90b; --note: #4d7cfe;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--txt);
+    font: 400 13px/1.5 'JetBrains Mono', ui-monospace, monospace;
+    padding: 0 5%;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 20px; flex-wrap: wrap;
+    padding: 22px 0 14px; border-bottom: 1px solid var(--line);
+  }
+  h1 { font-size: 15px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
+  .meta { color: var(--dim); font-size: 11px; }
+  .meta b { color: var(--txt); font-weight: 500; }
+  a { color: var(--note); text-decoration: none; }
+
+  .rates {
+    display: flex; flex-wrap: wrap; gap: 6px 18px;
+    padding: 12px 0; border-bottom: 1px solid var(--line);
+    color: var(--dim); font-size: 11px;
+  }
+  .rates b { color: var(--txt); font-weight: 500; }
+  .rates .hot { color: var(--warn); }
+
+  table { width: 100%; border-collapse: collapse; margin: 14px 0 30px; }
+  th {
+    text-align: left; color: var(--dim); font-size: 10px; font-weight: 400;
+    letter-spacing: .16em; text-transform: uppercase;
+    padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line);
+  }
+  td { padding: 7px 10px 7px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr:hover td { background: var(--panel); }
+  .tk { color: var(--hot); font-weight: 700; font-size: 14px; }
+  .step { color: var(--dim); font-size: 11px; }
+  .why { color: var(--dim); font-size: 11px; }
+  .up { color: var(--up); } .down { color: var(--down); }
+  .warn { color: var(--warn); } .note { color: var(--note); } .dim { color: var(--dim); }
+  .empty { color: var(--dim); padding: 30px 0; }
+  footer { color: var(--dim); font-size: 11px; padding: 0 0 40px; line-height: 1.7; }
+  footer b { color: var(--warn); font-weight: 500; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Сканер цены</h1>
+  <span class="meta">бумаг <b id="n">—</b> · с событиями <b id="k">—</b> · пересчёт <b id="t">—</b></span>
+  <span class="meta"><a href="/market">Наблюдатель рынка →</a></span>
+</header>
+
+<div class="rates" id="rates"></div>
+<div id="out"></div>
+
+<footer>
+  Сканер смотрит <b>только на цену</b>: ни стакана, ни потока. События, которым нужен стакан, живут
+  в Наблюдателе рынка. Разделение не косметическое — событию со стаканом нужна открытая биржа, а
+  цена есть всегда.<br>
+  Считается <b>только по закрытым барам</b>, поэтому пересчёт при закрытии минуты, а не по таймеру.
+  Пока минута не закрылась, «резкого ускорения» не существует: есть бар, границы которого ещё
+  изменятся. 31.07 расчёт по окну с текущим баром превратил 3078 пробоев в 6.<br>
+  «Резко» — относительно медианы ходов САМОЙ бумаги, а не в рублях и не в процентах: одно и то же
+  движение у SBER и у UGLD значит разное. Если ряд стоит и медиана нулевая, масштаба нет и событий
+  нет — а не «всё резко».<br>
+  Строка «частота» показывает, <b>у какой доли бумаг</b> сработал каждый вид. Это не украшение:
+  событие, срабатывающее почти везде, не отмечает ничего. Замер на случайном ряду — откат находился
+  у 61% бумаг, пока определение не потребовало идущего встречного движения вместо положения цены в
+  диапазоне.<br>
+  Порядок — по числу событий, а не по важности: какое событие важнее, не измерено.<br>
+  <b>Три вида из восьми уже измерялись, и результат отрицательный.</b> Пробой, откат и разворот не
+  дали преимущества после издержек в 0.05%; покупка на откате при «структуре вверх» измерялась
+  вредной: t=−12.57, положительных дней 16%. Сканер <b>описывает</b>, что случилось с ценой, и не
+  советует, что делать.
+</footer>
+
+<script>
+const WORD = {
+  sharp_up: ["резкое ускорение вверх", "up"],
+  sharp_down: ["резкое ускорение вниз", "down"],
+  move_started: ["начало движения", "note"],
+  move_stalled: ["остановка движения", "warn"],
+  pullback: ["откат", "dim"],
+  level_break: ["пробой уровня", "note"],
+  false_break: ["ложный пробой", "warn"],
+  direction_changed: ["смена направления", "warn"],
+};
+
+function rates(r, total) {
+  const box = document.getElementById("rates");
+  const ks = Object.keys(r || {});
+  if (!ks.length) { box.innerHTML = ""; return; }
+  // Доля выше трети означает, что вид срабатывает слишком часто, чтобы что-то
+  // отмечать. Помечаем, а не прячем: это факт о пороге, и его надо видеть.
+  box.innerHTML = "<span>частота:</span>" + ks.map(k => {
+    const [w] = WORD[k] || [k];
+    const share = Math.round(r[k].share * 100);
+    return `<span class="${share > 33 ? "hot" : ""}">${w} <b>${share}%</b></span>`;
+  }).join("");
+}
+
+function rows(list) {
+  if (!list.length) return `<div class="empty">событий цены сейчас нет</div>`;
+  let h = `<table><tr><th>бумага</th><th>событие</th><th>шаг</th>`
+        + `<th>время</th><th>чем</th></tr>`;
+  for (const x of list) {
+    // От новых к старым внутри бумаги: последнее интереснее первого.
+    const evs = x.events.slice().reverse();
+    evs.forEach((e, i) => {
+      const [w, c] = WORD[e.kind] || [e.kind, ""];
+      h += `<tr><td class="tk">${i === 0 ? x.ticker : ""}</td>`
+         + `<td class="${c}">${w}</td>`
+         + `<td class="step">${e.step_min}м</td>`
+         + `<td class="step">${(e.ts || "").slice(11)}</td>`
+         + `<td class="why">${e.why || ""}</td></tr>`;
+    });
+  }
+  return h + `</table>`;
+}
+
+async function tick() {
+  const t0 = performance.now();
+  try {
+    const r = await fetch("/api/price-scan");
+    if (!r.ok) throw new Error(r.status);
+    const d = await r.json();
+    document.getElementById("n").textContent = d.scanned ?? "—";
+    document.getElementById("k").textContent = d.with_events ?? "—";
+    rates(d.rates, d.scanned);
+    document.getElementById("out").innerHTML =
+      d.note ? `<div class="empty">${d.note}</div>` : rows(d.results || []);
+  } catch (e) {
+    document.getElementById("out").innerHTML =
+      `<div class="empty">сканер не ответил: ${e.message}</div>`;
+  }
+  document.getElementById("t").textContent =
+    Math.round(performance.now() - t0) + " мс";
+}
+
+// Раз в 15 секунд: события живут на ЗАКРЫТЫХ барах, чаще пересчитывать нечего.
+// Опрос чаще давал бы тот же ответ и создавал бы вид свежести, которой нет.
+tick();
+setInterval(tick, 15000);
+</script>
+</body>
+</html>

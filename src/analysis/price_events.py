@@ -1,0 +1,387 @@
+"""
+Сканер цены: восемь событий по ЗАКРЫТЫМ барам, без стакана и без потока.
+
+ЗАЧЕМ ОТДЕЛЬНО ОТ book_events. Тот детектор смотрит на связки стакана, потока и
+цены — и это правильно для своей задачи. Но вопрос здесь другой: что делает
+САМА ЦЕНА, безотносительно того, кто её двигает. Смешивать нельзя: событие,
+которому нужен стакан, на закрытой бирже не сработает вовсе, а цена есть всегда.
+
+ПОЧЕМУ НЕ КАЖДУЮ СЕКУНДУ. События живут на ЗАКРЫТЫХ барах. Пока минута не
+закрылась, «резкого ускорения» не существует: есть незакрытый бар, границы
+которого ещё изменятся. Считать по нему — та же ошибка, что 31.07 превратила
+3078 пробоев в 6. Поэтому пересчёт при закрытии минуты, а не по таймеру.
+
+ПОРОГИ ОТ САМОЙ БУМАГИ. «Резкое движение» в рублях у SBER и у UGLD — разные
+величины, а в процентах разные у спокойного LKOH и у прыгающего MTLR. Поэтому
+масштаб берётся из её же баров: медиана модуля хода за последние N штук.
+
+    ЛОВУШКА, уже пойманная в ленте сделок. На ровном ряду медиана равна нулю, и
+    тогда РЕЗКИМ становится любое шевеление. Если медиана нулевая, масштаба нет
+    и события не выдаются вовсе — пустой ответ честнее выдуманного.
+
+ЧТО ИЗ ЭТОГО УЖЕ ИЗМЕРЕНО, И РЕЗУЛЬТАТ ОТРИЦАТЕЛЬНЫЙ:
+
+    BREAKOUT / PULLBACK / RETEST / REVERSAL   преимущества нет после издержек
+                                              в 0.05%
+    покупка на откате при «структуре вверх»   ВРЕДНО: t = -12.57, положительных
+                                              дней 16%
+
+Это не довод против детектора: детектор ОПИСЫВАЕТ, что случилось. Но ни одно
+поле здесь не называется сигналом, и «найден откат» не значит «пора покупать».
+"""
+from statistics import median
+from typing import Optional
+
+from src.analysis.timeframes import bars
+
+STEPS = (1, 5, 15)     # на каких шагах искать: минутка, пятиминутка, четверть часа
+LOOK = 20              # сколько закрытых баров берём за масштаб
+NEED = 6               # меньше этого баров события не ищем
+
+#  Во сколько раз ход должен превысить обычный, чтобы считаться РЕЗКИМ.
+#  Догадка. Калибровать по живому рынку: смотреть, у какой доли бумаг срабатывает.
+SHARP = 2.5
+
+#  Насколько «тихо» должно быть до начала движения и после остановки.
+QUIET = 0.4            # ход меньше этой доли обычного считается тишиной
+QUIET_BARS = 3         # столько баров подряд тишины
+
+#  Откат: какую часть пройденного ноги цена должна вернуть.
+#  Меньше нижней границы — шум, больше верхней — уже не откат, а разворот.
+PULL_MIN, PULL_MAX = 0.25, 0.75
+
+#  Сколько последних баров должны идти ПРОТИВ ноги.
+#
+#  Без этого условия откат находился у 61% бумаг на случайном блуждании — и это
+#  не изъян порога, а изъян определения: «цена вернула 25-75% ноги» описывает,
+#  ГДЕ цена, а не что она делает. Между недавними крайностями она и так почти
+#  всегда. Откат как СОБЫТИЕ — это идущее встречное движение, а не положение.
+PULL_BARS = 2
+
+#  Нога и структурный ход должны быть ОСМЫСЛЕННОГО размера относительно
+#  обычного хода бумаги.
+#
+#  Замер на случайном блуждании: без этого условия откат находился у 49 бумаг из
+#  80, смена направления у 45. Детектор, срабатывающий почти везде, не отмечает
+#  ничего — та же болезнь, что у процентиля на ровной ленте сделок.
+#
+#  Догадка. Калибровать по живому рынку через долю сработавших бумаг.
+LEG_SCALE = 3.0
+
+BREAK_TICKS = 2        # на сколько шагов цены надо выйти за уровень
+FALSE_BARS = 3         # столько баров есть у ложного пробоя, чтобы вернуться
+
+
+def _moves(closed: list) -> list:
+    """Ходы между закрытиями соседних баров."""
+    return [closed[i]["close"] - closed[i - 1]["close"]
+            for i in range(1, len(closed))]
+
+
+def _scale(moves: list) -> Optional[float]:
+    """
+    Обычный размер хода: медиана модулей.
+
+    Ноль означает, что ряд стоит. Тогда масштаба НЕТ, и это не то же самое, что
+    «масштаб маленький»: при нулевом делителе резким оказалось бы любое
+    шевеление. Ровно этот случай уже ловился на ленте сделок — тридцать
+    одинаковых сделок дали тридцать «крупных» из тридцати.
+    """
+    vals = [abs(m) for m in moves if m]
+    if not vals:
+        return None
+    m = median(vals)
+    return m if m > 0 else None
+
+
+def _ev(kind: str, why: str, step: int, bar: dict, **nums) -> dict:
+    """
+    Событие. Только описание: что случилось, когда и с какими числами.
+
+    Ни направления сделки, ни силы, ни совета — что из этого предшествует
+    движению цены, не измерено.
+    """
+    out = {"kind": kind, "why": why, "step_min": step, "ts": bar.get("ts")}
+    out.update({k: v for k, v in nums.items() if v is not None})
+    return out
+
+
+def detect_step(rows: list, step: int, tick: float = 0.01,
+                levels: Optional[list] = None, p: Optional[dict] = None) -> list:
+    """
+    События одного шага. `rows` — минутные бары по возрастанию времени.
+
+    Считается ТОЛЬКО по закрытым барам: незакрытый отбрасывается целиком.
+    """
+    p = {**DEFAULTS, **(p or {})}
+    bs = bars(rows, step)
+    closed = [b for b in bs if b.get("complete")]
+    if len(closed) < NEED:
+        return []
+    moves = _moves(closed)
+    scale = _scale(moves[-p["look"]:])
+    if scale is None:
+        return []                      # ряд стоит — масштаба нет, событий нет
+
+    last, prev = closed[-1], closed[-2]
+    mv = moves[-1]
+    out = []
+
+    # 1-2. РЕЗКОЕ УСКОРЕНИЕ. Ход последнего бара против обычного для этой бумаги.
+    if abs(mv) >= scale * p["sharp"]:
+        out.append(_ev(
+            "sharp_up" if mv > 0 else "sharp_down",
+            f"ход бара в {abs(mv) / scale:.1f} раза больше обычного",
+            step, last, move=round(mv, 6), scale=round(scale, 6),
+            times=round(abs(mv) / scale, 2)))
+
+    # 3. НАЧАЛО ДВИЖЕНИЯ: до этого было тихо, теперь пошло.
+    #    Отличается от ускорения тем, что ускорению нужно предыдущее движение, а
+    #    здесь его как раз не было.
+    qb = p["quiet_bars"]
+    if len(moves) > qb and abs(mv) >= scale * p["sharp"] * 0.6:
+        before = moves[-qb - 1:-1]
+        if before and all(abs(m) <= scale * p["quiet"] for m in before):
+            out.append(_ev(
+                "move_started",
+                f"{qb} бара стояли, затем ход в {abs(mv) / scale:.1f} раза больше обычного",
+                step, last, quiet_bars=qb, move=round(mv, 6),
+                times=round(abs(mv) / scale, 2)))
+
+    # 4. ОСТАНОВКА ДВИЖЕНИЯ: шло в одну сторону, встало.
+    if len(moves) >= qb + 1:
+        run = moves[-qb - 1:-1]
+        same = run and all(m > 0 for m in run) or run and all(m < 0 for m in run)
+        moved = run and all(abs(m) >= scale * 0.8 for m in run)
+        if same and moved and abs(mv) <= scale * p["quiet"]:
+            out.append(_ev(
+                "move_stalled",
+                f"{qb} бара шли в одну сторону, последний встал",
+                step, last, was_side="up" if run[0] > 0 else "down",
+                move=round(mv, 6)))
+
+    # 5. ОТКАТ: прошли ногу и вернули её часть, не сломав направления.
+    leg = _leg(closed, p["look"])
+    if leg:
+        back = _pullback(closed, leg, {**p, "step": step, "scale": scale})
+        if back:
+            out.append(back)
+
+    # 6-7. ПРОБОЙ И ЛОЖНЫЙ ПРОБОЙ по уровням С ГРАФИКА.
+    if levels:
+        out.extend(_breaks(closed, levels, tick, step, p))
+
+    # 8. СМЕНА НАПРАВЛЕНИЯ по СТРУКТУРЕ, а не по знаку одного бара.
+    flip = _structure_flip(closed, scale * p["leg_scale"] / 3)
+    if flip:
+        out.append(_ev("direction_changed", flip[1], step, last,
+                       was=flip[0], now=flip[2]))
+    return out
+
+
+DEFAULTS = {"look": LOOK, "sharp": SHARP, "quiet": QUIET,
+            "quiet_bars": QUIET_BARS, "pull_min": PULL_MIN,
+            "pull_max": PULL_MAX, "break_ticks": BREAK_TICKS,
+            "false_bars": FALSE_BARS, "leg_scale": LEG_SCALE,
+            "pull_bars": PULL_BARS}
+
+
+def _leg(closed: list, look: int) -> Optional[dict]:
+    """
+    Последняя нога: от крайней точки окна до противоположной крайности ПОСЛЕ неё.
+
+    Порядок важен: минимум должен быть РАНЬШЕ максимума, чтобы говорить о ноге
+    вверх. Иначе «нога» получилась бы из двух несвязанных точек.
+    """
+    win = closed[-look:]
+    if len(win) < 3:
+        return None
+    lows = [b["low"] for b in win]
+    highs = [b["high"] for b in win]
+    i_lo, i_hi = lows.index(min(lows)), highs.index(max(highs))
+    if i_hi > i_lo:
+        return {"side": "up", "from": min(lows), "to": max(highs),
+                "i_from": i_lo, "i_to": i_hi, "win": win}
+    if i_lo > i_hi:
+        return {"side": "down", "from": max(highs), "to": min(lows),
+                "i_from": i_hi, "i_to": i_lo, "win": win}
+    return None
+
+
+def _pullback(closed: list, leg: dict, p: dict) -> Optional[dict]:
+    """
+    Откат — возврат ЧАСТИ ноги. Больше верхней границы это уже не откат, а
+    разворот, и называть их одним словом значило бы стереть разницу.
+    """
+    size = abs(leg["to"] - leg["from"])
+    scale = p.get("scale") or 0
+    if size <= 0 or (scale and size < scale * p["leg_scale"]):
+        return None      # нога с шум размером — возвращать в ней нечего
+    now = closed[-1]["close"]
+    back = (leg["to"] - now) if leg["side"] == "up" else (now - leg["to"])
+    share = back / size
+    if not (p["pull_min"] <= share <= p["pull_max"]):
+        return None
+    # Откат должен идти ПОСЛЕ конца ноги, а не быть самой ногой.
+    if leg["i_to"] >= len(leg["win"]) - 1:
+        return None
+    # И он должен ИДТИ: последние бары движутся против ноги. Иначе это просто
+    # «цена где-то в середине диапазона», что на случайном ряду верно всегда.
+    nb = max(1, int(p.get("pull_bars", 1)))
+    if len(closed) < nb + 1:
+        return None
+    tail = [closed[-i - 1]["close"] for i in range(nb + 1)][::-1]
+    steps_ = [tail[i + 1] - tail[i] for i in range(len(tail) - 1)]
+    if leg["side"] == "up" and not all(x < 0 for x in steps_):
+        return None
+    if leg["side"] == "down" and not all(x > 0 for x in steps_):
+        return None
+    return _ev("pullback",
+               f"вернулось {share * 100:.0f}% хода, направление не сломано",
+               p.get("step", 0), closed[-1], leg_side=leg["side"],
+               retrace=round(share, 3), leg_size=round(size, 6))
+
+
+def _breaks(closed: list, levels: list, tick: float, step: int,
+            p: dict) -> list:
+    """
+    Пробой и ложный пробой уровней С ГРАФИКА.
+
+    ЛОЖНЫЙ ПРОБОЙ ДАТИРУЕТСЯ БАРОМ ВОЗВРАТА, а не баром пробоя. В момент
+    пробоя ещё неизвестно, ложный он или нет; поставить туда метку значило бы
+    утверждать, что мы знали будущее. Ровно эта ошибка 31.07 превратила 3078
+    пробоев в 6.
+    """
+    out = []
+    step_px = max(tick, 0.0) * p["break_ticks"]
+    n = p["false_bars"]
+    for lv in levels[:6]:
+        price = lv.get("price")
+        if not price:
+            continue
+        # Ищем бар, вышедший за уровень, среди последних n+1 закрытых.
+        for i in range(max(1, len(closed) - n - 1), len(closed)):
+            b, before = closed[i], closed[i - 1]
+            up = b["close"] > price + step_px
+            dn = b["close"] < price - step_px
+            if not (up or dn):
+                continue
+            # ПЕРЕСЕЧЕНИЕ, а не «оказался за уровнем». Первая версия проверяла
+            # только положение закрытия, и уровень ВЫШЕ рынка «пробивался вниз»
+            # на каждом обычном баре: цена под ним стояла всё время, пересекать
+            # его никто не пересекал. Нужно, чтобы предыдущий бар был по другую
+            # сторону.
+            if up and before["close"] > price:
+                continue
+            if dn and before["close"] < price:
+                continue
+            after = closed[i + 1:]
+            if not after:
+                # Пробой на последнем баре: возврата ещё не было и быть не могло.
+                if i == len(closed) - 1:
+                    out.append(_ev(
+                        "level_break",
+                        f"закрытие за уровнем {price} на {p['break_ticks']} шага",
+                        step, b, level=price, side="up" if up else "down"))
+                break
+            # Возврат: для пробоя вверх — закрытие обратно под уровень, для
+            # пробоя вниз — над ним. Пишется развёрнуто: условное выражение
+            # внутри фильтра списка читается неверно и уже дало синтаксическую
+            # ошибку.
+            if up:
+                back = [x for x in after if x["close"] <= price]
+            else:
+                back = [x for x in after if x["close"] >= price]
+            if back:
+                out.append(_ev(
+                    "false_break",
+                    f"вышли за {price} и вернулись обратно за {len(back)} бара",
+                    step, back[0], level=price,
+                    side="up" if up else "down",
+                    bars_out=after.index(back[0]) + 1))
+            break
+    return out
+
+
+def _structure_flip(closed: list, min_move: float = 0.0):
+    """
+    Смена направления ПО СТРУКТУРЕ: были выше по максимумам и минимумам, стали
+    ниже. Это сильнее, чем смена знака одного бара: один бар вниз внутри роста
+    происходит постоянно и ничего не меняет.
+    """
+    if len(closed) < 4:
+        return None
+
+    def st(a, b):
+        # Сдвиг должен быть заметным: смещение на копейку формально даёт
+        # «выше по максимумам и минимумам», а по сути это то же место.
+        if (b["high"] - a["high"] > min_move
+                and b["low"] - a["low"] > min_move):
+            return "up"
+        if (a["high"] - b["high"] > min_move
+                and a["low"] - b["low"] > min_move):
+            return "down"
+        return None
+
+    was = st(closed[-4], closed[-3])
+    now = st(closed[-2], closed[-1])
+    if was and now and was != now:
+        return (was, f"структура сменилась с «{was}» на «{now}»", now)
+    return None
+
+
+def detect(rows: list, tick: float = 0.01, levels: Optional[list] = None,
+           steps: tuple = STEPS, p: Optional[dict] = None) -> list:
+    """Все события бумаги по всем шагам, от старых к новым."""
+    out = []
+    for st in steps:
+        out.extend(detect_step(rows, st, tick=tick, levels=levels, p=p))
+    return out
+
+
+def scan(minutes: dict, ticks: Optional[dict] = None,
+         levels: Optional[dict] = None, steps: tuple = STEPS,
+         p: Optional[dict] = None) -> list:
+    """
+    Пройти по ВСЕМ бумагам и вернуть список тех, у кого что-то нашлось.
+
+    Форма выдачи у сканера другая, чем у карточки: список бумаг с тем, что
+    сработало, а не карточка на бумагу. Ради этого он и отдельно.
+
+    Порядок — по числу событий, потом по алфавиту. Не по «важности»: какое
+    событие важнее, не измерено, и придумывать вес значило бы выдать догадку за
+    знание.
+    """
+    out = []
+    total = 0
+    for tk, rows in (minutes or {}).items():
+        total += 1
+        evs = detect(list(rows or ()), tick=(ticks or {}).get(tk) or 0.01,
+                     levels=(levels or {}).get(tk), steps=steps, p=p)
+        if evs:
+            out.append({"ticker": tk, "events": evs, "count": len(evs),
+                        "kinds": sorted({e["kind"] for e in evs})})
+    out.sort(key=lambda x: (-x["count"], x["ticker"]))
+    return out
+
+
+def rates(scanned: list, total: int) -> dict:
+    """
+    У КАКОЙ ДОЛИ бумаг сработал каждый вид события.
+
+    Зачем это в выдаче. Замер на случайном блуждании: откат находился у 49 бумаг
+    из 80, смена направления у 45, а начало движения — у одной. Событие,
+    срабатывающее почти везде, не отмечает ничего, и читателю надо видеть это
+    прямо, а не догадываться.
+
+    Долю считать честнее, чем подбирать порог до «красивой» частоты: порог —
+    догадка, а доля — измерение. По ней и калибруют.
+    """
+    if not total:
+        return {}
+    per: dict = {}
+    for row in scanned:
+        for k in row["kinds"]:
+            per[k] = per.get(k, 0) + 1
+    return {k: {"tickers": n, "share": round(n / total, 3)}
+            for k, n in sorted(per.items(), key=lambda kv: -kv[1])}

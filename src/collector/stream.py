@@ -733,13 +733,19 @@ class MarketStream:
     def stop(self) -> None:
         self._stopped = True
 
-    def note_minute(self, ticker: str, ts: str, close) -> None:
+    def note_minute(self, ticker: str, row: dict) -> None:
         """
-        Запомнить закрытие минуты по бумаге — для широты рынка.
+        Запомнить ЗАКРЫТУЮ минуту по бумаге: весь бар, а не только закрытие.
 
         Держится в памяти, потому что ответ ОДИН И ТОТ ЖЕ для всех карточек:
         считать его из базы значило бы 80 запросов на каждый запрос экрана.
-        Здесь он стоит полторы тысячи чисел.
+        Здесь он стоит несколько тысяч чисел.
+
+        ПОЧЕМУ ВЕСЬ БАР. Сначала хранились только закрытия — их хватало для
+        широты рынка. Но структура (максимумы выше, минимумы ниже) без максимума
+        и минимума не считается вовсе, а сканер цены построен именно на ней.
+        Форма строки совпадает с той, что ждёт `timeframes.bars`, поэтому сборка
+        в 3/5/15/30 минут переиспользуется как есть, а не пишется заново.
 
         Минута может прийти повторно — сброс идёт чаще, чем раз в минуту.
         Тогда значение перезаписывается, а не дублируется: иначе «за 5 минут»
@@ -747,15 +753,22 @@ class MarketStream:
         """
         from collections import deque
         tk = (ticker or "").upper()
+        ts = (row or {}).get("ts")
+        close = (row or {}).get("close")
         if not tk or not ts or not close:
             return
+        bar = {"ts": ts, "close": close,
+               "open": row.get("open") or close,
+               "high": row.get("high") or close,
+               "low": row.get("low") or close,
+               "volume": row.get("volume") or 0}
         dq = self.minutes.get(tk)
         if dq is None:
-            dq = self.minutes[tk] = deque(maxlen=40)
-        if dq and dq[-1][0] == ts:
-            dq[-1] = (ts, close)
+            dq = self.minutes[tk] = deque(maxlen=60)
+        if dq and dq[-1]["ts"] == ts:
+            dq[-1] = bar
         else:
-            dq.append((ts, close))
+            dq.append(bar)
 
     def health(self) -> dict:
         """Что показывать в диагностике: возраст данных по каждой бумаге."""

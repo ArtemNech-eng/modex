@@ -801,6 +801,19 @@ async def get_book_live(ticker: str, light: bool = False):
     from src.analysis.timeframes import profile
     out["timeframes"] = profile(rows)
 
+    # СОБЫТИЯ ЦЕНЫ этой бумаги. Те же восемь, что в сканере, но для одной: когда
+    # смотришь SBER, надо видеть, что сделала именно его цена.
+    #
+    # Считаются по ЗАКРЫТЫМ барам, поэтому обновляются раз в минуту, а не раз в
+    # секунду: пока минута не закрылась, события не существует.
+    try:
+        from src.analysis.price_events import detect as price_detect
+        out["price_events"] = price_detect(
+            rows, tick=out.get("step") or 0.01,
+            levels=out.get("price_levels"))
+    except Exception as e:                                   # noqa: BLE001
+        logger.debug(f"price_events {tk}: {e}")
+
     # ИСТОРИЯ ОБЪЁМА и его СВЯЗКА С ЦЕНОЙ. «+0.4% при объёме ×1.2» и «+0.4% при
     # ×4.8 с новым максимумом» — разные картины, а объём сам по себе их не
     # различает.
@@ -860,6 +873,58 @@ async def get_micro(ticker: str, day: Optional[str] = None,
     rows = await db.micro_series(ticker, d, source=source)
     return {"ticker": ticker.upper(), "day": d, "source": source,
             "count": len(rows), "rows": rows}
+
+
+@app.get("/api/price-scan", summary="Сканер цены: что делает цена по всем бумагам")
+async def get_price_scan(steps: str = "1,5,15", limit: int = 40):
+    """
+    Восемь событий ЦЕНЫ по всем бумагам разом: резкое ускорение вверх и вниз,
+    начало движения, остановка, откат, пробой уровня, ложный пробой, смена
+    направления.
+
+    ТОЛЬКО ЦЕНА. Без стакана и без потока: вопрос здесь «что делает сама цена»,
+    безотносительно того, кто её двигает. События, которым нужен стакан, живут в
+    /api/events.
+
+    ПЕРЕСЧЁТ ПРИ ЗАКРЫТИИ МИНУТЫ, а не по таймеру. События существуют только на
+    ЗАКРЫТЫХ барах: пока минута не закрылась, «резкого ускорения» нет — есть
+    бар, границы которого ещё изменятся.
+
+    В выдаче есть `rates` — у какой доли бумаг сработал каждый вид. Это не
+    украшение: событие, срабатывающее почти везде, не отмечает ничего, и видеть
+    это надо прямо. Замер на случайном ряду: откат находился у 61% бумаг, пока
+    определение не потребовало ИДУЩЕГО встречного движения вместо положения
+    цены в диапазоне.
+
+    Порядок — по числу событий. Не по важности: какое событие важнее, не
+    измерено, и придумывать вес значило бы выдать догадку за знание.
+    """
+    from src.collector.stream import CURRENT
+    from src.analysis.price_events import scan, rates
+    from src.analysis.price_levels import levels as chart_levels
+    mins = getattr(CURRENT, "minutes", None)
+    if not mins:
+        return {"scanned": 0, "results": [], "rates": {},
+                "note": "минутной истории ещё нет — стрим только поднялся"}
+    try:
+        want = tuple(int(x) for x in steps.split(",") if x.strip())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="steps: например 1,5,15")
+    ticks = dict(getattr(CURRENT, "steps", None) or {})
+    # Уровни С ГРАФИКА, а не из стакана: заявку снимают за секунду, а место,
+    # где цена разворачивалась, остаётся.
+    lv = {}
+    for tk, rows in mins.items():
+        try:
+            lv[tk] = chart_levels(list(rows), tick=ticks.get(tk) or 0.01,
+                                  price_now=(list(rows) or [{}])[-1].get("close"),
+                                  top=4)
+        except Exception:                                    # noqa: BLE001
+            continue
+    found = scan(mins, ticks=ticks, levels=lv, steps=want)
+    return {"scanned": len(mins), "with_events": len(found),
+            "steps": list(want), "rates": rates(found, len(mins)),
+            "results": found[:limit]}
 
 
 @app.get("/api/levels/{ticker}", summary="История ценовых уровней по минутам")
@@ -2745,6 +2810,21 @@ async def ai_correlations():
 @app.get("/", include_in_schema=False)
 async def serve_dashboard():
     return FileResponse("dashboard/index.html")
+
+
+@app.get("/scan", include_in_schema=False)
+async def serve_price_scan():
+    """
+    «Сканер цены». Отдельная страница от «Наблюдателя», потому что форма выдачи
+    другая: список бумаг с тем, что сработало, а не карточка на бумагу. Впихнуть
+    список в сетку карточек — значит потерять единственное, ради чего сканер
+    существует: возможность окинуть взглядом весь рынок разом.
+
+    Обновляется раз в пятнадцать секунд, а не раз в секунду: события живут на
+    ЗАКРЫТЫХ барах, и чаще пересчитывать попросту нечего. Частый опрос создавал
+    бы вид свежести, которой нет.
+    """
+    return FileResponse("dashboard/price-scan.html")
 
 
 @app.get("/market", include_in_schema=False)
