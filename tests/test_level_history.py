@@ -956,3 +956,35 @@ def test_page_shows_state_and_life_without_verdicts():
     i = page.index("const STATE")
     assert not any(b in page[i:i + 400].lower()
                    for b in ("сильн", "слаб", "strong", "weak"))
+
+
+def test_unfinished_test_is_not_called_defended():
+    """
+    Найдено на ЖИВЫХ данных 02.08: у LKOH bid 4587 стояло «выдержал» при счёте
+    тестов 1 и нулях в обеих колонках исхода. То есть цена стояла у уровня прямо
+    в тот момент, и ничего он ещё не выдержал.
+
+    Незавершённый тест, выданный за пройденный, — то же переобещание, что и
+    «сильный», только незаметнее.
+    """
+    tr = tracker()
+    book(tr, T0, [(100.0, 1000), (99.0, 500)], asks=[(101.0, 400)])
+    book(tr, T0 + 1, [(99.0, 500)], asks=[(101.0, 400)])      # цена пришла
+    lv = tr.levels[key(99.0)]
+    assert lv["tests"] == 1 and lv["test_held"] == 0 and lv["test_failed"] == 0
+    assert tr.state(lv) == "testing", "исход ещё неизвестен"
+    book(tr, T0 + 2, [(100.0, 1000), (99.0, 500)], asks=[(101.0, 400)])
+    assert tr.state(tr.levels[key(99.0)]) == "defended", "теперь тест закрыт"
+
+
+def test_defended_requires_a_finished_test_even_with_many_open():
+    tr = tracker()
+    book(tr, T0, [(100.0, 1000), (99.0, 500)], asks=[(101.0, 400)])
+    for i in range(5):
+        book(tr, T0 + 1 + i, [(99.0, 500)], asks=[(101.0, 400)])
+    assert tr.state(tr.levels[key(99.0)]) == "testing"
+
+
+def test_page_knows_the_testing_state():
+    page = (ROOT / "dashboard/book-live.html").read_text()
+    assert "цена у уровня сейчас" in page
