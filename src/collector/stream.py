@@ -786,7 +786,14 @@ class MarketStream:
             "level_logs": self.levels.history.stats(),
             "ticks": self.ticks.stats(),
             "tape": self.tape.stats(),
+            # Глубина истории, а не только число бумаг. «Ноль событий» и «нет
+            # данных» выглядят одинаково, и без этой цифры их не различить: ровно
+            # так 02.08 сканер молчал после перезапуска, а причина была не в рынке.
             "market": {"tickers_with_minutes": len(self.minutes),
+                       "bars_min": min((len(v) for v in self.minutes.values()),
+                                       default=0),
+                       "bars_median": sorted(len(v) for v in self.minutes.values())
+                                      [len(self.minutes) // 2] if self.minutes else 0,
                        "sectors_known": len(self.sectors),
                        "imoex": bool(self.imoex)},
             "tickers_subscribed": len(self.figis),

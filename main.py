@@ -807,6 +807,30 @@ async def stream_pipeline():
                 logger.debug(f"IMOEX: {e}")
             await asyncio.sleep(30)
 
+    # ЗАСЕВ МИНУТНОЙ ПАМЯТИ ИЗ БАЗЫ.
+    #
+    # Найдено на живых данных 02.08: карточка SBER показывала 7 событий цены, а
+    # сканер по всем бумагам — ноль. Причина не в рынке: карточка читает базу
+    # (877 закрытых баров), а сканер память, которая при перезапуске контейнера
+    # обнуляется. Событию нужно шесть закрытых баров, пятнадцатиминутному —
+    # полтора часа, и всё это время сканер молчал бы после каждого деплоя.
+    #
+    # Восемьдесят запросов ОДИН раз при старте против получаса слепоты.
+    async def _seed_minutes():
+        day = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d")
+        ok = 0
+        for tk in tickers:
+            try:
+                rows = await db.candle_series(tk, day, "1m")
+            except Exception:                                # noqa: BLE001
+                continue
+            for r in rows[-60:]:
+                stream.note_minute(tk, r)
+            if rows:
+                ok += 1
+        logger.info(f"Сканер: минутная история засеяна по {ok} бумагам из базы")
+
+    asyncio.create_task(_seed_minutes())
     asyncio.create_task(_atr_background())
     asyncio.create_task(_market_background())
     await stream.run()
