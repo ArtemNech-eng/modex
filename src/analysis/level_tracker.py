@@ -112,10 +112,28 @@ class LevelTracker:
                     continue
                 if lv["size"] > 0:
                     k = (t, s, price)
-                    self.history.accrue(k, minute, lh.GONE, size=0)
+                    # ИСЧЕЗНОВЕНИЕ ТОЖЕ ДЕЛИТСЯ на съеденное и снятое.
+                    #
+                    # Найдено на живых данных 02.08: у TATN ask 519.9 уровень
+                    # пропадал трижды, а в итоге стояло «снято 0 ₽». Пропажа
+                    # целиком — чистейший случай снятия, и не считать её значило
+                    # врать заголовочным числом ровно в ту сторону, которая важна.
+                    #
+                    # Оговорка та же, что у GONE_SHARE: биржа отдаёт 20 уровней,
+                    # и заявка может выпасть из окна, не исчезнув. Для уровней,
+                    # которым мы ведём журнал, это маловероятно — они крупнейшие
+                    # на своей стороне, то есть у самого верха.
+                    pend = lv.get("pending_traded", 0)
+                    eaten = min(lv["size"], pend)
+                    gone_pulled = lv["size"] - eaten
+                    lv["pending_traded"] = pend - eaten
+                    self.history.accrue(k, minute, lh.GONE, lots=lv["size"],
+                                        size=0, traded=eaten,
+                                        pulled=gone_pulled)
                     if sec is not None and k in self.history.log:
                         self.history.add(k, sec, lh.GONE, lots=lv["size"],
-                                         size=0)
+                                         size=0, traded=eaten,
+                                         pulled=gone_pulled)
                     lv["size"] = 0
                     lv["gone_count"] += 1
                     lv["gone_at"] = minute

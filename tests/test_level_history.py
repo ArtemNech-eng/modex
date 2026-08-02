@@ -576,3 +576,54 @@ def test_enter_share_is_documented_as_a_guess():
     src = (ROOT / "src/analysis/level_history.py").read_text()
     i = src.index("ENTER_SHARE = ")
     assert "ДОГАДКА" in src[max(0, i - 700):i], "порог помечен догадкой"
+
+
+# ─── исчезновение это тоже снятие ──────────────────────────────────────────────
+
+def test_disappearance_counts_as_pulled():
+    """
+    Найдено на ЖИВЫХ данных 02.08: у TATN ask 519.9 уровень пропадал трижды, а в
+    итоге окна стояло «снято 0 ₽». Пропажа целиком — чистейший случай снятия, и
+    не считать её значило врать заголовочным числом ровно в ту сторону, которая
+    важна.
+    """
+    tr = tracker()
+    book(tr, T0, [(100.0, 1000)])
+    book(tr, T0 + 1, [])
+    s = tr.history.summary(key(100.0), T0 + 1)
+    assert s["pulled_rub"] == round(100.0 * 1000), "весь пропавший объём снят"
+    assert s["gone"] == 1
+
+
+def test_disappearance_eaten_by_trades_is_not_pulled():
+    """
+    Если уровень исчез, а сделки его выбрали — это исполнение, а не снятие. То же
+    различение, что при обычном уменьшении: иначе съеденная плита читалась бы как
+    отменённая.
+    """
+    tr = tracker()
+    book(tr, T0, [(100.0, 1000)])
+    tr.on_trade("SBER", 100.0, 1000)
+    book(tr, T0 + 1, [])
+    s = tr.history.summary(key(100.0), T0 + 1)
+    assert s["traded_rub"] == round(100.0 * 1000)
+    assert s["pulled_rub"] == 0
+
+
+def test_disappearance_splits_partly():
+    tr = tracker()
+    book(tr, T0, [(100.0, 1000)])
+    tr.on_trade("SBER", 100.0, 400)
+    book(tr, T0 + 1, [])
+    s = tr.history.summary(key(100.0), T0 + 1)
+    assert s["traded_rub"] == round(100.0 * 400)
+    assert s["pulled_rub"] == round(100.0 * 600)
+
+
+def test_disappearance_reaches_the_minute_totals_too():
+    """Иначе дыра осталась бы в базе, где её потом никто не найдёт."""
+    tr = tracker()
+    book(tr, T0, [(100.0, 1000)])
+    book(tr, T0 + 1, [])
+    got = dict((k, v) for k, _, v in tr.history.drop_completed("нет-такой-минуты"))
+    assert got[key(100.0)]["pulled"] == 1000
