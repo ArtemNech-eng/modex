@@ -830,7 +830,53 @@ async def stream_pipeline():
                 ok += 1
         logger.info(f"Сканер: минутная история засеяна по {ok} бумагам из базы")
 
+    # НОРМА ОБЪЁМА ПО ВРЕМЕНИ СУТОК. Считается из базы раз в час.
+    #
+    # Артём просил сравнивать «с обычным объёмом этой акции в это же время», и
+    # это правильно: у объёма сильная внутридневная форма — открытие и закрытие
+    # тяжёлые, середина дня пустая. Скользящая норма этого не различает.
+    #
+    # НО СЕЙЧАС ЕЁ НЕ ИЗ ЧЕГО СТРОИТЬ. Стрим поднялся 01.08, и оба дня с тех пор
+    # выходные: 583 и 1188 минут ДИЛЕРСКИХ котировок при нуле биржевых за более
+    # ранние даты. Поэтому day_profile молчит, пока дней меньше MIN_DAYS, и
+    # сканер честно помечает, по какой норме посчитано.
+    async def _volume_profiles():
+        from src.analysis.volume_events import day_profile, MIN_DAYS
+        while True:
+            try:
+                today = (datetime.now(timezone.utc) + timedelta(hours=3)
+                         ).strftime("%Y-%m-%d")
+                days = [(datetime.now(timezone.utc) + timedelta(hours=3)
+                         - timedelta(days=i)).strftime("%Y-%m-%d")
+                        for i in range(1, 31)]        # ПРОШЛЫЕ дни, без сегодня
+                built = 0
+                for tk in tickers:
+                    per_day = {}
+                    for d in days:
+                        if d == today:
+                            continue
+                        try:
+                            rows = await db.candle_series(tk, d, "1m")
+                        except Exception:              # noqa: BLE001
+                            continue
+                        if rows:
+                            per_day[d] = rows
+                    prof = day_profile(per_day, lot=(stream.lots or {}).get(tk) or 1,
+                                       min_days=MIN_DAYS)
+                    if prof:
+                        stream.vol_profiles[tk] = prof
+                        built += 1
+                if built:
+                    logger.info(f"Норма объёма по времени суток: {built} бумаг")
+                else:
+                    logger.info("Норма объёма по времени суток: дней пока мало, "
+                                "сканер работает по скользящей")
+            except Exception as e:                     # noqa: BLE001
+                logger.debug(f"нормы объёма: {e}")
+            await asyncio.sleep(3600)
+
     asyncio.create_task(_seed_minutes())
+    asyncio.create_task(_volume_profiles())
     asyncio.create_task(_atr_background())
     asyncio.create_task(_market_background())
     await stream.run()

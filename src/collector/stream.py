@@ -367,6 +367,10 @@ class MarketStream:
         # двух тяжёлых бумагах при том, что падают шестьдесят.
         self.minutes: dict = {}       # тикер -> deque[(минута, закрытие)]
         self.imoex: dict = {}         # индекс из ISS, с возрастом
+        # Норма оборота по минутам суток, тикер -> {минута дня: рубли}.
+        # Пусто, пока в базе меньше десяти торговых дней: считать «обычный
+        # объём 14:30» по двум выходным значит выдумать норму.
+        self.vol_profiles: dict = {}
         self.sectors: dict = {}       # тикер -> сектор, из индексов MOEX
         self.lots: dict = {}          # тикер -> лотность, из ISS
         self.steps: dict = {}         # тикер -> шаг цены, из ISS
@@ -795,7 +799,8 @@ class MarketStream:
                        "bars_median": sorted(len(v) for v in self.minutes.values())
                                       [len(self.minutes) // 2] if self.minutes else 0,
                        "sectors_known": len(self.sectors),
-                       "imoex": bool(self.imoex)},
+                       "imoex": bool(self.imoex),
+                       "vol_profiles": len(self.vol_profiles)},
             "tickers_subscribed": len(self.figis),
             "tickers_with_data": len(ages),
             "tickers_fresh_60s": fresh,

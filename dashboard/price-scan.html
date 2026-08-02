@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Сканер цены</title>
+<title>Сканеры цены и объёма</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
   :root {
@@ -48,6 +48,11 @@
   .up { color: var(--up); } .down { color: var(--down); }
   .warn { color: var(--warn); } .note { color: var(--note); } .dim { color: var(--dim); }
   .empty { color: var(--dim); padding: 30px 0; }
+  .sec {
+    font-size: 12px; font-weight: 700; letter-spacing: .16em;
+    text-transform: uppercase; color: var(--hot);
+    margin: 26px 0 0; padding-top: 18px; border-top: 1px solid var(--line);
+  }
   footer { color: var(--dim); font-size: 11px; padding: 0 0 40px; line-height: 1.7; }
   footer b { color: var(--warn); font-weight: 500; }
 </style>
@@ -55,13 +60,18 @@
 <body>
 
 <header>
-  <h1>Сканер цены</h1>
+  <h1>Сканеры</h1>
   <span class="meta">бумаг <b id="n">—</b> · с событиями <b id="k">—</b> · пересчёт <b id="t">—</b></span>
   <span class="meta"><a href="/market">Наблюдатель рынка →</a></span>
 </header>
 
+<h2 class="sec">Цена</h2>
 <div class="rates" id="rates"></div>
 <div id="out"></div>
+
+<h2 class="sec">Объём — пришли ли деньги</h2>
+<div class="rates" id="vrates"></div>
+<div id="vout"></div>
 
 <footer>
   Сканер смотрит <b>только на цену</b>: ни стакана, ни потока. События, которым нужен стакан, живут
@@ -78,6 +88,19 @@
   у 61% бумаг, пока определение не потребовало идущего встречного движения вместо положения цены в
   диапазоне.<br>
   Порядок — по числу событий, а не по важности: какое событие важнее, не измерено.<br>
+  <b>Объём считается в РУБЛЯХ</b>: лот у SBER 1, у UGLD 1000, и список по лотам сравнивал бы
+  несравнимое. Оборот берётся как лоты × лотность × закрытие бара — это приближение, настоящий
+  оборот считают по цене каждой сделки.<br>
+  У объёма ДВЕ нормы, и в каждой строке написано, по какой посчитано. Скользящая есть всегда, но
+  <b>ползёт</b>: если оборот растёт полчаса, норма растёт вместе с ним и всплеск перестаёт быть
+  виден. Норма по времени суток этого не делает — у объёма сильная внутридневная форма, открытие и
+  закрытие тяжёлые, середина дня пустая. <b>Но её пока нет:</b> стрим поднялся 01.08, и оба дня с
+  тех пор выходные с дилерскими котировками. Считать «обычный объём 14:30» по ним значило бы
+  выдумать норму, поэтому механизм молчит, пока не наберётся десять торговых дней.<br>
+  «Разгоняется» требует и роста подряд, и значимости: ряд может расти втрое и всё равно оставаться
+  ниже обычного — это не «деньги пошли», а возврат к норме после пустых минут.<br>
+  Порядок в таблице объёма — по КРАТНОСТИ к норме, а не по рублям: миллиард у SBER это обычный
+  день, а сто миллионов у DATA — событие.<br>
   <b>Три вида из восьми уже измерялись, и результат отрицательный.</b> Пробой, откат и разворот не
   дали преимущества после издержек в 0.05%; покупка на откате при «структуре вверх» измерялась
   вредной: t=−12.57, положительных дней 16%. Сканер <b>описывает</b>, что случилось с ценой, и не
@@ -128,6 +151,59 @@ function rows(list) {
   return h + `</table>`;
 }
 
+const VWORD = {
+  volume_surge: ["всплеск оборота", "warn"],
+  volume_accelerating: ["оборот разгоняется", "note"],
+};
+
+const rub = v => v == null ? "—"
+  : Math.abs(v) >= 1e9 ? (v / 1e9).toFixed(2) + " млрд ₽"
+  : Math.abs(v) >= 1e6 ? (v / 1e6).toFixed(1) + " млн ₽"
+  : Math.abs(v) >= 1e3 ? (v / 1e3).toFixed(0) + " тыс ₽" : Math.round(v) + " ₽";
+
+function vrows(list) {
+  if (!list.length) return `<div class="empty">необычного оборота сейчас нет</div>`;
+  let h = `<table><tr><th>бумага</th><th>событие</th><th>шаг</th>`
+        + `<th>оборот</th><th>норма</th><th>раз</th><th>чем</th></tr>`;
+  for (const x of list) {
+    x.events.slice().reverse().forEach((e, i) => {
+      const [w, c] = VWORD[e.kind] || [e.kind, ""];
+      h += `<tr><td class="tk">${i === 0 ? x.ticker : ""}</td>`
+         + `<td class="${c}">${w}</td>`
+         + `<td class="step">${e.step_min}м</td>`
+         + `<td>${rub(e.rub)}</td>`
+         + `<td class="step">${rub(e.base_rub)}</td>`
+         + `<td class="${e.times >= 5 ? "warn" : ""}">×${e.times}</td>`
+         + `<td class="why">${e.why || ""}</td></tr>`;
+    });
+  }
+  return h + `</table>`;
+}
+
+async function vtick() {
+  try {
+    const r = await fetch("/api/volume-scan");
+    if (!r.ok) throw new Error(r.status);
+    const d = await r.json();
+    // Норма ОБЯЗАНА быть названа: скользящая и по времени суток отвечают на
+    // разные вопросы, и молча подставлять одну вместо другой нельзя.
+    const note = d.profiles_ready
+      ? `норма по времени суток, ${d.profiles_ready} бумаг`
+      : `норма скользящая — по времени суток пока не из чего строить`;
+    document.getElementById("vrates").innerHTML =
+      `<span>${note}</span>` + Object.keys(d.rates || {}).map(k => {
+        const [w] = VWORD[k] || [k];
+        const share = Math.round(d.rates[k].share * 100);
+        return `<span class="${share > 33 ? "hot" : ""}">${w} <b>${share}%</b></span>`;
+      }).join("");
+    document.getElementById("vout").innerHTML =
+      d.note ? `<div class="empty">${d.note}</div>` : vrows(d.results || []);
+  } catch (e) {
+    document.getElementById("vout").innerHTML =
+      `<div class="empty">сканер объёма не ответил: ${e.message}</div>`;
+  }
+}
+
 async function tick() {
   const t0 = performance.now();
   try {
@@ -149,8 +225,9 @@ async function tick() {
 
 // Раз в 15 секунд: события живут на ЗАКРЫТЫХ барах, чаще пересчитывать нечего.
 // Опрос чаще давал бы тот же ответ и создавал бы вид свежести, которой нет.
-tick();
+tick(); vtick();
 setInterval(tick, 15000);
+setInterval(vtick, 15000);
 </script>
 </body>
 </html>

@@ -927,6 +927,49 @@ async def get_price_scan(steps: str = "1,5,15", limit: int = 40):
             "results": found[:limit]}
 
 
+@app.get("/api/volume-scan", summary="Сканер объёма: пришли ли деньги")
+async def get_volume_scan(steps: str = "1,5", limit: int = 40):
+    """
+    Всплеск оборота и его УСКОРЕНИЕ по всем бумагам разом.
+
+    Отвечает на вопрос «действительно ли в движение пришли деньги», и отдельно —
+    на более интересный: в какой МОМЕНТ они пошли. «Сегодня большой объём» это
+    состояние, «оборот растёт четвёртую минуту подряд» — событие со временем.
+
+    В РУБЛЯХ. Лот у SBER 1, у UGLD 1000, и список по лотам сравнивал бы
+    несравнимое. Оборот считается как лоты × лотность × закрытие бара — это
+    приближение: настоящий оборот берут по цене каждой сделки.
+
+    ДВЕ НОРМЫ, и в каждом событии написано, по какой посчитано. Скользящая
+    (медиана последних баров) есть всегда, но ПОЛЗЁТ вместе с растущим объёмом.
+    Норма по времени суток этого не делает и потому лучше — но она появится
+    только когда наберётся десять торговых дней. Сейчас в базе два дня, оба
+    выходные с дилерскими котировками, и строить по ним «обычный объём 14:30»
+    значило бы выдумать норму.
+
+    Порядок — по КРАТНОСТИ к норме, а не по рублям: миллиард у SBER это обычный
+    день, а сто миллионов у DATA — событие.
+    """
+    from src.collector.stream import CURRENT
+    from src.analysis.volume_events import scan, rates
+    mins = getattr(CURRENT, "minutes", None)
+    if not mins:
+        return {"scanned": 0, "results": [], "rates": {},
+                "note": "минутной истории ещё нет — стрим только поднялся"}
+    try:
+        want = tuple(int(x) for x in steps.split(",") if x.strip())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="steps: например 1,5")
+    profiles = dict(getattr(CURRENT, "vol_profiles", None) or {})
+    found = scan(mins, lots=dict(getattr(CURRENT, "lots", None) or {}),
+                 profiles=profiles, steps=want)
+    return {"scanned": len(mins), "with_events": len(found),
+            "steps": list(want), "rates": rates(found, len(mins)),
+            "baseline": "время суток" if profiles else "скользящая",
+            "profiles_ready": len(profiles),
+            "results": found[:limit]}
+
+
 @app.get("/api/levels/{ticker}", summary="История ценовых уровней по минутам")
 async def get_levels(ticker: str, day: Optional[str] = None,
                      source: str = "exchange", limit: int = 400):
