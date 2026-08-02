@@ -602,7 +602,20 @@ async def get_book_live(ticker: str, light: bool = False):
     lot = int((CURRENT.lots or {}).get(tk) or 1)
     out["lot"] = lot
     out["step"] = float((getattr(CURRENT, "steps", None) or {}).get(tk) or 0)
-    out["levels"] = CURRENT.levels.notable(tk, lot=lot, top=1)
+    # УРОВЕНЬ ВМЕСТЕ С ЕГО ИСТОРИЕЙ. Не «BID сейчас 882 тыс.», а что с ним
+    # происходило последние 60 секунд: вырос, съели, сняли, вернулся.
+    #
+    # Идёт в ЛЁГКИЙ ответ сознательно: он опрашивается раз в секунду, а это
+    # ровно та частота, на которой история уровня и имеет смысл. В базу за ней
+    # ходить не надо — она целиком в памяти.
+    #
+    # Источник как у секундного ряда: на закрытой бирже биржевых уровней нет.
+    lvl_src = ("exchange" if CURRENT.levels.notable(tk, lot=lot, top=1)
+               else "dealer")
+    out["level_source"] = lvl_src
+    out["levels"] = CURRENT.levels.with_history(
+        tk, int(datetime.now(timezone.utc).timestamp()),
+        lot=lot, top=1, source=lvl_src)
 
     # СЕКУНДНЫЕ ПОКАЗАТЕЛИ — из кольца в памяти, доли секунды.
     #
@@ -654,7 +667,12 @@ async def get_book_live(ticker: str, light: bool = False):
         else:
             out["source_note"] = "ни биржевых, ни дилерских данных потока нет"
     out["source"] = src
-    out["levels"] = CURRENT.levels.notable(tk, lot=lot, top=1, source=src)
+    # Полный путь знает источник точнее — он проверен по НАЛИЧИЮ потока в базе,
+    # а не по наличию уровней в памяти. Историю прикладываем и здесь.
+    out["level_source"] = src
+    out["levels"] = CURRENT.levels.with_history(
+        tk, int(datetime.now(timezone.utc).timestamp()),
+        lot=lot, top=1, source=src)
 
     closes = [r["close"] for r in rows if r.get("close")]
     out["price"] = closes[-1] if closes else None

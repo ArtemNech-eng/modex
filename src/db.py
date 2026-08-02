@@ -8,6 +8,7 @@ MOODEX — слой базы данных (SQLAlchemy async)
 Здесь хранятся каналы, добавленные вручную через дашборд, чтобы они
 переживали перезапуски и редеплой.
 """
+import os
 import json
 import asyncio
 import logging
@@ -477,6 +478,53 @@ class MicroMinute(Base):
     traded_at_best: Mapped[int] = mapped_column(Integer, default=0)
     traded_near: Mapped[int] = mapped_column(Integer, default=0)
     traded_deep: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class LevelMinute(Base):
+    """
+    Жизнь ОДНОГО ЦЕНОВОГО УРОВНЯ за минуту.
+
+    Чего не было. book_minute хранит РАЗМЕР крупнейшей заявки, но не её ЦЕНУ, и
+    ничего про то, съели её или сняли. На вопрос «уровень 276.52 держали или
+    убрали» ответить было нельзя.
+
+    Почему не секунды. Двадцать цен десять раз в секунду на 80 бумагах — это
+    миллионы строк в день против 20 ГБ свободных. Секундный ряд живёт в памяти
+    (level_history), а сюда уходит минутный итог.
+
+    СТРОКА ПИШЕТСЯ НЕ ВСЕГДА. Только когда на уровне что-то происходило выше
+    порога в рублях. Иначе на каждую минуту пришлось бы по шесть уровней на
+    бумагу на источник — под полмиллиона строк в день, и арифметика опять не
+    сошлась бы. Сколько их будет на живом рынке, я не знаю: порог придётся
+    калибровать по факту, а не назначать заранее.
+
+    ГЛАВНОЕ ЗДЕСЬ — РАЗДЕЛЕНИЕ traded и pulled. «Съели» и «владелец передумал»
+    означают противоположное, а разность размеров их не различает.
+
+    Объёмы в ЛОТАХ, как всё от биржи. Рубли считаются на чтении: лотность у
+    бумаг разная.
+    """
+    __tablename__ = "level_minute"
+
+    # "ts:TICKER:source:side:price" — цена в ключе, иначе уровни одной минуты
+    # затирали бы друг друга.
+    key: Mapped[str] = mapped_column(String(96), primary_key=True)
+    ts: Mapped[str] = mapped_column(String(16), index=True)           # МСК
+    ticker: Mapped[str] = mapped_column(String(32), index=True)
+    source: Mapped[str] = mapped_column(String(8), default="exchange", index=True)
+    side: Mapped[str] = mapped_column(String(4))                      # bid|ask
+    price: Mapped[float] = mapped_column(Float)
+    peak: Mapped[int] = mapped_column(Integer, default=0)             # лотов
+    end_size: Mapped[int] = mapped_column(Integer, default=0)
+    added: Mapped[int] = mapped_column(Integer, default=0)
+    # Съедено против снято — то, ради чего таблица.
+    traded: Mapped[int] = mapped_column(Integer, default=0)
+    pulled: Mapped[int] = mapped_column(Integer, default=0)
+    restored: Mapped[int] = mapped_column(Integer, default=0)
+    gone: Mapped[int] = mapped_column(Integer, default=0)
+    events: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
@@ -2702,6 +2750,93 @@ async def merge_micro_minutes(ticker: str, rows: list[dict],
     return n
 
 
+#  Порог записи уровня в базу, в РУБЛЯХ за минуту. Ниже него строка не пишется:
+#  иначе на каждую минуту пришлось бы по шесть уровней на бумагу на источник,
+#  около полумиллиона строк в день, и арифметика не сошлась бы с 20 ГБ.
+#
+#  Значение — ДОГАДКА. Сколько уровней его перейдут на живом рынке, я не знаю;
+#  калибровать надо по факту, поэтому оно вынесено в переменную окружения.
+LEVEL_MINUTE_FLOOR_RUB = float(os.getenv("LEVEL_FLOOR_RUB", "100000"))
+
+
+async def merge_level_minutes(rows: list[dict],
+                              floor_rub: Optional[float] = None) -> dict:
+    """
+    Влить минутные итоги уровней. Суммы складываются, пик берётся максимумом.
+
+    `rows` — то, что отдал LevelLog.drop_minute, дополненное тикером, ценой,
+    стороной, источником и лотностью.
+
+    Возвращает и записанное, и ОТБРОШЕННОЕ: без второго числа нельзя понять,
+    порог отсекает шум или половину полезного.
+    """
+    if not rows:
+        return {"written": 0, "skipped": 0}
+    floor = LEVEL_MINUTE_FLOOR_RUB if floor_rub is None else float(floor_rub)
+    n = skipped = 0
+    SUMS = ("added", "traded", "pulled", "restored", "gone", "events")
+    try:
+        async with async_session() as session:
+            for r in rows:
+                tk = (r.get("ticker") or "").upper()
+                price = float(r.get("price") or 0)
+                lot = max(1, int(r.get("lot") or 1))
+                if not tk or price <= 0 or not r.get("ts"):
+                    skipped += 1
+                    continue
+                # Значимость считается в РУБЛЯХ: «1000 лотов» у SBER и у UGLD —
+                # это 276 тысяч и 666 тысяч, сравнивать в лотах нельзя.
+                money = price * lot
+                moved = (int(r.get("traded") or 0) + int(r.get("pulled") or 0)
+                         + int(r.get("added") or 0)) * money
+                if moved < floor and not r.get("restored"):
+                    skipped += 1
+                    continue
+                src = r.get("source") or "exchange"
+                side = r.get("side") or "bid"
+                key = f"{r['ts']}:{tk}:{src}:{side}:{price:.6f}"
+                row = await session.get(LevelMinute, key)
+                if row is None:
+                    row = LevelMinute(key=key, ts=r["ts"], ticker=tk,
+                                      source=src, side=side, price=price,
+                                      peak=0, end_size=0,
+                                      **{k: 0 for k in SUMS})
+                    session.add(row)
+                for k in SUMS:
+                    setattr(row, k, getattr(row, k) + int(r.get(k) or 0))
+                row.peak = max(row.peak, int(r.get("peak") or 0))
+                row.end_size = int(r.get("end_size") or 0)
+                row.updated_at = datetime.now(timezone.utc)
+                n += 1
+            await session.commit()
+    except Exception as e:                                       # noqa: BLE001
+        logger.debug(f"merge_level_minutes: {e}")
+        return {"written": 0, "skipped": skipped, "error": str(e)[:120]}
+    return {"written": n, "skipped": skipped, "floor_rub": floor}
+
+
+async def level_series(ticker: str, day: str, source: str = "exchange",
+                       limit: int = 400) -> list[dict]:
+    """
+    История уровней бумаги за день, по минутам. Порядок — по времени.
+
+    Отдаётся в ЛОТАХ, как лежит. Рубли считает вызывающий: лотность у бумаг
+    разная и в базе её нет.
+    """
+    async with async_session() as session:
+        conds = [LevelMinute.ticker == ticker.upper(),
+                 LevelMinute.ts.like(f"{day}%")]
+        if source:
+            conds.append(LevelMinute.source == source)
+        q = (select(LevelMinute).where(*conds)
+             .order_by(LevelMinute.ts).limit(max(1, int(limit))))
+        rows = (await session.execute(q)).scalars().all()
+    return [{"ts": r.ts, "side": r.side, "price": r.price, "peak": r.peak,
+             "end_size": r.end_size, "added": r.added, "traded": r.traded,
+             "pulled": r.pulled, "restored": r.restored, "gone": r.gone,
+             "events": r.events, "source": r.source} for r in rows]
+
+
 async def micro_series(ticker: str, day: str,
                        source: str = "exchange") -> list[dict]:
     """Производные секундного ряда за день, по минутам."""
@@ -2742,6 +2877,20 @@ async def prune_micro_minute(keep_days: int = 90) -> int:
     async with async_session() as session:
         result = await session.execute(
             delete(MicroMinute).where(MicroMinute.ts < cutoff))
+        await session.commit()
+        return result.rowcount or 0
+
+
+async def prune_level_minute(keep_days: int = 90) -> int:
+    """
+    Чистка истории уровней тем же сроком. Без неё таблица растёт весь срок жизни
+    сервера — а именно на переполнении диска деплой уже вставал трижды.
+    """
+    cutoff = (datetime.now(timezone.utc) + timedelta(hours=3)
+              - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+    async with async_session() as session:
+        result = await session.execute(
+            delete(LevelMinute).where(LevelMinute.ts < cutoff))
         await session.commit()
         return result.rowcount or 0
 

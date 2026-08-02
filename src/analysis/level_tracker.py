@@ -26,6 +26,8 @@
 """
 from typing import Optional
 
+from src.analysis import level_history as lh
+
 # Уровень считается ушедшим, когда от его максимума осталось меньше этой доли.
 # Не ноль: биржа отдаёт 20 уровней, и заявка может просто выпасть из окна, не
 # исчезнув. Это неотличимо от снятия, и лучше считать так, чем делать вид, что
@@ -42,15 +44,21 @@ class LevelTracker:
     заявкой на покупку, и на продажу в разные моменты.
     """
 
-    def __init__(self, keep_minutes: int = KEEP_MINUTES):
+    def __init__(self, keep_minutes: int = KEEP_MINUTES,
+                 history: Optional["lh.LevelLog"] = None):
         self.keep_minutes = keep_minutes
         self.levels: dict = {}
         self.best: dict = {}          # тикер -> (лучший бид, лучший аск)
+        # СЕКУНДНАЯ история уровня. События определяются ЗДЕСЬ, потому что здесь
+        # уже вычисляются исчезновение, восстановление и изменение размера.
+        # Отдельный модуль со своим определением слова «восстановился» разошёлся
+        # бы с этим — так модули и расходятся.
+        self.history = history if history is not None else lh.LevelLog()
 
     # ─── приём данных ────────────────────────────────────────────────────────
 
     def on_book(self, ticker: str, minute: str, bids: list, asks: list,
-                source: str = "exchange") -> None:
+                source: str = "exchange", sec: Optional[int] = None) -> None:
         """
         bids/asks — списки (цена, лоты). Порядок не важен, сортируем сами.
 
@@ -59,6 +67,9 @@ class LevelTracker:
           уровень, пропавший из стакана, помечается ушедшим — но не удаляется;
           вернувшийся считается восстановленным, и отсчёт исполнения обнуляется;
           уровень за лучшей ценой помечается пробитым.
+
+        `sec` — секунда эпохи пакета. Без неё история уровня не ведётся: минута
+        для вопроса «что было десять секунд назад» бесполезна.
         """
         tk = (ticker or "").upper()
         if not tk:
@@ -79,13 +90,32 @@ class LevelTracker:
                 if price <= 0 or qty <= 0:
                     continue
                 present[round(float(price), 6)] = int(qty)
+            # Журнал ведётся для КРУПНЫХ уровней плюс тех, у кого он уже есть.
+            # Второе обязательно: крупную плиту, которую съедают, надо довести до
+            # нуля, а она по пути выпадает из верхних — и самые интересные
+            # события потерялись бы ровно в конце.
+            #
+            # «Крупный» — не «пятый по счёту», а «сопоставимый с крупнейшим на
+            # своей стороне». Пятое место занимает кто угодно: на синтетическом
+            # прогоне отбор по месту дал 36 тысяч вытеснений за 2400 пакетов, и
+            # журналы не успевали накопить историю.
+            ranked = sorted(present.items(), key=lambda kv: -kv[1])
+            biggest = ranked[0][1] if ranked else 0
+            floor_qty = biggest * lh.ENTER_SHARE
+            top = {p for p, q in ranked[:self.history.top_levels]
+                   if q >= floor_qty}
             for price, qty in present.items():
-                self._touch(tk, side, price, qty, minute)
+                self._touch(tk, side, price, qty, minute, sec, price in top)
             # Известные уровни этой стороны, которых в пакете НЕТ.
             for (t, s, price), lv in self.levels.items():
                 if t != tk or s != side or price in present:
                     continue
                 if lv["size"] > 0:
+                    k = (t, s, price)
+                    self.history.accrue(k, minute, lh.GONE, size=0)
+                    if sec is not None and k in self.history.log:
+                        self.history.add(k, sec, lh.GONE, lots=lv["size"],
+                                         size=0)
                     lv["size"] = 0
                     lv["gone_count"] += 1
                     lv["gone_at"] = minute
@@ -101,7 +131,8 @@ class LevelTracker:
                 lv["broken"] = True
 
     def _touch(self, tk: str, side: str, price: float, qty: int,
-               minute: str) -> None:
+               minute: str, sec: Optional[int] = None,
+               in_top: bool = False) -> None:
         k = (tk, side, price)
         lv = self.levels.get(k)
         if lv is None:
@@ -110,19 +141,81 @@ class LevelTracker:
                 "traded": 0, "traded_since_restore": 0, "gone_count": 0,
                 "restored_count": 0, "first_seen": minute, "last_seen": minute,
                 "gone_at": None, "restored_at": None, "broken": False,
+                # Сделки, ещё не приписанные ни одному уменьшению. Нужны потому,
+                # что сделки и стакан — ДВА независимых потока: сделка может
+                # прийти позже пакета, который её уже учёл.
+                "pending_traded": 0,
             }
+            self.history.accrue(k, minute, lh.APPEARED, lots=qty, size=qty)
+            if sec is not None and in_top:
+                self.history.add(k, sec, lh.APPEARED, lots=qty, size=qty)
             return
-        was_gone = lv["size"] <= lv["peak"] * GONE_SHARE
+
+        prev = lv["size"]
+        delta = qty - prev
+        # ИСПОЛНЕНО ИЛИ СНЯТО. Уменьшение на 300 лотов — это либо съели, либо
+        # владелец убрал заявку. Смысл противоположный, и различает их только
+        # объём сделок на этой цене между пакетами.
+        pending = lv.get("pending_traded", 0)
+        traded = pulled = 0
+        if delta < 0:
+            traded = min(-delta, pending)
+            pulled = -delta - traded
+            lv["pending_traded"] = pending - traded
+        elif pending > 0 and delta >= 0:
+            # Сделки прошли, а размер не упал — значит долили на ту же цену.
+            traded = pending
+            lv["pending_traded"] = 0
+
+        was_gone = prev <= lv["peak"] * GONE_SHARE
         # ВОССТАНОВЛЕНИЕ. Считается только если уровень действительно уходил и
         # вернулся к сопоставимому размеру: иначе каждое дрожание объёма
         # записывалось бы как восстановление.
-        if was_gone and qty >= lv["peak"] * 0.5 and lv["gone_count"] > 0:
+        restored = bool(was_gone and qty >= lv["peak"] * 0.5
+                        and lv["gone_count"] > 0)
+        if restored:
             lv["restored_count"] += 1
             lv["restored_at"] = minute
             lv["traded_since_restore"] = 0
+            lv["pending_traded"] = 0
+
+        kind = self._kind(restored, delta, traded, pulled)
+        if kind:
+            # В МИНУТУ — всегда, включая мелочь: сумма мелких исполнений за
+            # минуту может быть больше одного крупного, и терять её нельзя.
+            self.history.accrue(k, minute, kind, lots=abs(delta), size=qty,
+                                traded=traded, pulled=pulled)
+            # В СЕКУНДНЫЙ журнал — только заметное: стоящий уровень дал бы
+            # шестьдесят строк в минуту, и нужные в них утонули бы.
+            if sec is not None and (in_top or k in self.history.log):
+                floor = max(1, lv["peak"] * lh.MIN_SHARE)
+                big = (abs(delta) >= floor or traded >= floor
+                       or pulled >= floor)
+                if big or kind in (lh.RESTORED, lh.GONE):
+                    self.history.add(k, sec, kind, lots=abs(delta), size=qty,
+                                     traded=traded, pulled=pulled)
+
         lv["size"] = qty
         lv["peak"] = max(lv["peak"], qty)
         lv["last_seen"] = minute
+
+    @staticmethod
+    def _kind(restored: bool, delta: int, traded: int, pulled: int):
+        """
+        Как назвать произошедшее. Только описание, без оценок.
+
+        Разделение исполненного и снятого важнее самого факта уменьшения:
+        «съели» и «передумал» означают противоположное.
+        """
+        if restored:
+            return lh.RESTORED
+        if delta > 0:
+            return lh.GREW
+        if delta < 0:
+            if traded and pulled:
+                return lh.EATEN          # часть исполнена, часть снята
+            return lh.EXECUTED if traded else lh.PULLED
+        return lh.REFILLED if traded else None
 
     def on_trade(self, ticker: str, price: float, qty: int,
                  source: str = "exchange") -> None:
@@ -144,6 +237,11 @@ class LevelTracker:
             if lv is not None:
                 lv["traded"] += int(qty)
                 lv["traded_since_restore"] += int(qty)
+                # Ждёт ближайшего уменьшения, чтобы отличить исполнение от
+                # снятия. Ограничено пиком: иначе неприписанные сделки копились
+                # бы весь день и потом объявили бы исполненным чистое снятие.
+                lv["pending_traded"] = min(
+                    lv["peak"], lv.get("pending_traded", 0) + int(qty))
 
     # ─── выдача ──────────────────────────────────────────────────────────────
 
@@ -182,6 +280,26 @@ class LevelTracker:
                 })
         return out
 
+    def with_history(self, ticker: str, now_sec: int, lot: int = 1,
+                     top: int = 1, source: str = "exchange",
+                     window: int = lh.WINDOW) -> list:
+        """
+        Заметные уровни ВМЕСТЕ с их секундной историей.
+
+        То, ради чего всё: не «BID сейчас 882 тыс.», а что с ним происходило
+        последние десять-шестьдесят секунд.
+        """
+        tk = f"{(ticker or '').upper()}|{source}"
+        out = self.notable(ticker, lot=lot, top=top, source=source)
+        for lv in out:
+            k = (tk, lv["side"], lv["price"])
+            tl = self.history.timeline(k, now_sec, lot=lot, window=window)
+            if tl:
+                lv["timeline"] = tl
+                lv["history"] = self.history.summary(k, now_sec, lot=lot,
+                                                     window=window)
+        return out
+
     def prune(self, current_minute: str) -> int:
         """
         Убрать уровни, которых давно нет. Без этого карта растёт весь день: цена
@@ -201,6 +319,7 @@ class LevelTracker:
                 dead.append(k)
         for k in dead:
             del self.levels[k]
+            self.history.forget(k)      # иначе журналы копятся весь день
         return len(dead)
 
     def stats(self) -> dict:

@@ -490,7 +490,7 @@ class MarketStream:
                 tk, msk_minute(when),
                 [(quotation(o.price), int(o.quantity)) for o in bids],
                 [(quotation(o.price), int(o.quantity)) for o in asks],
-                source=src)
+                source=src, sec=int(when.timestamp()))
             self.ticks.on_book(tk, src, int(when.timestamp()), bid, ask,
                                bid5, ask5, bb, ba, bid_top, ask_top)
             self.stats["books_dealer" if src == "dealer" else "books"] += 1
@@ -723,6 +723,10 @@ class MarketStream:
             **self.stats,
             "instance": self.instance,
             "levels": self.levels.stats(),
+            # Счётчики журналов уровней. Нужны, чтобы ИЗМЕРИТЬ отбор на живом
+            # рынке, а не поверить синтетическому прогону: если вытеснений много,
+            # значит журналы не успевают накопить историю и порог надо менять.
+            "level_logs": self.levels.history.stats(),
             "ticks": self.ticks.stats(),
             "tickers_subscribed": len(self.figis),
             "tickers_with_data": len(ages),

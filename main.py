@@ -510,6 +510,7 @@ async def market_snapshot_pipeline():
                 await db.prune_book_minute(keep_days=BOOK_MINUTE_KEEP_DAYS)
                 await db.prune_candle_minute(keep_days=BOOK_MINUTE_KEEP_DAYS)
                 await db.prune_micro_minute(keep_days=BOOK_MINUTE_KEEP_DAYS)
+                await db.prune_level_minute(keep_days=BOOK_MINUTE_KEEP_DAYS)
         except Exception as e:
             logger.debug(f"market snapshot: {e}")
         # В сессию — частые снимки (90с); вне сессии — редкие (300с): экономим API,
@@ -537,7 +538,7 @@ async def stream_pipeline():
         return
 
     from src.analysis.universe import cached_universe
-    from src.collector.stream import MarketStream
+    from src.collector.stream import MarketStream, msk_minute
     from src.collector.tinkoff_client import TinkoffClient
 
     static_tickers = list(MOEX_TICKERS.keys())
@@ -613,6 +614,33 @@ async def stream_pipeline():
             for tk, rows in per_ticker.items():
                 n = await db.merge_micro_minutes(tk, rows, source=src)
                 counts[f"секунды/{src}"] = counts.get(f"секунды/{src}", 0) + n
+
+        # ИСТОРИЯ УРОВНЕЙ. Секунды остаются в памяти — двадцать цен десять раз в
+        # секунду на 80 бумагах не помещаются никуда. В базу идёт минутный итог,
+        # и только по уровням, где что-то происходило выше порога в рублях.
+        #
+        # Берутся ЗАВЕРШЁННЫЕ минуты: текущая ещё набирается, и записать её
+        # половину значило бы потом дописывать остаток второй строкой.
+        try:
+            now_min = msk_minute(datetime.now(timezone.utc))
+            done = stream.levels.history.drop_completed(now_min)
+            if done:
+                rows = []
+                for key, minute, tot in done:
+                    tk_src, side, price = key
+                    tk, _, src = tk_src.partition("|")
+                    rows.append({**tot, "ts": minute, "ticker": tk,
+                                 "source": src or "exchange", "side": side,
+                                 "price": price,
+                                 "lot": (stream.lots or {}).get(tk) or 1})
+                res = await db.merge_level_minutes(rows)
+                # Отброшенное логируется рядом с записанным: без второго числа
+                # нельзя понять, порог отсекает шум или половину полезного.
+                counts["уровни"] = res.get("written", 0)
+                counts["уровни/ниже порога"] = res.get("skipped", 0)
+        except Exception as e:                                   # noqa: BLE001
+            logger.debug(f"история уровней: {e}")
+
         if counts:
             logger.debug("стрим записал: %s", counts)
 
