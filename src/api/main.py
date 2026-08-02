@@ -841,6 +841,11 @@ async def get_levels(ticker: str, day: Optional[str] = None,
             return {"ticker": ticker.upper(), "day": d, "source": source,
                     "count": 0, "rows": [], "error": str(e),
                     "create_attempt": made}
+    # CURRENT импортируется ЛОКАЛЬНО в каждом маршруте, который им пользуется:
+    # это ссылка на живой стрим, и на момент импорта модуля её ещё нет. Без этой
+    # строки здесь был NameError и голая пятисотка — она и держала маршрут
+    # сломанным, а вовсе не отсутствие таблицы, как я решил сначала.
+    from src.collector.stream import CURRENT
     lot = int((getattr(CURRENT, "lots", None) or {}).get(ticker.upper()) or 1)
     total = {"traded_lots": sum(r["traded"] for r in rows),
              "pulled_lots": sum(r["pulled"] for r in rows),
