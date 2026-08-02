@@ -659,3 +659,50 @@ def test_route_returns_the_reason_not_a_bare_500():
     body = api[i:j]
     assert "db.LevelStoreError" in body
     assert '"error"' in body and "create_attempt" in body
+
+
+def test_refill_counts_as_added_in_the_summary():
+    """
+    Найдено НА ЭКРАНЕ 02.08: у GAZP стояли строки «долили 52 тыс» и «долили
+    100 тыс», а в итоге — «долили 0 ₽».
+
+    Причина: у события refilled размер НЕ меняется, abs(delta) равен нулю, и весь
+    долитый объём лежит в поле сделок. Складывать только изменение размера значит
+    не увидеть ровно тот случай, когда заявку держат под давлением.
+    """
+    tr = tracker()
+    book(tr, T0, [(100.0, 1000)])
+    tr.on_trade("SBER", 100.0, 300)
+    book(tr, T0 + 1, [(100.0, 1000)])          # съели 300 и столько же долили
+    s = tr.history.summary(key(100.0), T0 + 1)
+    assert s["traded_rub"] == round(100.0 * 300)
+    assert s["added_rub"] >= round(100.0 * 300), \
+        "долитое взамен съеденного входит в добавленное"
+
+
+def test_growth_with_trades_counts_both_parts():
+    """
+    Уровень и съели, и он вырос: валовое добавление больше прироста на съеденное.
+    """
+    tr = tracker()
+    book(tr, T0, [(100.0, 1000)])
+    tr.on_trade("SBER", 100.0, 200)
+    book(tr, T0 + 1, [(100.0, 1500)])          # +500 сверх съеденных 200
+    s = tr.history.summary(key(100.0), T0 + 1)
+    # 1000 при появлении + 500 прироста + 200 возмещённых
+    assert s["added_rub"] == round(100.0 * (1000 + 500 + 200))
+
+
+def test_summary_added_is_never_zero_when_lines_say_added():
+    """
+    Итог не должен противоречить строкам над ним: это первое, что видит глаз.
+    """
+    tr = tracker()
+    book(tr, T0, [(100.0, 500)])
+    tr.on_trade("SBER", 100.0, 100)
+    book(tr, T0 + 1, [(100.0, 500)])
+    rows = tr.history.timeline(key(100.0), T0 + 1)
+    s = tr.history.summary(key(100.0), T0 + 1)
+    shown = [r for r in rows if r["kind"] in (lh.GREW, lh.APPEARED,
+                                              lh.RESTORED, lh.REFILLED)]
+    assert shown and s["added_rub"] > 0

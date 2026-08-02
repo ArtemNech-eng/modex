@@ -258,8 +258,23 @@ class LevelLog:
         rows = self.timeline(key, now_sec, lot=lot, window=window)
         if not rows:
             return {}
-        added = sum(r.get("rub", 0) for r in rows
-                    if r["kind"] in (GREW, APPEARED, RESTORED, REFILLED))
+        # ДОЛИТОЕ СЧИТАЕТСЯ ВМЕСТЕ С ВОЗМЕЩЁННЫМ.
+        #
+        # Найдено на экране 02.08: у GAZP стояли две строки «долили 52 тыс» и
+        # «долили 100 тыс», а в итоге — «долили 0 ₽». У события refilled размер
+        # НЕ меняется, значит abs(delta) равен нулю, и весь долитый объём лежит в
+        # поле сделок. Складывать только изменение размера — значит не увидеть
+        # ровно тот случай, когда заявку держат под давлением.
+        #
+        # Для grew с сделками валовое добавление тоже больше прироста: сколько
+        # съели, столько же и восполнили, плюс сам прирост.
+        added = 0
+        for r in rows:
+            if r["kind"] not in (GREW, APPEARED, RESTORED, REFILLED):
+                continue
+            added += r.get("rub", 0)
+            if r["kind"] in (GREW, REFILLED):
+                added += r.get("traded_rub", 0)
         traded = sum(r.get("traded_rub", 0) for r in rows)
         pulled = sum(r.get("pulled_rub", 0) for r in rows)
         return {
