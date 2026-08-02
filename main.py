@@ -629,10 +629,21 @@ async def stream_pipeline():
                 for key, minute, tot in done:
                     tk_src, side, price = key
                     tk, _, src = tk_src.partition("|")
-                    rows.append({**tot, "ts": minute, "ticker": tk,
-                                 "source": src or "exchange", "side": side,
-                                 "price": price,
-                                 "lot": (stream.lots or {}).get(tk) or 1})
+                    row = {**tot, "ts": minute, "ticker": tk,
+                           "source": src or "exchange", "side": side,
+                           "price": price,
+                           "lot": (stream.lots or {}).get(tk) or 1}
+                    # Счётчики тестов живут на уровне, а не в журнале событий:
+                    # тест это приход ЦЕНЫ, а не изменение размера. Берём их
+                    # состоянием на конец минуты — без них нечем будет измерить,
+                    # значит ли «выдержал» хоть что-то для будущего.
+                    lv = stream.levels.levels.get(key)
+                    if lv:
+                        row.update(tests=lv.get("tests", 0),
+                                   test_held=lv.get("test_held", 0),
+                                   test_failed=lv.get("test_failed", 0),
+                                   alive_sec=lv.get("alive_sec", 0))
+                    rows.append(row)
                 res = await db.merge_level_minutes(rows)
                 # Отброшенное логируется рядом с записанным: без второго числа
                 # нельзя понять, порог отсекает шум или половину полезного.

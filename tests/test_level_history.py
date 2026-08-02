@@ -706,3 +706,253 @@ def test_summary_added_is_never_zero_when_lines_say_added():
     shown = [r for r in rows if r["kind"] in (lh.GREW, lh.APPEARED,
                                               lh.RESTORED, lh.REFILLED)]
     assert shown and s["added_rub"] > 0
+
+
+# ─── тесты уровня: цена дошла и что дальше ────────────────────────────────────
+
+def test_price_reaching_the_level_counts_as_a_test():
+    """
+    ТЕСТ — это когда цена ДОШЛА до уровня, то есть он стал лучшим на своей
+    стороне. Не «на уровне были сделки»: цена может подойти и отступить, не
+    задев ни одной заявки, и это тоже тест, причём выдержанный.
+    """
+    tr = tracker()
+    book(tr, T0, [(100.0, 1000), (99.0, 500)], asks=[(101.0, 400)])
+    assert tr.levels[key(99.0)]["tests"] == 0, "до 99.0 цена не доходила"
+    # лучший бид опустился ровно на 99.0 — уровень под тестом
+    book(tr, T0 + 1, [(99.0, 500)], asks=[(101.0, 400)])
+    lv = tr.levels[key(99.0)]
+    assert lv["tests"] == 1 and lv["in_test"] is True
+
+
+def test_price_stepping_away_means_the_test_held():
+    tr = tracker()
+    book(tr, T0, [(100.0, 1000), (99.0, 500)], asks=[(101.0, 400)])
+    book(tr, T0 + 1, [(99.0, 500)], asks=[(101.0, 400)])          # тест
+    book(tr, T0 + 2, [(100.0, 1000), (99.0, 500)], asks=[(101.0, 400)])
+    lv = tr.levels[key(99.0)]
+    assert lv["tests"] == 1 and lv["test_held"] == 1
+    assert lv["test_failed"] == 0 and lv["in_test"] is False
+
+
+def test_price_going_through_means_the_test_failed():
+    tr = tracker()
+    book(tr, T0, [(100.0, 1000), (99.0, 500)], asks=[(101.0, 400)])
+    book(tr, T0 + 1, [(99.0, 500)], asks=[(101.0, 400)])          # тест
+    book(tr, T0 + 2, [(98.5, 300)], asks=[(101.0, 400)])          # прошла ниже
+    lv = tr.levels[key(99.0)]
+    assert lv["test_failed"] == 1 and lv["test_held"] == 0
+    assert lv["broken"] is True
+
+
+def test_repeated_touches_are_separate_tests():
+    """Три подхода — три теста, а не один длинный."""
+    tr = tracker()
+    far = [(100.0, 1000), (99.0, 500)]
+    near = [(99.0, 500)]
+    book(tr, T0, far, asks=[(101.0, 400)])
+    for i in range(3):
+        book(tr, T0 + 1 + i * 2, near, asks=[(101.0, 400)])
+        book(tr, T0 + 2 + i * 2, far, asks=[(101.0, 400)])
+    lv = tr.levels[key(99.0)]
+    assert lv["tests"] == 3 and lv["test_held"] == 3
+
+
+def test_staying_at_the_touch_is_not_counted_again():
+    """Пока цена стоит на уровне, тест ОДИН, а не по одному на пакет."""
+    tr = tracker()
+    book(tr, T0, [(100.0, 1000), (99.0, 500)], asks=[(101.0, 400)])
+    for i in range(10):
+        book(tr, T0 + 1 + i, [(99.0, 500)], asks=[(101.0, 400)])
+    assert tr.levels[key(99.0)]["tests"] == 1
+
+
+def test_ask_side_is_tested_from_above():
+    tr = tracker()
+    book(tr, T0, [(100.0, 500)], asks=[(101.0, 400), (102.0, 700)])
+    book(tr, T0 + 1, [(100.0, 500)], asks=[(102.0, 700)])        # аск дошёл
+    lv = tr.levels[102.0, "ask"] if False else tr.levels[key(102.0, "ask")]
+    assert lv["tests"] == 1
+    book(tr, T0 + 2, [(100.0, 500)], asks=[(102.5, 700)])        # ушёл выше
+    assert tr.levels[key(102.0, "ask")]["test_failed"] == 1
+
+
+def test_best_price_is_rounded_so_equality_works():
+    """
+    Цены уровней лежат в ключах как round(..., 6). Без округления лучшей цены
+    сравнение «дошла до уровня» не сходилось бы НИКОГДА, и тест не засчитался бы
+    ни один раз — самая тихая из возможных поломок.
+    """
+    tr = tracker()
+    p = 0.1 + 0.2                      # 0.30000000000000004, а в ключе 0.3
+    book(tr, T0, [(0.4, 100), (p, 500)], asks=[(1.0, 100)])
+    assert tr.levels[key(0.3)]["at_touch"] is False, "цена пока выше"
+    book(tr, T0 + 1, [(p, 500)], asks=[(1.0, 100)])      # цена пришла
+    assert tr.levels[key(0.3)]["tests"] == 1
+
+
+# ─── сколько прожил ───────────────────────────────────────────────────────────
+
+def test_lifetime_is_measured_in_seconds():
+    """
+    В минутах разница между сорока секундами и двумя минутами теряется целиком,
+    а для заявки это разные жизни.
+    """
+    tr = tracker()
+    book(tr, T0, [(100.0, 500)])
+    for i in range(1, 41):
+        book(tr, T0 + i, [(100.0, 500 + i)])
+    lv = tr.levels[key(100.0)]
+    assert lv["alive_sec"] == 40
+    assert tr.life(lv, now_sec=T0 + 45)["age_sec"] == 45
+
+
+def test_time_while_absent_does_not_count_as_lived():
+    """
+    Уровень появился, полчаса отсутствовал и вернулся — прожил не полчаса.
+    «Когда впервые увидели» и «сколько простоял» это разные вопросы.
+    """
+    tr = tracker()
+    book(tr, T0, [(100.0, 500)])
+    book(tr, T0 + 5, [(100.0, 500)])
+    book(tr, T0 + 6, [])                      # ушёл
+    book(tr, T0 + 40, [(100.0, 500)])         # вернулся через 34 секунды
+    lv = tr.levels[key(100.0)]
+    assert lv["alive_sec"] <= 6, "простой в зачёт не идёт"
+    assert tr.life(lv, now_sec=T0 + 40)["age_sec"] == 40
+
+
+# ─── состояние словом ─────────────────────────────────────────────────────────
+
+def test_state_defended_after_a_held_test():
+    tr = tracker()
+    book(tr, T0, [(100.0, 1000), (99.0, 500)], asks=[(101.0, 400)])
+    book(tr, T0 + 1, [(99.0, 500)], asks=[(101.0, 400)])
+    book(tr, T0 + 2, [(100.0, 1000), (99.0, 500)], asks=[(101.0, 400)])
+    assert tr.state(tr.levels[key(99.0)]) == "defended"
+
+
+def test_state_broken_wins_over_everything():
+    tr = tracker()
+    book(tr, T0, [(100.0, 1000), (99.0, 500)], asks=[(101.0, 400)])
+    book(tr, T0 + 1, [(99.0, 500)], asks=[(101.0, 400)])
+    book(tr, T0 + 2, [(98.0, 300)], asks=[(101.0, 400)])
+    assert tr.state(tr.levels[key(99.0)]) == "broken"
+
+
+def test_state_untested_when_price_never_came():
+    tr = tracker()
+    book(tr, T0, [(100.0, 1000), (95.0, 500)], asks=[(101.0, 400)])
+    assert tr.state(tr.levels[key(95.0)]) == "untested"
+
+
+def test_state_eaten_versus_pulled():
+    """Съели и убрали — противоположный смысл, и слово должно их различать."""
+    eaten = tracker()
+    book(eaten, T0, [(90.0, 1000)], asks=[(101.0, 400)])
+    eaten.on_trade("SBER", 90.0, 900)
+    book(eaten, T0 + 1, [(90.0, 50)], asks=[(101.0, 400)])
+    assert eaten.state(eaten.levels[key(90.0)]) == "eaten"
+
+    pulled = tracker()
+    book(pulled, T0, [(90.0, 1000)], asks=[(101.0, 400)])
+    book(pulled, T0 + 1, [(90.0, 50)], asks=[(101.0, 400)])
+    assert pulled.state(pulled.levels[key(90.0)]) == "pulled"
+
+
+def test_no_strong_or_weak_verdicts():
+    """
+    Артём просил STRONG / WEAK / DEFENDED / FAILED «без выдуманного Score».
+    Насчёт Score он прав. Но «сильный» означает «в следующий раз выдержит» — это
+    утверждение о БУДУЩЕМ, которого измерения не подтверждали. 31.07 ровно такая
+    метка измерялась ВРЕДНОЙ: t=-12.57, положительных дней 16%.
+
+    Здесь только прошедшее время: каждое слово — пересказ счётчиков.
+    """
+    tr = tracker()
+    book(tr, T0, [(100.0, 1000), (99.0, 500)], asks=[(101.0, 400)])
+    book(tr, T0 + 1, [(99.0, 500)], asks=[(101.0, 400)])
+    blob = str(tr.with_history("SBER", T0 + 1)).lower()
+    for bad in ("strong", "weak", "score", "сильн", "слаб", "signal",
+                "recommend", "reliable"):
+        assert bad not in blob, bad
+    src = (ROOT / "src/analysis/level_tracker.py").read_text()
+    assert "-12.57" in src, "измеренный вред таких меток записан рядом с кодом"
+
+
+def test_life_returns_the_nine_facts_asked_for():
+    tr = tracker()
+    book(tr, T0, [(100.0, 1000), (99.0, 500)], asks=[(101.0, 400)])
+    book(tr, T0 + 1, [(99.0, 500)], asks=[(101.0, 400)])
+    tr.on_trade("SBER", 99.0, 100)
+    book(tr, T0 + 2, [(100.0, 1000), (99.0, 400)], asks=[(101.0, 400)])
+    lf = tr.life(tr.levels[key(99.0)], now_sec=T0 + 2, lot=1)
+    for f in ("state", "first_seen", "gone_count", "restored_count",
+              "traded_rub", "tests", "test_held", "test_failed", "broken",
+              "alive_sec", "age_sec", "traded_share_of_peak"):
+        assert f in lf, f
+
+
+def test_life_is_attached_to_the_notable_level():
+    tr = tracker()
+    book(tr, T0, [(100.0, 5000)], asks=[(101.0, 400)])
+    got = tr.with_history("SBER", T0, lot=1, top=1)
+    assert any("life" in x for x in got)
+
+
+# ─── скорость: указатель по тикеру ────────────────────────────────────────────
+
+def test_packet_handling_does_not_scan_all_tickers():
+    """
+    Замер, а не рассуждение. Обход исчезнувших и пробитых шёл по ВСЕМ уровням
+    всех бумаг: 0.92 мс на пакет, 1085 пакетов в секунду при потребности 800.
+    Запас 1.36x — и это ДО добавления счёта тестов.
+
+    Тест держит указатель на месте: с двумя бумагами и с восемьюдесятью время
+    обработки одного пакета должно отличаться незначительно.
+    """
+    import time
+
+    def build(n):
+        tr = tracker()
+        for t in range(n):
+            base = 100.0 + t
+            bids = [(round(base - j * 0.01, 2), 500) for j in range(20)]
+            asks = [(round(base + 0.1 + j * 0.01, 2), 500) for j in range(20)]
+            tr.on_book(f"TK{t}", MIN, bids, asks, sec=T0)
+        return tr
+
+    def measure(tr, n=200):
+        bids = [(round(100.0 - j * 0.01, 2), 500) for j in range(20)]
+        asks = [(round(100.1 + j * 0.01, 2), 500) for j in range(20)]
+        t0 = time.perf_counter()
+        for i in range(n):
+            tr.on_book("TK0", MIN, bids, asks, sec=T0 + i)
+        return (time.perf_counter() - t0) / n
+
+    small = measure(build(2))
+    big = measure(build(80))
+    assert big < small * 6, (
+        f"обработка растёт с числом бумаг: {small*1000:.3f} мс против "
+        f"{big*1000:.3f} мс — похоже, обход снова идёт по всем уровням")
+
+
+def test_index_is_cleaned_by_prune():
+    """Указатель без очистки растёт весь день — та же течь, что с журналами."""
+    tr = tracker(keep_minutes=0)
+    book(tr, T0, [(100.0, 500)], minute="2026-08-03T10:00")
+    book(tr, T0 + 1, [], minute="2026-08-03T10:00")
+    tr.prune("2026-08-03T11:00")
+    assert not tr.index.get(("SBER|exchange", "bid"))
+
+
+def test_page_shows_state_and_life_without_verdicts():
+    page = (ROOT / "dashboard/book-live.html").read_text()
+    for word in ("состояние", "выдержал", "не выдержал", "пробит",
+                 "выкуплен", "снят", "живёт", "стоял"):
+        assert word in page, word
+    assert "-12.57" in page or "−12.57" in page, "оговорка про метки на экране"
+    # Никаких вердиктов о будущем в разметке состояний.
+    i = page.index("const STATE")
+    assert not any(b in page[i:i + 400].lower()
+                   for b in ("сильн", "слаб", "strong", "weak"))

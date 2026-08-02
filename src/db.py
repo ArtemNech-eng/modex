@@ -525,6 +525,14 @@ class LevelMinute(Base):
     restored: Mapped[int] = mapped_column(Integer, default=0)
     gone: Mapped[int] = mapped_column(Integer, default=0)
     events: Mapped[int] = mapped_column(Integer, default=0)
+    # ТЕСТЫ — накопительные счётчики уровня на конец минуты, не приращение.
+    # Тест это приход цены К уровню и её уход: отступила или прошла насквозь.
+    # Нужны, чтобы однажды ИЗМЕРИТЬ, значит ли «выдержал» хоть что-нибудь для
+    # будущего. Пока не измерено, слова «сильный» на карточке нет.
+    tests: Mapped[int] = mapped_column(Integer, default=0)
+    test_held: Mapped[int] = mapped_column(Integer, default=0)
+    test_failed: Mapped[int] = mapped_column(Integer, default=0)
+    alive_sec: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
@@ -677,6 +685,16 @@ _ADDED_COLUMNS = {
                     "ask5_sum": "DOUBLE PRECISION DEFAULT 0",
                     "bid_top_max": "INTEGER DEFAULT 0",
                     "ask_top_max": "INTEGER DEFAULT 0"},
+    # Счётчики тестов добавлены после того, как таблица уже появилась на живом
+    # сервере, — create_all их не допишет, только миграция.
+    #
+    # Зачем они в базе. Слова «сильный» на карточке нет намеренно: связь
+    # «выдержал сегодня» с «удержит завтра» не измерялась. Измерить её можно
+    # только по накопленным тестам, и без этих трёх колонок считать будет нечего.
+    "level_minute": {"tests": "INTEGER DEFAULT 0",
+                     "test_held": "INTEGER DEFAULT 0",
+                     "test_failed": "INTEGER DEFAULT 0",
+                     "alive_sec": "INTEGER DEFAULT 0"},
 }
 
 
@@ -2841,6 +2859,11 @@ async def merge_level_minutes(rows: list[dict],
                     setattr(row, k, getattr(row, k) + int(r.get(k) or 0))
                 row.peak = max(row.peak, int(r.get("peak") or 0))
                 row.end_size = int(r.get("end_size") or 0)
+                # Счётчики тестов НАКОПИТЕЛЬНЫЕ: берётся последнее состояние, а
+                # не сумма. Сложение удвоило бы их при повторном вливе минуты.
+                for k in ("tests", "test_held", "test_failed", "alive_sec"):
+                    if r.get(k) is not None:
+                        setattr(row, k, int(r[k]))
                 row.updated_at = datetime.now(timezone.utc)
                 n += 1
             await session.commit()
@@ -2877,7 +2900,10 @@ async def level_series(ticker: str, day: str, source: str = "exchange",
     return [{"ts": r.ts, "side": r.side, "price": r.price, "peak": r.peak,
              "end_size": r.end_size, "added": r.added, "traded": r.traded,
              "pulled": r.pulled, "restored": r.restored, "gone": r.gone,
-             "events": r.events, "source": r.source} for r in rows]
+             "events": r.events, "source": r.source,
+             "tests": r.tests, "test_held": r.test_held,
+             "test_failed": r.test_failed, "alive_sec": r.alive_sec}
+            for r in rows]
 
 
 async def micro_series(ticker: str, day: str,

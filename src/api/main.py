@@ -852,6 +852,19 @@ async def get_levels(ticker: str, day: Optional[str] = None,
              "added_lots": sum(r["added"] for r in rows),
              "restored": sum(r["restored"] for r in rows),
              "gone": sum(r["gone"] for r in rows)}
+    # ТЕСТЫ накопительные на уровень, поэтому по каждой цене берётся максимум за
+    # день, а не сумма по минутам — иначе один тест сосчитался бы столько раз,
+    # сколько минут прожил уровень.
+    per_level: dict = {}
+    for r in rows:
+        k = (r["side"], r["price"])
+        cur = per_level.get(k) or {}
+        for f in ("tests", "test_held", "test_failed"):
+            cur[f] = max(cur.get(f, 0), int(r.get(f) or 0))
+        per_level[k] = cur
+    for f in ("tests", "test_held", "test_failed"):
+        total[f] = sum(v.get(f, 0) for v in per_level.values())
+    total["levels"] = len(per_level)
     return {"ticker": ticker.upper(), "day": d, "source": source, "lot": lot,
             "count": len(rows), "totals": total,
             "floor_rub": db.LEVEL_MINUTE_FLOOR_RUB, "rows": rows}
