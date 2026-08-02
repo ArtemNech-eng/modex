@@ -350,6 +350,13 @@ class MarketStream:
         # и исполнение возле лучших цен: данные приходили, но не сохранялись.
         from src.analysis.book_ticks import TickRing
         self.ticks = TickRing()
+        # Лента сделок. Количество сделок, объёмы агрессивных покупок и продаж,
+        # накопленная дельта в потоке БЫЛИ, но сворачивались до минуты, а
+        # внутриминутный порядок выбрасывался. Именно порядок и отличает три
+        # крупные покупки подряд за десять секунд от трёх, разбросанных по
+        # минуте: суммы одинаковые, события разные.
+        from src.analysis.trade_tape import TradeTape
+        self.tape = TradeTape()
         self.lots: dict = {}          # тикер -> лотность, из ISS
         self.steps: dict = {}         # тикер -> шаг цены, из ISS
         self.atr: dict = {}           # тикер -> дневной ATR, из ISS
@@ -449,6 +456,8 @@ class MarketStream:
             bb, ba = self.levels.best.get(f"{tk}|{src}", (0.0, 0.0))
             self.ticks.on_trade(tk, src, price, int(t.quantity), bb, ba,
                                 tick=float(self.steps.get(tk) or 0))
+            self.tape.on_trade(tk, src, int(when.timestamp()), price,
+                               int(t.quantity), int(t.direction), bb, ba)
             self.stats["trades_dealer" if src == "dealer" else "trades"] += 1
         elif name == "orderbook":
             ob = resp.orderbook
@@ -728,6 +737,7 @@ class MarketStream:
             # значит журналы не успевают накопить историю и порог надо менять.
             "level_logs": self.levels.history.stats(),
             "ticks": self.ticks.stats(),
+            "tape": self.tape.stats(),
             "tickers_subscribed": len(self.figis),
             "tickers_with_data": len(ages),
             "tickers_fresh_60s": fresh,

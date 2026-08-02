@@ -634,6 +634,32 @@ async def get_book_live(ticker: str, light: bool = False):
     out["liquidity_speed"] = CURRENT.ticks.speed(tk, tick_src, now_sec)
     out["execution"] = CURRENT.ticks.near_best(tk, tick_src)
 
+    # ЛЕНТА СДЕЛОК. Отвечает на вопрос «реальное давление или просто большая
+    # заявка в стакане»: заявку можно снять за секунду ничего не потратив, а
+    # сделку отменить нельзя.
+    #
+    # Источник берётся тот же, что у секундного ряда: дилерская сделка — сделка
+    # с брокером, а не с рынком, и считать её давлением рынка нельзя.
+    tape = getattr(CURRENT, "tape", None)
+    if tape is not None:
+        out["tape_30s"] = tape.window(tk, tick_src, now_sec, back=30)
+        out["tape_5m"] = tape.window(tk, tick_src, now_sec, back=300)
+        # СЕРИЯ односторонних крупных сделок — то, ради чего лента. Само
+        # количество крупных ничего не значит: порог это верхние проценты, их
+        # всегда примерно столько же. Значит сгущение.
+        out["big_streak"] = tape.streak(tk, tick_src, now_sec, back=60)
+        out["big_trades"] = tape.big_trades(tk, tick_src, now_sec, back=60,
+                                            top=6)
+        thr = tape.big_threshold(tk, tick_src)
+        if thr:
+            out["big_threshold_lots"] = thr
+        # ДАВЛЕНИЕ ПРОТИВ СТОЯЩЕГО: два числа рядом, без вывода о том, какое
+        # из них важнее — этого никто не мерил.
+        resting = sum(x.get("now_lots") or 0 for x in (out.get("levels") or []))
+        if resting:
+            out["pressure"] = tape.pressure_vs_resting(
+                tk, tick_src, now_sec, resting_lots=resting, back=60)
+
     # ── по прошлым минутам: до 20 секунд ─────────────────────────────────────
     #
     # light=true отдаёт ТОЛЬКО память и не ходит в базу.
