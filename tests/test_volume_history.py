@@ -387,6 +387,6 @@ def test_volume_profile_is_wired_into_the_card():
 
 
 def test_page_shows_the_pairing():
-    page = (ROOT / "dashboard/book-live.html").read_text()
+    page = (ROOT / "dashboard/market-watch.html").read_text()
     assert "объём" in page.lower()
     assert "volume_mult" in page

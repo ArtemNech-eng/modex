@@ -505,7 +505,7 @@ def test_history_is_wired_into_the_light_response():
 
 
 def test_page_shows_the_sequence_and_the_caveat():
-    page = (ROOT / "dashboard/book-live.html").read_text()
+    page = (ROOT / "dashboard/market-watch.html").read_text()
     assert "история уровня" in page
     for word in ("исполнено", "снято", "вернулся", "долили"):
         assert word in page, word
@@ -947,7 +947,7 @@ def test_index_is_cleaned_by_prune():
 
 
 def test_page_shows_state_and_life_without_verdicts():
-    page = (ROOT / "dashboard/book-live.html").read_text()
+    page = (ROOT / "dashboard/market-watch.html").read_text()
     for word in ("состояние", "выдержал", "не выдержал", "пробит",
                  "выкуплен", "снят", "живёт", "стоял"):
         assert word in page, word
@@ -986,5 +986,5 @@ def test_defended_requires_a_finished_test_even_with_many_open():
 
 
 def test_page_knows_the_testing_state():
-    page = (ROOT / "dashboard/book-live.html").read_text()
+    page = (ROOT / "dashboard/market-watch.html").read_text()
     assert "цена у уровня сейчас" in page

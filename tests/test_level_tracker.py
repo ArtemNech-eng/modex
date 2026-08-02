@@ -282,7 +282,7 @@ def test_live_page_and_light_mode_exist():
     assert "/api/book-live/{ticker}" in api
     assert "light: bool = False" in api
     assert "/book-live" in api
-    page = (root / "dashboard/book-live.html").read_text()
+    page = (root / "dashboard/market-watch.html").read_text()
     assert "light=true" in page, "страница обязана пользоваться лёгким режимом"
     assert "setInterval(tickLight, 1000)" in page
 
@@ -293,7 +293,7 @@ def test_page_says_it_describes_and_does_not_advise():
     """
     import pathlib
     page = (pathlib.Path(__file__).resolve().parents[1]
-            / "dashboard/book-live.html").read_text()
+            / "dashboard/market-watch.html").read_text()
     assert "описывает состояние" in page
     assert "не измерено" in page
     assert "вредным" in page, "и про измеренный вред структуры тоже"

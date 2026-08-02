@@ -367,7 +367,7 @@ def test_wired_into_the_card():
 
 
 def test_page_shows_pressure_against_resting():
-    page = (ROOT / "dashboard/book-live.html").read_text()
+    page = (ROOT / "dashboard/market-watch.html").read_text()
     assert "исполнено / стоит в стакане" in page
     assert "серия крупных" in page
     assert "все тридцать" in page, "случай вырождения порога описан на экране"

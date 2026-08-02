@@ -356,7 +356,7 @@ def test_live_card_shows_the_three_new_things():
     for k in ('out["imbalance"]', 'out["liquidity_speed"]', 'out["execution"]'):
         assert k in api, k
     assert "/api/micro/{ticker}" in api
-    page = (ROOT / "dashboard/book-live.html").read_text()
+    page = (ROOT / "dashboard/market-watch.html").read_text()
     assert "перекос стакана" in page
     assert "скорость ликвидности" in page
     assert "исполнение относительно лучшей" in page
@@ -364,5 +364,5 @@ def test_live_card_shows_the_three_new_things():
 
 def test_page_explains_why_seconds_are_not_stored():
     """Ограничение должно быть НА ЭКРАНЕ, а не только в коде."""
-    page = (ROOT / "dashboard/book-live.html").read_text()
+    page = (ROOT / "dashboard/market-watch.html").read_text()
     assert "35 ГБ" in page and "не пишется" in page

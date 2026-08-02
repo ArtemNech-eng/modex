@@ -288,7 +288,7 @@ def test_page_shows_levels_and_says_they_are_not_rated():
     """
     Рамка должна быть НА ЭКРАНЕ: смотреть будут на экран, а не в код.
     """
-    page = (ROOT / "dashboard/book-live.html").read_text()
+    page = (ROOT / "dashboard/market-watch.html").read_text()
     assert "уровни с графика" in page
     assert "не измерено" in page
     assert "ATR дня" in page

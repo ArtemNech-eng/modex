@@ -299,7 +299,7 @@ def test_profile_is_wired_into_the_card():
 
 
 def test_page_shows_all_five_and_the_disagreement():
-    page = (ROOT / "dashboard/book-live.html").read_text()
+    page = (ROOT / "dashboard/market-watch.html").read_text()
     assert "таймфреймы · согласие" in page
     for k in ("1m", "3m", "5m", "15m", "30m"):
         assert f'"{k}"' in page, k

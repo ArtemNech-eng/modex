@@ -257,7 +257,7 @@ def test_sectors_come_from_moex_indices_not_from_a_guess():
 
 
 def test_page_shows_market_around():
-    page = (ROOT / "dashboard/book-live.html").read_text()
+    page = (ROOT / "dashboard/market-watch.html").read_text()
     assert "рынок вокруг" in page
     assert "против корзины" in page and "против IMOEX" in page
     assert "в разные стороны" in page
@@ -329,7 +329,7 @@ def test_api_computes_age_from_the_exchange_timestamp():
 
 
 def test_page_marks_a_stale_index():
-    page = (ROOT / "dashboard/book-live.html").read_text()
+    page = (ROOT / "dashboard/market-watch.html").read_text()
     assert "несвежий" in page
 
 
@@ -362,3 +362,41 @@ def test_the_noise_case_is_documented():
     src = (ROOT / "src/analysis/market_context.py").read_text()
     assert "НЕ ШУМОМ" in src
     assert "0.02 п.п. в разные стороны" in src or "вместе на 0.02" in src
+
+
+# ─── имя страницы ─────────────────────────────────────────────────────────────
+
+def test_page_is_named_market_watch():
+    """
+    Страница называется «Наблюдатель рынка»: стакана в ней давно меньше
+    половины — таймфреймы, объём, лента сделок и контекст рынка появились позже.
+    """
+    page = (ROOT / "dashboard/market-watch.html").read_text()
+    assert "<title>Наблюдатель рынка</title>" in page
+    assert "<h1>Наблюдатель рынка</h1>" in page
+    assert "Стакан Лайв" not in page
+
+
+def test_old_address_keeps_working():
+    """
+    Старый /book-live оставлен рабочим намеренно: он в закладках и в проверочных
+    скриптах. Ломать чужие ссылки ради косметики не стоит.
+    """
+    api = (ROOT / "src/api/main.py").read_text()
+    assert '@app.get("/market", include_in_schema=False)' in api
+    assert '@app.get("/book-live", include_in_schema=False)' in api
+    i = api.index('async def serve_market_watch')
+    assert "market-watch.html" in api[i:i + 1200]
+
+
+def test_no_stale_references_to_the_old_file():
+    """
+    Искомая строка собирается ИЗ ЧАСТЕЙ намеренно: иначе тест находит её в самом
+    себе и падает на собственной проверке.
+    """
+    old = "book-live" + ".html"
+    bad = [f.name for f in
+           list((ROOT / "tests").glob("*.py"))
+           + [ROOT / "src/api/main.py", ROOT / "main.py"]
+           if old in f.read_text()]
+    assert not bad, f"остались ссылки на старое имя файла: {bad}"
