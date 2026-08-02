@@ -627,3 +627,35 @@ def test_disappearance_reaches_the_minute_totals_too():
     book(tr, T0 + 1, [])
     got = dict((k, v) for k, _, v in tr.history.drop_completed("нет-такой-минуты"))
     assert got[key(100.0)]["pulled"] == 1000
+
+
+# ─── отсутствие таблицы не должно быть немым ──────────────────────────────────
+
+def test_missing_table_is_reported_not_swallowed():
+    """
+    Найдено на проде 02.08: таблица level_minute не создалась, чтение отдавало
+    голую пятисотку, а ЗАПИСЬ молча возвращала ноль — и ноль читался как «тихий
+    рынок». Час данных потерян незаметно.
+
+    Ошибка чтения обязана иметь свой тип, ошибка записи — попадать в лог
+    предупреждением, а не в debug.
+    """
+    src = (ROOT / "src/db.py").read_text()
+    assert "class LevelStoreError" in src
+    assert "async def ensure_level_table" in src
+    i = src.index("await init_db()")
+    assert "ensure_level_table" in src[i:i + 800], \
+        "явное создание таблицы стоит рядом со стартом"
+    main = (ROOT / "main.py").read_text()
+    j = main.index('counts["уровни"]')
+    assert "logger.warning" in main[j:j + 500], \
+        "ошибка записи уровней уходит предупреждением, а не в debug"
+
+
+def test_route_returns_the_reason_not_a_bare_500():
+    api = (ROOT / "src/api/main.py").read_text()
+    i = api.index("async def get_levels")
+    j = api.index("@app.get", i)          # до следующего маршрута
+    body = api[i:j]
+    assert "db.LevelStoreError" in body
+    assert '"error"' in body and "create_attempt" in body

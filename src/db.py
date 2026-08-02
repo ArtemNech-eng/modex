@@ -757,6 +757,13 @@ async def setup_db():
         if _setup_done:
             return
         await init_db()
+        # Явное создание позже добавленной таблицы. На живом сервере она не
+        # появилась, хотя create_all вызывается здесь же строкой выше, — причина
+        # пока неизвестна, а данные терять нельзя. Вызов идемпотентный и
+        # логирует исход, так что причина всплывёт в логе, а не в пятисотке.
+        res = await ensure_level_table()
+        if not res.get("ok"):
+            logger.warning(f"level_minute не создана: {res.get('error')}")
         await migrate_schema()
         await migrate_from_json()
         # При первом запуске наполняем список трейдеров ников из конфига,
@@ -2759,6 +2766,34 @@ async def merge_micro_minutes(ticker: str, rows: list[dict],
 LEVEL_MINUTE_FLOOR_RUB = float(os.getenv("LEVEL_FLOOR_RUB", "100000"))
 
 
+class LevelStoreError(RuntimeError):
+    """
+    Чтение истории уровней не удалось, и причина известна.
+
+    Отдельный тип нужен, чтобы маршрут вернул ПРИЧИНУ, а не голую пятисотку:
+    «no such table» и «база занята» требуют разных действий, а Internal Server
+    Error не отличает их ничем.
+    """
+
+
+async def ensure_level_table() -> dict:
+    """
+    Создать level_minute, если её нет.
+
+    Зачем отдельно от init_db. Таблица добавлена позже остальных, и на живом
+    сервере она не появилась, хотя create_all вызывается при старте. Причину
+    надо увидеть, а не угадать: здесь создание вызывается явно и отдаёт результат
+    наружу вместе с текстом ошибки, если он есть.
+    """
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(LevelMinute.__table__.create, checkfirst=True)
+        return {"ok": True}
+    except Exception as e:                                       # noqa: BLE001
+        logger.warning(f"ensure_level_table: {e}")
+        return {"ok": False, "error": str(e)[:300]}
+
+
 async def merge_level_minutes(rows: list[dict],
                               floor_rub: Optional[float] = None) -> dict:
     """
@@ -2823,14 +2858,22 @@ async def level_series(ticker: str, day: str, source: str = "exchange",
     Отдаётся в ЛОТАХ, как лежит. Рубли считает вызывающий: лотность у бумаг
     разная и в базе её нет.
     """
-    async with async_session() as session:
-        conds = [LevelMinute.ticker == ticker.upper(),
-                 LevelMinute.ts.like(f"{day}%")]
-        if source:
-            conds.append(LevelMinute.source == source)
-        q = (select(LevelMinute).where(*conds)
-             .order_by(LevelMinute.ts).limit(max(1, int(limit))))
-        rows = (await session.execute(q)).scalars().all()
+    # Таблица могла не создаться: она добавлена позже остальных, и если старт
+    # прошёл мимо create_all, чтение падает пятисоткой без объяснения. Пустой
+    # ответ вместо падения, но с записью причины — молчаливая пустота уже дважды
+    # обходилась дорого.
+    try:
+        async with async_session() as session:
+            conds = [LevelMinute.ticker == ticker.upper(),
+                     LevelMinute.ts.like(f"{day}%")]
+            if source:
+                conds.append(LevelMinute.source == source)
+            q = (select(LevelMinute).where(*conds)
+                 .order_by(LevelMinute.ts).limit(max(1, int(limit))))
+            rows = (await session.execute(q)).scalars().all()
+    except Exception as e:                                       # noqa: BLE001
+        logger.warning(f"level_series {ticker}: {e}")
+        raise LevelStoreError(str(e)[:300]) from e
     return [{"ts": r.ts, "side": r.side, "price": r.price, "peak": r.peak,
              "end_size": r.end_size, "added": r.added, "traded": r.traded,
              "pulled": r.pulled, "restored": r.restored, "gone": r.gone,

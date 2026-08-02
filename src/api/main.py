@@ -829,7 +829,18 @@ async def get_levels(ticker: str, day: Optional[str] = None,
         raise HTTPException(status_code=400,
                             detail=f"source: {', '.join(sorted(FLOW_SOURCES))}")
     d = day or (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d")
-    rows = await db.level_series(ticker, d, source=source, limit=limit)
+    try:
+        rows = await db.level_series(ticker, d, source=source, limit=limit)
+    except db.LevelStoreError as e:
+        # ПРИЧИНА наружу, а не голая пятисотка. «Таблицы нет» и «база занята» —
+        # разные беды, и Internal Server Error не отличает их ничем.
+        made = await db.ensure_level_table()
+        if made.get("ok"):
+            rows = await db.level_series(ticker, d, source=source, limit=limit)
+        else:
+            return {"ticker": ticker.upper(), "day": d, "source": source,
+                    "count": 0, "rows": [], "error": str(e),
+                    "create_attempt": made}
     lot = int((getattr(CURRENT, "lots", None) or {}).get(ticker.upper()) or 1)
     total = {"traded_lots": sum(r["traded"] for r in rows),
              "pulled_lots": sum(r["pulled"] for r in rows),
