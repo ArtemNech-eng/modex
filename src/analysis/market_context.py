@@ -111,7 +111,7 @@ def rank(chg: dict, ticker: str) -> Optional[dict]:
 
 
 def relative(ticker_pct: Optional[float], bench_pct: Optional[float],
-             lead_pp: float = LEAD_PP) -> dict:
+             lead_pp: float = LEAD_PP, flat: float = FLAT_PCT) -> dict:
     """
     Насколько бумага расходится с эталоном, в процентных пунктах.
 
@@ -131,8 +131,15 @@ def relative(ticker_pct: Optional[float], bench_pct: Optional[float],
         out["vs_bench"] = "вместе"
     else:
         out["vs_bench"] = "обгоняет" if diff > 0 else "отстаёт"
-    # Разные стороны — отдельный факт. Бумага растёт, когда рынок падает.
-    if ticker_pct > 0 > bench_pct or ticker_pct < 0 < bench_pct:
+    # РАЗНЫЕ СТОРОНЫ — отдельный факт: бумага растёт, когда рынок падает.
+    #
+    # Но обе величины должны быть НЕ ШУМОМ. Найдено на живых данных 02.08: у
+    # SBER вышло «вместе на 0.02 п.п. в разные стороны» — бумага +0.01%,
+    # медиана −0.01%. Знаки формально разные, обе величины — округление. На
+    # тихом рынке такой флаг горел бы постоянно и обесценился бы к тому
+    # моменту, когда движение станет настоящим.
+    if (abs(ticker_pct) > flat and abs(bench_pct) > flat
+            and (ticker_pct > 0) != (bench_pct > 0)):
         out["opposite"] = True
     return out
 

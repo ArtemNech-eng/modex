@@ -331,3 +331,34 @@ def test_api_computes_age_from_the_exchange_timestamp():
 def test_page_marks_a_stale_index():
     page = (ROOT / "dashboard/book-live.html").read_text()
     assert "несвежий" in page
+
+
+def test_opposite_does_not_fire_on_rounding_noise():
+    """
+    Найдено НА ЭКРАНЕ 02.08. У SBER вышла строка «вместе на 0.02 п.п. в разные
+    стороны»: бумага +0.01%, медиана корзины −0.01%. Знаки формально разные, обе
+    величины — округление.
+
+    На тихом рынке такой флаг горел бы постоянно и обесценился бы ровно к тому
+    моменту, когда расхождение станет настоящим.
+    """
+    r = relative(0.01, -0.01)
+    assert r["vs_bench"] == "вместе"
+    assert "opposite" not in r, "шум не считается разными сторонами"
+
+
+def test_opposite_still_fires_on_a_real_divergence():
+    r = relative(0.8, -0.4)
+    assert r["opposite"] is True
+
+
+def test_opposite_needs_both_sides_to_be_real():
+    """Одной настоящей стороны мало: вторая может быть нулём."""
+    assert "opposite" not in relative(0.8, -0.01)
+    assert "opposite" not in relative(0.01, -0.8)
+
+
+def test_the_noise_case_is_documented():
+    src = (ROOT / "src/analysis/market_context.py").read_text()
+    assert "НЕ ШУМОМ" in src
+    assert "0.02 п.п. в разные стороны" in src or "вместе на 0.02" in src
