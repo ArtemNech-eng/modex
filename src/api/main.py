@@ -875,6 +875,29 @@ async def get_micro(ticker: str, day: Optional[str] = None,
             "count": len(rows), "rows": rows}
 
 
+def _scanner_note() -> str:
+    """
+    Почему у сканеров нет баров. Три разные причины, а не одна фраза; одна из
+    них — остановка сбора при открытом рынке, и прятать её за «стрим только
+    поднялся» нельзя.
+    """
+    from datetime import datetime, timedelta, timezone
+    from src.collector.stream import CURRENT
+    from src.analysis.intraday import session_phase, no_data_note
+    msk = datetime.now(timezone.utc) + timedelta(hours=3)
+    try:
+        phase = session_phase(msk.hour * 60 + msk.minute, msk.weekday())
+    except Exception:                                        # noqa: BLE001
+        phase = "?"
+    fresh = 0
+    if CURRENT is not None:
+        try:
+            fresh = int(CURRENT.health().get("tickers_fresh_60s") or 0)
+        except Exception:                                    # noqa: BLE001
+            fresh = 0
+    return no_data_note(CURRENT is not None, phase, fresh)
+
+
 @app.get("/api/price-scan", summary="Сканер цены: что делает цена по всем бумагам")
 async def get_price_scan(steps: str = "1,5,15", limit: int = 40):
     """
@@ -905,7 +928,7 @@ async def get_price_scan(steps: str = "1,5,15", limit: int = 40):
     mins = getattr(CURRENT, "minutes", None)
     if not mins:
         return {"scanned": 0, "results": [], "rates": {},
-                "note": "минутной истории ещё нет — стрим только поднялся"}
+                "note": _scanner_note()}
     try:
         want = tuple(int(x) for x in steps.split(",") if x.strip())
     except ValueError:
@@ -961,7 +984,7 @@ async def get_volume_scan(steps: str = "1,5", limit: int = 40):
     mins = getattr(CURRENT, "minutes", None)
     if not mins:
         return {"scanned": 0, "results": [], "rates": {},
-                "note": "минутной истории ещё нет — стрим только поднялся"}
+                "note": _scanner_note()}
     try:
         want = tuple(int(x) for x in steps.split(",") if x.strip())
     except ValueError:
