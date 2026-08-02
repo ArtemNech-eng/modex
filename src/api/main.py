@@ -800,6 +800,47 @@ async def get_micro(ticker: str, day: Optional[str] = None,
             "count": len(rows), "rows": rows}
 
 
+@app.get("/api/levels/{ticker}", summary="История ценовых уровней по минутам")
+async def get_levels(ticker: str, day: Optional[str] = None,
+                     source: str = "exchange", limit: int = 400):
+    """
+    Жизнь ценовых уровней бумаги за день: сколько долили, сколько СЪЕЛИ и сколько
+    СНЯЛИ на каждой цене.
+
+    Съедено и снято — разные вещи, и в этом весь смысл таблицы. Уменьшение
+    заявки на 300 лотов значит либо «покупатель забрал предложение», либо
+    «продавец передумал». Разность размеров их не различает, различает только
+    объём сделок на этой цене между пакетами стакана.
+
+    ПИШЕТСЯ НЕ ВСЁ. Строка появляется, только если оборот по уровню за минуту
+    выше порога в рублях (LEVEL_FLOOR_RUB) либо уровень восстанавливался. Иначе
+    на каждую минуту пришлось бы по шесть уровней на бумагу на источник — под
+    полмиллиона строк в день. Порог — догадка, его надо калибровать по факту.
+
+    Секундная история живого уровня — в /api/book-live/{ticker}, поле timeline:
+    там задержка доли секунды, но глубина всего минута и только в памяти.
+
+    Объёмы в ЛОТАХ, как в базе. Рубли надо считать через лотность: у UGLD лот
+    1000, у SBER 1.
+    """
+    if not ticker_known(ticker):
+        raise HTTPException(status_code=404, detail=f"Тикер {ticker} не найден")
+    if source not in FLOW_SOURCES:
+        raise HTTPException(status_code=400,
+                            detail=f"source: {', '.join(sorted(FLOW_SOURCES))}")
+    d = day or (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d")
+    rows = await db.level_series(ticker, d, source=source, limit=limit)
+    lot = int((getattr(CURRENT, "lots", None) or {}).get(ticker.upper()) or 1)
+    total = {"traded_lots": sum(r["traded"] for r in rows),
+             "pulled_lots": sum(r["pulled"] for r in rows),
+             "added_lots": sum(r["added"] for r in rows),
+             "restored": sum(r["restored"] for r in rows),
+             "gone": sum(r["gone"] for r in rows)}
+    return {"ticker": ticker.upper(), "day": d, "source": source, "lot": lot,
+            "count": len(rows), "totals": total,
+            "floor_rub": db.LEVEL_MINUTE_FLOOR_RUB, "rows": rows}
+
+
 @app.get("/api/live/{ticker}", summary="Прямо сейчас: из памяти, без ожидания сброса")
 async def get_live(ticker: str):
     """
