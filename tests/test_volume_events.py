@@ -29,7 +29,14 @@
     порядок           по КРАТНОСТИ, а не по рублям: миллиард у SBER это обычный
                       день, сто миллионов у DATA — событие
 
+    пол по обороту    минута тише позиции Артёма это минута, где он был бы всей
+                      ликвидностью. 02.08 на экране: EUTR ×99.7 при 39 469 ₽
+
     без вердиктов     31.07 одиночный RVOL измерялся ПЛОСКИМ на всех порогах
+
+Объёмы в фикстурах — ПРАВДОПОДОБНЫЕ ДЕНЬГИ, а не круглые сотни: минута в
+10 тыс ₽ описывает рынок, которого для него нет. Замер по 50 бумагам
+наблюдения: средняя минута p10 182 тыс ₽, медиана 914 тыс ₽.
 """
 import pathlib
 
@@ -61,7 +68,7 @@ def test_turnover_is_in_rubles_with_lot_size():
     Лот у SBER 1, у UGLD 1000. Сто лотов у одной и у другой — разные деньги, и
     список по лотам сравнивал бы несравнимое.
     """
-    rows = steady(10, vol=100) + [bar(10, 1000), bar(11, 1000)]
+    rows = steady(10, vol=1000) + [bar(10, 10000), bar(11, 10000)]
     small = detect_step(rows, 1, lot=1)
     big = detect_step(rows, 1, lot=1000)
     assert small and big
@@ -70,11 +77,11 @@ def test_turnover_is_in_rubles_with_lot_size():
 
 def test_price_enters_the_turnover():
     """Тысяча лотов по 100 ₽ и по 5000 ₽ — разные деньги."""
-    rows = steady(10, vol=100, close=100.0) + [bar(10, 1000, 100.0),
-                                               bar(11, 1000, 100.0)]
+    rows = steady(10, vol=1000, close=100.0) + [bar(10, 10000, 100.0),
+                                                bar(11, 10000, 100.0)]
     cheap = detect_step(rows, 1, lot=1)[0]["rub"]
-    rows2 = steady(10, vol=100, close=5000.0) + [bar(10, 1000, 5000.0),
-                                                 bar(11, 1000, 5000.0)]
+    rows2 = steady(10, vol=1000, close=5000.0) + [bar(10, 10000, 5000.0),
+                                                  bar(11, 10000, 5000.0)]
     rich = detect_step(rows2, 1, lot=1)[0]["rub"]
     assert rich == cheap * 50
 
@@ -103,11 +110,11 @@ def test_baseline_skips_empty_minutes():
     Минуты без сделок утянули бы медиану вниз, и любая обычная минута стала бы
     всплеском — та же ловушка, что дала 30 «крупных» сделок из 30.
     """
-    rows = [bar(i, 0) for i in range(6)] + [bar(i, 100) for i in range(6, 14)]
-    rows.append(bar(14, 300))
-    rows.append(bar(15, 300))
+    rows = [bar(i, 0) for i in range(6)] + [bar(i, 1000) for i in range(6, 14)]
+    rows.append(bar(14, 3000))
+    rows.append(bar(15, 3000))
     got = detect_step(rows, 1, lot=1)
-    assert got and got[0]["base_rub"] == round(100 * 100.0), "норма по ненулевым"
+    assert got and got[0]["base_rub"] == round(1000 * 100.0), "норма по ненулевым"
 
 
 def test_baseline_excludes_the_measured_bar():
@@ -212,9 +219,9 @@ def test_time_of_day_profile_needs_enough_days():
 
 
 def test_time_of_day_profile_is_used_when_present():
-    prof = {600 + i: 10000.0 for i in range(20)}     # 10:00-10:19 по 10 тыс ₽
-    rows = steady(12, vol=100, close=100.0)          # скользящая норма 10 тыс
-    rows += [bar(12, 500, 100.0), bar(13, 500, 100.0)]
+    prof = {600 + i: 100000.0 for i in range(20)}    # 10:00-10:19 по 100 тыс ₽
+    rows = steady(12, vol=1000, close=100.0)         # скользящая норма 100 тыс
+    rows += [bar(12, 5000, 100.0), bar(13, 5000, 100.0)]
     got = detect_step(rows, 1, lot=1, profile=prof)
     assert got and got[0]["base_source"] == "время суток"
 
@@ -258,15 +265,15 @@ def test_scan_orders_by_multiple_not_by_rubles():
 
 
 def test_scan_skips_quiet_tickers():
-    quiet = steady(14, vol=100)
-    loud = steady(12, vol=100) + [bar(12, 1000), bar(13, 1000)]
+    quiet = steady(14, vol=1000)
+    loud = steady(12, vol=1000) + [bar(12, 10000), bar(13, 10000)]
     got = scan({"QUIET": quiet, "LOUD": loud}, lots={"QUIET": 1, "LOUD": 1})
     assert [x["ticker"] for x in got] == ["LOUD"]
 
 
 def test_rates_report_base_frequency():
-    loud = steady(12, vol=100) + [bar(12, 1000), bar(13, 1000)]
-    got = scan({"A": loud, "B": steady(14, vol=100)}, lots={"A": 1, "B": 1})
+    loud = steady(12, vol=1000) + [bar(12, 10000), bar(13, 10000)]
+    got = scan({"A": loud, "B": steady(14, vol=1000)}, lots={"A": 1, "B": 1})
     r = rates(got, 2)
     assert r["volume_surge"]["tickers"] == 1
     assert r["volume_surge"]["share"] == pytest.approx(0.5)
@@ -338,3 +345,75 @@ def test_page_has_a_second_table_and_names_the_baseline():
     assert "всплеск оборота" in page and "оборот разгоняется" in page
     assert "норма скользящая" in page, "источник нормы назван на экране"
     assert "выдумать норму" in page, "почему нормы по времени нет — на экране"
+
+
+# ─── пол по обороту ───────────────────────────────────────────────────────────
+
+def test_huge_multiple_on_tiny_turnover_is_not_an_event():
+    """
+    НАЙДЕНО НА ЖИВОМ ЭКРАНЕ 02.08, не тестом.
+
+    EUTR стоял первым на доске с «оборот в 99.7 раза выше нормы». За этой
+    строкой было 39 469 ₽ при норме 396 ₽. Относительный тест отработал
+    безупречно и выдал бессмыслицу: у Артёма позиция 150–250 тыс ₽, он был бы
+    всей этой минутой целиком.
+
+    Та же яма, что дала 30 «крупных» сделок из 30. `_baseline` выбрасывает бары
+    с НУЛЁМ и ничего не может против бара в 396 ₽.
+    """
+    rows = [bar(i, 4, close=100.0) for i in range(12)]      # норма 400 ₽
+    rows += [bar(12, 395), bar(13, 395)]                    # 39 500 ₽, ×98.75
+    got = detect_step(rows, 1, lot=1)
+    assert got == [], "кратность огромна, денег нет"
+
+
+def test_the_exact_acceleration_series_from_the_screen():
+    """Разгон 44 → 352 → 3388 → 39777 ₽ начинался с сорока четырёх рублей."""
+    rows = [bar(i, 4, close=100.0) for i in range(10)]
+    for i, v in enumerate((0.44, 3.52, 33.88, 397.77)):
+        rows.append(bar(10 + i, v))
+    rows.append(bar(14, 397.77))
+    assert "volume_accelerating" not in kinds(detect_step(rows, 1, lot=1))
+
+
+def test_floor_scales_with_step_length():
+    """
+    У пятиминутки оборот вчетверо больше по построению. Плоский порог сделал бы
+    её вчетверо снисходительнее — и события расползлись бы по длинным шагам.
+    """
+    small = {"floor": 1000.0}
+    rows = [bar(i, 1, close=100.0) for i in range(20)]      # 100 ₽ в минуту
+    rows += [bar(20 + i, 12, close=100.0) for i in range(6)]  # 1200 ₽ в минуту
+    rows.append(bar(26, 12, close=100.0))
+    assert detect_step(rows, 1, lot=1, p=small), "минутка проходит пол 1000"
+    assert detect_step(rows, 5, lot=1, p=small) == [], "пятиминутке нужно 5000"
+
+
+def test_real_money_still_passes():
+    """Пол режет мёртвые минуты, а не бумаги: SBER на всплеске проходит."""
+    rows = [bar(i, 40000, close=300.0) for i in range(12)]   # 12 млн ₽ в минуту
+    rows += [bar(12, 160000, close=300.0), bar(13, 160000, close=300.0)]
+    got = [e for e in detect_step(rows, 1, lot=1) if e["kind"] == "volume_surge"]
+    assert got and got[0]["times"] == pytest.approx(4.0, abs=0.05)
+
+
+def test_floor_is_configurable_without_deploy():
+    """Порог — догадка по размеру позиции. Артём меняет его сам, через Coolify."""
+    import src.analysis.volume_events as m
+    assert "VOLUME_FLOOR_RUB" in pathlib.Path(m.__file__).read_text()
+    rows = [bar(i, 4, close=100.0) for i in range(12)] + [bar(12, 395), bar(13, 395)]
+    assert detect_step(rows, 1, lot=1, p={"floor": 1000.0}), "с низким полом видно"
+
+
+def test_suppressed_count_is_reported():
+    """
+    Пустая таблица должна читаться как «всё выброшено полом», а не как «на рынке
+    спокойно». Молчание без причины — та же ошибка, что «0 событий» на пустой
+    памяти после деплоя.
+    """
+    from src.analysis.volume_events import below_floor
+    quiet = {"EUTR": [bar(i, 4, close=100.0) for i in range(8)]}
+    loud = {"SBER": [bar(i, 40000, close=300.0) for i in range(8)]}
+    assert below_floor(quiet) == 1
+    assert below_floor(loud) == 0
+    assert below_floor({**quiet, **loud}) == 1

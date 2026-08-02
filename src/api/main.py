@@ -949,9 +949,15 @@ async def get_volume_scan(steps: str = "1,5", limit: int = 40):
 
     Порядок — по КРАТНОСТИ к норме, а не по рублям: миллиард у SBER это обычный
     день, а сто миллионов у DATA — событие.
+
+    ПОЛ ПО ОБОРОТУ. Единственный порог, взятый не из самой бумаги, — и взятый
+    из размера позиции Артёма. Минута тише его позиции это минута, где он был бы
+    всей ликвидностью, и «оборот в 99.7 раза выше нормы» на 39 469 ₽ ничего не
+    значит. Отсев показан числом `below_floor`: пустая таблица должна читаться
+    как «всё выброшено полом», а не как «на рынке спокойно».
     """
     from src.collector.stream import CURRENT
-    from src.analysis.volume_events import scan, rates
+    from src.analysis.volume_events import scan, rates, below_floor, FLOOR_RUB
     mins = getattr(CURRENT, "minutes", None)
     if not mins:
         return {"scanned": 0, "results": [], "rates": {},
@@ -962,11 +968,14 @@ async def get_volume_scan(steps: str = "1,5", limit: int = 40):
         raise HTTPException(status_code=400, detail="steps: например 1,5")
     profiles = dict(getattr(CURRENT, "vol_profiles", None) or {})
     found = scan(mins, lots=dict(getattr(CURRENT, "lots", None) or {}),
-                 profiles=profiles, steps=want)
+                 profiles=profiles, steps=want)  # lots ниже — тот же словарь
+    lots = dict(getattr(CURRENT, "lots", None) or {})
     return {"scanned": len(mins), "with_events": len(found),
             "steps": list(want), "rates": rates(found, len(mins)),
             "baseline": "время суток" if profiles else "скользящая",
             "profiles_ready": len(profiles),
+            "floor_rub": FLOOR_RUB,
+            "below_floor": below_floor(mins, lots=lots),
             "results": found[:limit]}
 
 
