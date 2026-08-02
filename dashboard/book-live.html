@@ -279,9 +279,13 @@ function card(tk) {
        + ` / <span class="dim">${b.flat}</span> из ${b.total}</span></div>`;
     if (mk.index && mk.index.change_pct != null)
       h += `<div class="row"><span class="dim">IMOEX${
-             mk.index.age_sec != null ? ` · ${Math.round(mk.index.age_sec)}с назад` : ""
-           }</span><span class="${cls(mk.index.change_pct)}">`
-         + `${pct(mk.index.change_pct)}</span></div>`;
+             mk.index.age_sec != null
+               ? " · " + (mk.index.age_sec > 3600
+                   ? Math.round(mk.index.age_sec / 3600) + "ч назад"
+                   : Math.round(mk.index.age_sec) + "с назад")
+               : ""
+           }</span><span class="${mk.index.stale ? "warn" : cls(mk.index.change_pct)}">`
+         + `${pct(mk.index.change_pct)}${mk.index.stale ? " несвежий" : ""}</span></div>`;
     // Расхождение с корзиной — без задержки, поэтому оно первое.
     const vb = m5.vs_basket;
     if (vb && vb.diff_pp != null)

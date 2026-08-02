@@ -40,6 +40,14 @@ FLAT_PCT = 0.05        # меньше этого движение считает
 MIN_SECTOR = 3         # меньше стольких бумаг в секторе — широта ненадёжна
 LEAD_PP = 0.15         # расхождение меньше этого — «идёт вместе», п.п.
 
+#  Старше этого индекс помечается несвежим.
+#
+#  Найдено на живых данных 02.08: поле возраста считалось от МОЕГО обращения к
+#  ISS и показывало «11 секунд» для значения, снятого биржей двумя днями раньше
+#  (SYSTIME 31.07 19:00, биржа закрыта). Вопрос был ровно обратный: когда это
+#  было правдой, а не когда я спросил.
+STALE_SEC = 180
+
 
 def changes(minutes: dict, back: int = 1) -> dict:
     """
@@ -193,7 +201,13 @@ def context(minutes: dict, ticker: str, sectors: Optional[dict] = None,
         if sv:
             out["sector"] = sv
     if index:
+        # `age_sec` — возраст ДАННЫХ по метке самой биржи, а не времени моего
+        # запроса. На закрытой бирже это разница в двое суток, и путать их
+        # значит выдавать позавчерашнее значение за свежее.
         out["index"] = {k: index.get(k) for k in
-                        ("name", "value", "change_pct", "age_sec", "ts")
+                        ("name", "value", "change_pct", "age_sec",
+                         "fetch_age_sec", "ts")
                         if index.get(k) is not None}
+        if (index.get("age_sec") or 0) > STALE_SEC:
+            out["index"]["stale"] = True
     return out

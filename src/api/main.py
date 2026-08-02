@@ -672,9 +672,21 @@ async def get_book_live(ticker: str, light: bool = False):
     if mins:
         from src.analysis.market_context import context
         idx = dict(getattr(CURRENT, "imoex", None) or {})
+        # ВОЗРАСТ ДАННЫХ, А НЕ ЗАПРОСА. Первая версия считала, сколько прошло с
+        # моего обращения к ISS, и на закрытой бирже показывала «11 секунд» для
+        # значения двухдневной давности. Вопрос был ровно обратный: когда это
+        # было правдой, а не когда я спросил.
         if idx.get("fetched_at"):
-            idx["age_sec"] = round(
+            idx["fetch_age_sec"] = round(
                 datetime.now(timezone.utc).timestamp() - idx["fetched_at"], 1)
+        if idx.get("ts"):
+            try:
+                # SYSTIME от биржи идёт в московском времени, без зоны.
+                seen = datetime.strptime(str(idx["ts"]), "%Y-%m-%d %H:%M:%S")
+                now_msk = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3)
+                idx["age_sec"] = max(0.0, round((now_msk - seen).total_seconds(), 1))
+            except (ValueError, TypeError):
+                pass
         out["market"] = context(mins, tk,
                                 sectors=getattr(CURRENT, "sectors", None),
                                 index=idx or None)

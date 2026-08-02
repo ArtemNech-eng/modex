@@ -290,3 +290,44 @@ def test_minute_history_is_bounded_and_skips_junk():
     s.note_minute("GAZP", None, 100.0)
     s.note_minute("GAZP", "2026-08-03T10:00", None)
     assert "GAZP" not in s.minutes and "" not in s.minutes
+
+
+def test_index_age_is_the_age_of_the_data_not_of_the_request():
+    """
+    Найдено на ЖИВЫХ данных 02.08. Поле возраста считалось от МОЕГО обращения к
+    ISS и показывало «11 секунд» для значения, снятого биржей двумя днями раньше
+    (SYSTIME 31.07 19:00, биржа закрыта с пятницы).
+
+    Вопрос был ровно обратный: когда это было правдой, а не когда я спросил.
+    Ради этого поле и вводилось — чтобы задержка индекса не переворачивала знак
+    разницы незаметно.
+    """
+    from src.analysis.market_context import STALE_SEC
+    stale = {"name": "IMOEX", "value": 2226.36, "change_pct": 0.75,
+             "ts": "2026-07-31 19:00:11", "age_sec": 2 * 24 * 3600,
+             "fetch_age_sec": 11.5, "changes": {1: 0.0}}
+    c = context(basket(), "SBER", index=stale, steps=(1,))
+    assert c["index"]["stale"] is True
+    assert c["index"]["age_sec"] > STALE_SEC
+    assert c["index"]["fetch_age_sec"] == 11.5, "возраст запроса тоже виден"
+
+
+def test_fresh_index_is_not_flagged():
+    fresh = {"name": "IMOEX", "value": 2226.0, "change_pct": -0.4,
+             "ts": "2026-08-03T10:05:00", "age_sec": 20.0,
+             "changes": {1: -0.05}}
+    c = context(basket(), "SBER", index=fresh, steps=(1,))
+    assert "stale" not in c["index"]
+
+
+def test_api_computes_age_from_the_exchange_timestamp():
+    api = (ROOT / "src/api/main.py").read_text()
+    i = api.index('idx["fetch_age_sec"]')
+    body = api[i:i + 900]
+    assert "SYSTIME" in api[max(0, i - 600):i + 900] or "%Y-%m-%d %H:%M:%S" in body
+    assert 'idx["age_sec"]' in body, "возраст данных считается отдельно от запроса"
+
+
+def test_page_marks_a_stale_index():
+    page = (ROOT / "dashboard/book-live.html").read_text()
+    assert "несвежий" in page
