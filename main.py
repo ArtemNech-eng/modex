@@ -552,14 +552,32 @@ async def stream_pipeline():
     # выяснилось, что в прежней 22 записи из 43 указывали на чужие инструменты.
     client = TinkoffClient(TINKOFF_TOKEN)
     figis: dict = {}
-    for t in tickers:
-        try:
-            f = await client.get_figi(t)
-            if f:
-                figis[t] = f
-        except Exception as e:                                   # noqa: BLE001
-            logger.debug(f"figi {t}: {e}")
-        await asyncio.sleep(0.1)
+    # ПОВТОР, А НЕ ВЫХОД. 03.08 в 15:57 поток не поднялся после деплоя и не
+    # поднялся сам: `if not figis: return` ниже уводил конвейер молча, и прод
+    # стоял без данных 15 минут, пока я не заметил. FIGI разрешается ТОЛЬКО через
+    # Tinkoff API, 80 вызовов при старте, и на выкате их легко придушить лимитом —
+    # старый контейнер ещё держит соединение, новый резолвит.
+    #
+    # Транзиентный отказ не должен убивать сбор до следующего деплоя.
+    for attempt in range(1, 6):
+        for t in tickers:
+            if t in figis:
+                continue
+            try:
+                f = await client.get_figi(t)
+                if f:
+                    figis[t] = f
+            except Exception as e:                               # noqa: BLE001
+                logger.debug(f"figi {t}: {e}")
+            await asyncio.sleep(0.1)
+        if figis:
+            if attempt > 1:
+                logger.warning("Стрим: FIGI разрешились с попытки %d", attempt)
+            break
+        wait = min(5 * 2 ** (attempt - 1), 60)
+        logger.error("Стрим: FIGI не разрешился ни по одной бумаге, "
+                     "попытка %d, пауза %d с", attempt, wait)
+        await asyncio.sleep(wait)
     logger.info(f"Стрим: разрешено {len(figis)} из {len(tickers)} бумаг")
 
     # ЛОТНОСТЬ из ISS. Нужна, чтобы отдавать объёмы в рублях: у SBER лот 1, у
@@ -587,8 +605,15 @@ async def stream_pipeline():
                        f"«возле лучшей цены» выродится в «точно по цене»")
         lots, steps = {}, {}
     if not figis:
-        logger.error("Стрим: ни одной бумаги не разрешено, выхожу")
-        return
+        # ПРИЧИНА ВИДНА СНАРУЖИ, а не только в логе: /api/stream/health говорил
+        # «включён, но ещё не поднялся или упал при старте» — фраза, под которую
+        # подходит и падение, и молчаливый выход, и они требуют разного.
+        import src.collector.stream as _st
+        _st.START_ERROR = ("FIGI не разрешился ни по одной бумаге за 5 попыток — "
+                           "Tinkoff API недоступен или токен придушен лимитом")
+        logger.error("Стрим: %s. Перезапуск конвейера через 60 с", _st.START_ERROR)
+        await asyncio.sleep(60)
+        return await stream_pipeline()
 
     async def _flush(flow: dict, book: dict, candle: dict, micro: dict):
         """

@@ -593,8 +593,13 @@ async def get_book_live(ticker: str, light: bool = False):
     now = datetime.now(timezone.utc) + timedelta(hours=3)
     out = {"ticker": tk, "at": now.strftime("%H:%M:%S"), "live": False}
     if CURRENT is None:
+        # Та же различимость, что в /api/stream/health: «выключен», «поднимается»
+        # и «неисправность» требуют разных действий, и одна фраза на все три уже
+        # стоила пятнадцати минут простоя 03.08.
+        from src.collector.stream import START_ERROR as _SE
         out["reason"] = ("стрим выключен" if not STREAM_ENABLED
-                         else "стрим ещё не поднялся")
+                         else f"НЕИСПРАВНОСТЬ: {_SE}" if _SE
+                         else "стрим поднимается, резолв FIGI занимает до минуты")
         return out
     out["live"] = True
 
@@ -1121,9 +1126,15 @@ async def get_live(ticker: str):
     from src.collector.stream import CURRENT
     from config.settings import STREAM_ENABLED
     if CURRENT is None:
+        # Третье место с той же расплывчатой фразой. Все три обязаны различать
+        # «выключен», «поднимается» и «неисправность»: одна формулировка на три
+        # состояния 03.08 стоила пятнадцати минут простоя незамеченным.
+        from src.collector.stream import START_ERROR as _SE
         return {"ticker": ticker.upper(), "live": False,
                 "reason": ("стрим выключен" if not STREAM_ENABLED
-                           else "стрим ещё не поднялся")}
+                           else f"НЕИСПРАВНОСТЬ: {_SE}" if _SE
+                           else "стрим поднимается, резолв FIGI занимает до минуты"),
+                "start_error": _SE}
     snap = CURRENT.agg.snapshot(ticker)
     age = CURRENT.last_msg.get(ticker.upper())
     return {
@@ -1150,9 +1161,19 @@ async def stream_health():
     from src.collector.stream import CURRENT
     from config.settings import STREAM_ENABLED
     if CURRENT is None:
-        return {"enabled": STREAM_ENABLED, "running": False,
-                "reason": ("выключен флагом STREAM_ENABLED" if not STREAM_ENABLED
-                           else "включён, но ещё не поднялся или упал при старте")}
+        # Причина НАЗЫВАЕТСЯ. Прежняя фраза «ещё не поднялся или упал при старте»
+        # подходила и к нормальному прогреву, и к транзиентному отказу Tinkoff, и
+        # к молчаливому выходу конвейера — 03.08 прод стоял 15 минут, а по этой
+        # строке было не понять, ждать или бить тревогу.
+        from src.collector.stream import START_ERROR
+        if not STREAM_ENABLED:
+            reason = "выключен флагом STREAM_ENABLED"
+        elif START_ERROR:
+            reason = f"НЕИСПРАВНОСТЬ: {START_ERROR}"
+        else:
+            reason = "включён, поднимается (резолв FIGI занимает до минуты)"
+        return {"enabled": STREAM_ENABLED, "running": False, "reason": reason,
+                "start_error": START_ERROR}
     return {"enabled": True, "running": True, **CURRENT.health()}
 
 
