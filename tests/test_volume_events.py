@@ -583,3 +583,76 @@ def test_warming_up_is_counted():
     assert warming_up({"A": fresh}) == 1
     assert warming_up({"B": settled}) == 0
     assert warming_up({"A": fresh, "B": settled}) == 1
+
+
+# ─── порог «норму не из чего считать» ─────────────────────────────────────────
+
+def test_thin_threshold_is_not_the_floor():
+    """
+    НАЙДЕНО ПЕРЕПРОВЕРКОЙ НА БИРЖЕВЫХ ДАННЫХ, по просьбе Артёма.
+
+    Первая версия брала для «тонкой нормы» сам пол, помноженный на длину шага, и
+    смешала два разных вопроса. Замер за день по всем 80 бумагам, 558 событий с
+    меткой:
+
+        медиана «тонкой» нормы бара     109 384 ₽
+        из них настоящий шум (< 10 тыс)      4%
+        на шаге 5м медиана нормы        455 412 ₽
+
+    Полмиллиона рублей — не шум. Кратность скрывалась в 96% случаев, где она
+    осмысленна.
+
+    «Норму не из чего считать» — про число сделок в знаменателе. «Норма мала для
+    позиции» — про ликвидность, и это закрывает пол на ЧИСЛИТЕЛЕ.
+    """
+    from src.analysis.volume_events import THIN_RUB, FLOOR_RUB
+    assert THIN_RUB < FLOOR_RUB, "порог шума ниже пола позиции"
+    src = pathlib.Path("src/analysis/volume_events.py").read_text()
+    assert "109 384" in src, "замер записан рядом с порогом"
+
+
+def test_thin_does_not_scale_with_step():
+    """
+    Кратность считается бар к бару, значит шум мерится в знаменателе БАРА.
+    Пятиминутка вбирает впятеро больше сделок и от шума ДАЛЬШЕ, а не ближе, —
+    умножать порог на шаг было бы наоборот.
+    """
+    # Норма 100 тыс ₽ на баре: для минутки и для пятиминутки одинаково не шум.
+    rows1 = [bar(i, 1000, close=100.0) for i in range(12)]
+    rows1 += [bar(12, 20000, close=100.0), bar(13, 20000, close=100.0)]
+    got1 = detect_step(rows1, 1, lot=1)
+    assert got1 and got1[0]["base_thin"] is False, "100 тыс на минутном баре — не шум"
+    rows5 = [sbar(10, i, 1000, close=100.0) for i in range(60)]
+    for i in range(60, 70):
+        rows5.append(sbar(11, i - 60, 20000, close=100.0))
+    got5 = [e for e in detect_step(rows5, 5, lot=1) if e["kind"] == "volume_surge"]
+    if got5:
+        assert got5[0]["base_thin"] is False, "и на пятиминутке тоже"
+
+
+def test_absurd_multiple_is_still_caught():
+    """
+    Ради чего метка и существует. Замер за день: помеченные события имеют
+    медианную кратность ×42.7 и доходят до ×1510 при норме 856 ₽; непомеченные —
+    медиану ×5.6. Порог отделяет абсурд, а не малые числа.
+    """
+    # Норма 800 ₽ на бар, оборот 1.3 млн — ровно случай VSEH ×1510.
+    rows = [bar(i, 8, close=100.0) for i in range(12)]
+    rows += [bar(12, 13000, close=100.0), bar(13, 13000, close=100.0)]
+    got = [e for e in detect_step(rows, 1, lot=1) if e["kind"] == "volume_surge"]
+    assert got, "оборот прошёл пол"
+    assert got[0]["base_thin"] is True
+    assert got[0]["times"] > 100
+    assert "раза выше нормы" not in got[0]["why"]
+
+
+def test_real_awakening_keeps_its_multiple():
+    """
+    LENT ×236.2 при норме 33 828 ₽ и обороте 7.99 млн ₽ — настоящее пробуждение
+    бумаги, и кратность здесь информативна. Прежний порог её скрывал.
+    """
+    rows = [bar(i, 340, close=100.0) for i in range(12)]        # норма 34 тыс ₽
+    rows += [bar(12, 80000, close=100.0), bar(13, 80000, close=100.0)]
+    got = [e for e in detect_step(rows, 1, lot=1) if e["kind"] == "volume_surge"]
+    assert got and got[0]["base_thin"] is False, "34 тыс — не шум"
+    assert "раза выше нормы" in got[0]["why"]
