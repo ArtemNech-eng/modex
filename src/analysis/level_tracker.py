@@ -142,6 +142,12 @@ class LevelTracker:
             # сходилось бы НИКОГДА — молча, ни одного теста за всё время.
             top = {p for p, q in ranked[:self.history.top_levels]
                    if q >= floor_qty}
+            # ПЛЮС крупнейшие уровни ВСЕЙ стороны, как бы далеко они ни стояли:
+            # именно их показывает карточка (`notable`, top=1). Без этого журналы
+            # наполнялись, а на экране история оставалась пустой — наборы не
+            # пересекались.
+            top |= {p for p, _q in sorted(present.items(),
+                                          key=lambda kv: -kv[1])[:lh.WALLS]}
             for price, qty in present.items():
                 self._touch(tk, side, price, qty, minute, sec, price in top)
             # Известные уровни ЭТОЙ бумаги и стороны, которых в пакете НЕТ.
