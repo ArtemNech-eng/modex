@@ -55,12 +55,24 @@ class TinkoffClient:
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
         }
+        # ПРИЧИНА ОТКАЗА ДОСТУПНА ВЫЗЫВАЮЩЕМУ, а не только логу. 03.08 прод четыре
+        # часа стоял с 48 мёртвыми тикерами, и назвать причину было НЕЛЬЗЯ: статус
+        # ответа знали здесь, наружу уходил None, а лога у агента нет. Перевыпуск
+        # токена ничего не дал и ничего не сообщил — версию закрыли, знание не
+        # прибавилось. Эти два поля и есть разница между «не работает» и диагнозом.
+        self.last_error: Optional[str] = None
+        self.last_status: Optional[int] = None
 
     def _ok(self) -> bool:
         return bool(self.token)
 
+    def _fail(self, reason: str, status: Optional[int] = None) -> None:
+        self.last_error = reason
+        self.last_status = status
+
     async def _post(self, endpoint: str, body: dict) -> Optional[dict]:
         if not self._ok():
+            self._fail("TINKOFF_TOKEN не задан")
             return None
         url = f"{TINKOFF_BASE}/{endpoint}"
         try:
@@ -68,10 +80,13 @@ class TinkoffClient:
                 resp = await client.post(url, headers=self.headers, json=body)
                 if resp.status_code != 200:
                     logger.warning(f"Tinkoff API {endpoint}: {resp.status_code} {resp.text[:200]}")
+                    self._fail(f"HTTP {resp.status_code}: {resp.text[:160]}", resp.status_code)
                     return None
+                self._fail(None)
                 return resp.json()
         except Exception as e:
             logger.warning(f"Tinkoff API error {endpoint}: {e}")
+            self._fail(f"{type(e).__name__}: {str(e)[:160]}")
             return None
 
     async def get_figi(self, ticker: str) -> Optional[str]:
@@ -94,8 +109,17 @@ class TinkoffClient:
                 figi = inst.get("figi")
                 if figi:
                     TICKER_TO_FIGI[ticker] = figi
+                    self._fail(None)
                     return figi
-        logger.warning(f"FIGI для {ticker} не подтверждён API — реалтайм недоступен")
+        if not instruments:
+            self._fail("ответ 200, instruments пуст — запрос отсеял всё "
+                       "(проверить фильтр apiTradeAvailableFlag и instrumentKind)")
+        else:
+            got = ", ".join(sorted({str(i.get("ticker")) for i in instruments})[:8])
+            self._fail(f"ответ 200, инструментов {len(instruments)}, "
+                       f"точного совпадения тикера нет: {got}")
+        logger.warning(f"FIGI для {ticker} не подтверждён API — реалтайм недоступен: "
+                       f"{self.last_error}")
         return None
 
     async def resolve_live(self, ticker: str) -> Optional[dict]:
@@ -109,11 +133,78 @@ class TinkoffClient:
             "tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument",
             {"query": ticker, "instrumentKind": "INSTRUMENT_TYPE_SHARE", "apiTradeAvailableFlag": True},
         )
-        for inst in (data or {}).get("instruments", []):
+        if data is None:
+            # причину уже записал _post: статус ответа либо отказ сети
+            return None
+        instruments = data.get("instruments", [])
+        for inst in instruments:
             if inst.get("ticker", "").upper() == ticker:
+                self._fail(None)
                 return {"ticker": inst.get("ticker"), "figi": inst.get("figi"),
                         "name": inst.get("name"), "trade_available": inst.get("apiTradeAvailableFlag")}
+        # ОТВЕТ 200, А БУМАГИ НЕТ — это НЕ то же самое, что отказ API, и лечится
+        # иначе. Раньше оба случая давали None, и «48 мёртвых» не различало
+        # «Tinkoff молчит» от «наш запрос отсеял всё сам».
+        if not instruments:
+            self._fail("ответ 200, instruments пуст — запрос отсеял всё "
+                       "(проверить фильтр apiTradeAvailableFlag и instrumentKind)")
+        else:
+            got = ", ".join(sorted({str(i.get("ticker")) for i in instruments})[:8])
+            self._fail(f"ответ 200, инструментов {len(instruments)}, "
+                       f"точного совпадения тикера нет: {got}")
         return None
+
+    async def probe(self, ticker: str = "SBER") -> dict:
+        """
+        ОДИН вызов, который НАЗЫВАЕТ причину, а не перечисляет версии через «или».
+        Прежнее сообщение прода — «Tinkoff API недоступен ИЛИ токен придушен
+        лимитом» — это два разных диагноза и два разных действия, и выбрать между
+        ними было нечем.
+        Три запроса подряд, снимающие фильтры по одному, отвечают на вопрос
+        «отказ на стороне Tinkoff или наш запрос отсеивает всё сам».
+        """
+        ep = "tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument"
+        if not self._ok():
+            return {"verdict": "TINKOFF_TOKEN не задан", "token_set": False}
+
+        async def _try(body: dict) -> dict:
+            data = await self._post(ep, body)
+            if data is None:
+                return {"ok": False, "status": self.last_status, "error": self.last_error}
+            inst = data.get("instruments", [])
+            return {"ok": True, "status": 200, "count": len(inst),
+                    "tickers": sorted({str(i.get("ticker")) for i in inst})[:8]}
+
+        full = await _try({"query": ticker, "instrumentKind": "INSTRUMENT_TYPE_SHARE",
+                           "apiTradeAvailableFlag": True})
+        no_flag = await _try({"query": ticker, "instrumentKind": "INSTRUMENT_TYPE_SHARE"})
+        bare = await _try({"query": ticker})
+
+        st = full.get("status")
+        if not full["ok"]:
+            if st in (401, 403):
+                verdict = "токен недействителен или отозван"
+            elif st == 429:
+                verdict = "лимит запросов Tinkoff"
+            elif st and st >= 500:
+                verdict = f"Tinkoff недоступен (HTTP {st})"
+            elif st:
+                verdict = f"Tinkoff ответил HTTP {st}"
+            else:
+                verdict = "сеть или таймаут до Tinkoff — запрос не дошёл"
+        elif full.get("count"):
+            verdict = "исправно: API отвечает, инструменты приходят"
+        elif no_flag.get("count"):
+            verdict = ("наш запрос отсеивает всё сам: без apiTradeAvailableFlag "
+                       "инструменты есть, с ним пусто")
+        elif bare.get("count"):
+            verdict = ("наш запрос отсеивает всё сам: мешает instrumentKind "
+                       "INSTRUMENT_TYPE_SHARE")
+        else:
+            verdict = ("API отвечает 200, но инструментов не отдаёт ни с фильтрами, "
+                       "ни без них")
+        return {"verdict": verdict, "token_set": True, "ticker": ticker,
+                "with_filters": full, "without_trade_flag": no_flag, "query_only": bare}
 
     async def get_candles(self, ticker: str, days: int = 365) -> Optional[dict]:
         """Дневные свечи с точным объёмом."""

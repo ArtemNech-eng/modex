@@ -1277,25 +1277,40 @@ async def health_figi():
     статического кэша) — ловит переименования/делистинги (YNDX→YDEX, POLY/DSKY
     и т.п.). Работает при закрытом рынке. Показывает, по каким символам стакан
     в принципе НЕ соберётся, пока не поправим их в MOEX_TICKERS.
+
+    ПРИЧИНА ПО КАЖДОМУ МЁРТВОМУ ТИКЕРУ. Прежняя версия делала
+    `except Exception: info = None` и складывала в dead все три разных случая:
+    отказ HTTP, ответ 200 с пустым instruments и ответ 200 без совпадения тикера.
+    03.08 прибор показал «48 мертвы» и не сказал почему ни по одной — четыре часа
+    простоя и зря перевыпущенный токен. Поле probe отвечает на «чья вина» одним
+    запросом, поля reasons — по каждой бумаге.
     """
     from config.settings import TINKOFF_TOKEN, MOEX_TICKERS
     if not TINKOFF_TOKEN:
         return {"error": "TINKOFF_TOKEN не задан"}
     from src.collector.tinkoff_client import TinkoffClient
     tk = TinkoffClient()
-    live, dead = {}, []
+    probe = await tk.probe()
+    live, dead, reasons = {}, [], {}
     for t in MOEX_TICKERS:
         try:
             info = await tk.resolve_live(t)
-        except Exception:
-            info = None
+            why = tk.last_error
+        except Exception as e:                                   # noqa: BLE001
+            info, why = None, f"{type(e).__name__}: {str(e)[:120]}"
         if info and info.get("figi"):
             live[t] = {"figi": info["figi"], "name": info.get("name")}
         else:
             dead.append(t)
+            reasons[t] = why or "причина не записана"
         await asyncio.sleep(0.1)
+    # Сводка по причинам: 48 одинаковых строк читать незачем, важно их РАСПРЕДЕЛЕНИЕ.
+    by_reason: dict = {}
+    for why in reasons.values():
+        by_reason[why] = by_reason.get(why, 0) + 1
     return {"total": len(MOEX_TICKERS), "live": len(live), "dead_count": len(dead),
-            "dead_tickers": dead, "live_map": live}
+            "dead_tickers": dead, "live_map": live,
+            "probe": probe, "dead_by_reason": by_reason, "dead_reasons": reasons}
 
 
 @app.get("/api/health/ai", summary="Диагностика Claude/AI-провайдера (сырой ответ)")
