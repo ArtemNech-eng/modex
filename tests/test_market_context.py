@@ -298,7 +298,12 @@ def test_minute_history_is_bounded_and_skips_junk():
     for i in range(100):
         s.note_minute("SBER", {"ts": f"2026-08-03T{10 + i // 60:02d}:{i % 60:02d}",
                                "close": 100.0 + i})
-    assert len(s.minutes["SBER"]) <= 60
+    from src.collector.stream import MINUTES_KEPT
+    # От КОНСТАНТЫ, а не от числа: окно выросло с 60 до 240, потому что при
+    # часе памяти шаг 15м не срабатывал ни разу. Тест, зашивший 60, поймал бы
+    # это как поломку, хотя поломкой было прежнее значение.
+    assert len(s.minutes["SBER"]) <= MINUTES_KEPT
+    assert MINUTES_KEPT >= 90, "шагу 15м нужно шесть закрытых баров"
     s.note_minute("", {"ts": "2026-08-03T10:00", "close": 100.0})
     s.note_minute("GAZP", {"ts": None, "close": 100.0})
     s.note_minute("GAZP", {"ts": "2026-08-03T10:00", "close": None})

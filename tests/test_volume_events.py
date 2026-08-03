@@ -345,7 +345,11 @@ def test_scanner_endpoint_exists():
     api = (ROOT / "src/api/main.py").read_text()
     assert '@app.get("/api/volume-scan"' in api
     i = api.index("async def get_volume_scan")
-    body = api[i:i + 3000]
+    # До СЛЕДУЮЩЕГО маршрута, а не первые 3000 символов. Счётчик символов
+    # ломается от любой добавленной строки: тело выросло, и тест объявил
+    # поломкой собственное окно, а не код.
+    j = api.find("\n@app.", i)
+    body = api[i:j if j > 0 else len(api)]
     assert "profiles_ready" in body, "видно, готова ли норма по времени"
     assert "vol_profiles" in body
 

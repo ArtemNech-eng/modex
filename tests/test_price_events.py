@@ -35,8 +35,8 @@ import pathlib
 
 import pytest
 
-from src.analysis.price_events import (detect, detect_step, scan, DEFAULTS,
-                                       STEPS, NEED)
+from src.analysis.price_events import (detect, detect_step, scan, rates,
+                                       DEFAULTS, STEPS, NEED)
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -334,7 +334,11 @@ def test_scanner_endpoint_exists_and_reports_rates():
 
 def test_card_shows_the_tickers_own_price_events():
     api = (ROOT / "src/api/main.py").read_text()
-    assert 'out["price_events"] = price_detect(' in api
+    # Карточка и сканер обязаны звать ОДНУ функцию с одними входными данными.
+    # 03.08 они считали по-разному и давали по одной бумаге разные ответы:
+    # RAGR 8 событий против 4, POSI 3 против 9. Обе цифры были верны.
+    assert 'out["price_events"] = events_for(' in api
+    assert "from src.analysis.price_events import events_for" in api
     page = (ROOT / "dashboard/market-watch.html").read_text()
     assert "события цены" in page
     assert "события стакана" in page, "два разных блока, не слиты"
@@ -343,7 +347,11 @@ def test_card_shows_the_tickers_own_price_events():
 def test_scanner_page_is_a_list_not_cards():
     page = (ROOT / "dashboard/price-scan.html").read_text()
     assert "<table>" in page or "<table" in page
-    assert "частота" in page, "базовая частота видов на экране"
+    # Не по одному слову: формулировка меняется, а требование нет — доли видов
+    # обязаны быть на экране, и общая, и по каждому шагу отдельно.
+    assert "rates(d.rates" in page, "общая доля видов на экране"
+    assert "byStep(d.rates_by_step" in page, "доли по каждому шагу на экране"
+    assert "хотя бы на одном шаге" in page, "общая доля названа честно"
     assert "-12.57" in page or "−12.57" in page, "измеренный вред записан"
     assert "61%" in page, "случай вырождения отката записан"
     api = (ROOT / "src/api/main.py").read_text()
@@ -431,3 +439,67 @@ def test_break_reason_says_how_deep_in_units_of_the_ticker():
     assert "хода бумаги" in why, why
     # Вышли на 0.06 при обычном ходе 0.02 — это три хода.
     assert "3.0 хода" in why, why
+
+
+# ─── связность: один ответ на одну бумагу ─────────────────────────────────────
+
+def test_card_and_scanner_give_the_same_answer():
+    """
+    НАЙДЕНО 03.08 СРАВНЕНИЕМ ДВУХ ЭКРАНОВ.
+
+        RAGR   сканер 8 событий · карточка 4
+        POSI   сканер 3         · карточка 9
+
+    Обе цифры были ВЕРНЫ для своих входных данных: сканер считал по 60 барам из
+    памяти и 4 уровням, карточка — по 262 барам из базы и 6. Дефект связности
+    хуже арифметической ошибки: обе стороны убедительны, и выбрать нельзя.
+
+    Теперь оба зовут events_for, и разойтись им не на чем.
+    """
+    from src.analysis.price_events import events_for, WINDOW
+    rows = [bar(i % 60, 100.0 + (i % 7) * 0.1 - (i % 5) * 0.08) for i in range(300)]
+    # Карточка передаёт всю историю дня, сканер — свою память. Ответ один.
+    card = events_for(rows, tick=0.01)
+    scanner = events_for(rows[-WINDOW:], tick=0.01)
+    assert [e["kind"] for e in card] == [e["kind"] for e in scanner]
+    assert [e["ts"] for e in card] == [e["ts"] for e in scanner]
+
+
+def test_scan_uses_the_canonical_path_too():
+    """Сканер по всем бумагам обязан идти тем же путём, что и одна карточка."""
+    from src.analysis.price_events import events_for
+    rows = [bar(i % 60, 100.0 + (i % 7) * 0.1 - (i % 5) * 0.08) for i in range(300)]
+    one = events_for(rows, tick=0.01)
+    many = scan({"AAA": rows}, ticks={"AAA": 0.01})
+    got = many[0]["events"] if many else []
+    assert [e["kind"] for e in got] == [e["kind"] for e in one]
+
+
+def test_window_is_long_enough_for_every_advertised_step():
+    """
+    Шаг 15м требует шести ЗАКРЫТЫХ баров, то есть 90 минут. При памяти в 60
+    минут он не срабатывал НИ РАЗУ, хотя ручка объявляла steps [1, 5, 15].
+    Замер на живой доске 03.08: 1м — 16 событий, 5м — 54, 15м — ноль.
+    """
+    from src.analysis.price_events import WINDOW, STEPS, NEED
+    for s in STEPS:
+        assert WINDOW // s >= NEED, f"шагу {s}м не хватает окна {WINDOW}"
+
+
+def test_rates_by_step_does_not_inflate_with_more_steps():
+    """
+    Общая доля считает бумагу сработавшей, если сработал ХОТЬ КАКОЙ шаг, и
+    растёт от числа шагов. 03.08 включение 15м и 30м подняло «ложный пробой» с
+    32% до 50%, и я едва не принял это за расстройку порогов.
+    """
+    from src.analysis.price_events import rates_by_step
+    scanned = [{"ticker": "AAA", "kinds": ["false_break"], "events": [
+        {"kind": "false_break", "step_min": 1},
+        {"kind": "false_break", "step_min": 5},
+        {"kind": "false_break", "step_min": 15}]}]
+    общая = rates(scanned, 10)
+    по_шагам = rates_by_step(scanned, 10)
+    assert общая["false_break"]["share"] == 0.1
+    for st in ("1", "5", "15"):
+        assert по_шагам[st]["false_break"]["share"] == 0.1, \
+            "одна бумага на трёх шагах это 10%, а не 30%"

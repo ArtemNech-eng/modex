@@ -32,6 +32,7 @@
 from statistics import median
 from typing import Optional
 
+from src.analysis.price_levels import levels as _chart_levels
 from src.analysis.timeframes import bars
 
 STEPS = (1, 5, 15)     # на каких шагах искать: минутка, пятиминутка, четверть часа
@@ -67,6 +68,31 @@ PULL_BARS = 2
 #
 #  Догадка. Калибровать по живому рынку через долю сработавших бумаг.
 LEG_SCALE = 3.0
+
+# ОКНО ПАМЯТИ и число уровней — ОДНИ на весь продукт.
+#
+# 03.08 сканер и карточка бумаги давали по одной и той же бумаге разные ответы:
+# RAGR 8 событий против 4, POSI 3 против 9. Обе цифры были верны для своих
+# входных данных — сканер считал по 60 барам из памяти и 4 уровням, карточка по
+# 262 барам из базы и 6. На экране это выглядит как противоречие, и такой
+# дефект хуже арифметической ошибки: обе стороны убедительны.
+#
+# 240 БАРОВ, А НЕ 60, потому что 60 их и не хватало. Шаг 15м требует шести
+# закрытых баров, то есть 90 минут; при памяти в 60 минут он не срабатывал НИ
+# РАЗУ, хотя ручка объявляла steps [1, 5, 15]. Замер на живой доске: 1м — 16
+# событий, 5м — 54, 15м — ноль. Третий шаг в списке был неправдой с самого
+# начала.
+#
+#     шаг    баров из 60    баров из 240
+#      1м        60             240
+#      5м        12              48
+#     15м         4  МАЛО        16
+#     30м         2  МАЛО         8
+#
+# Доли по КАЖДОМУ шагу при окне 240 остаются ниже трети (максимум 28%), то есть
+# длинное окно ничего не расстраивает.
+WINDOW = 240
+LEVELS_TOP = 4
 
 BREAK_TICKS = 2        # НИЖНЯЯ граница выхода за уровень, в шагах цены
 # Основной порог пробоя — В ДОЛЯХ ОБЫЧНОГО ХОДА САМОЙ БУМАГИ.
@@ -388,6 +414,26 @@ def detect(rows: list, tick: float = 0.01, levels: Optional[list] = None,
     return out
 
 
+def events_for(rows: list, tick: float = 0.01, steps: tuple = STEPS,
+               p: Optional[dict] = None) -> list:
+    """
+    События одной бумаги с КАНОНИЧЕСКИМИ входными данными.
+
+    Единственная точка, где решается, сколько брать баров и сколько уровней.
+    Сканер и карточка обязаны звать её, а не собирать входные данные каждый по
+    своему — иначе они снова разойдутся, и обе будут правы.
+    """
+    rows = list(rows or ())[-WINDOW:]
+    if not rows:
+        return []
+    try:
+        lv = _chart_levels(rows, tick=tick or 0.01,
+                           price_now=rows[-1].get("close"), top=LEVELS_TOP)
+    except Exception:                                        # noqa: BLE001
+        lv = []
+    return detect(rows, tick=tick or 0.01, levels=lv, steps=steps, p=p)
+
+
 def scan(minutes: dict, ticks: Optional[dict] = None,
          levels: Optional[dict] = None, steps: tuple = STEPS,
          p: Optional[dict] = None) -> list:
@@ -405,13 +451,40 @@ def scan(minutes: dict, ticks: Optional[dict] = None,
     total = 0
     for tk, rows in (minutes or {}).items():
         total += 1
-        evs = detect(list(rows or ()), tick=(ticks or {}).get(tk) or 0.01,
-                     levels=(levels or {}).get(tk), steps=steps, p=p)
+        tick = (ticks or {}).get(tk) or 0.01
+        if levels is not None and tk in levels:
+            # Уровни переданы снаружи — уважаем их (так делают тесты).
+            evs = detect(list(rows or ())[-WINDOW:], tick=tick,
+                         levels=levels[tk], steps=steps, p=p)
+        else:
+            # Иначе КАНОНИЧЕСКИЙ путь, тот же, что у карточки.
+            evs = events_for(rows, tick=tick, steps=steps, p=p)
         if evs:
             out.append({"ticker": tk, "events": evs, "count": len(evs),
                         "kinds": sorted({e["kind"] for e in evs})})
     out.sort(key=lambda x: (-x["count"], x["ticker"]))
     return out
+
+
+def rates_by_step(scanned: list, total: int) -> dict:
+    """
+    Доля бумаг ПО КАЖДОМУ ШАГУ отдельно.
+
+    Общая доля обманывает: она считает бумагу сработавшей, если сработал хоть
+    какой шаг, и потому растёт от ЧИСЛА ШАГОВ, а не от шума. 03.08 включение
+    15м и 30м подняло «ложный пробой» с 32% до 50%, и я едва не принял это за
+    расстройку порогов. По шагам отдельно максимум был 28%.
+    """
+    if not total:
+        return {}
+    per: dict = {}
+    for x in scanned:
+        for e in x["events"]:
+            per.setdefault(str(e["step_min"]), {}).setdefault(e["kind"], set()
+                                                              ).add(x["ticker"])
+    return {st: {k: {"tickers": len(v), "share": round(len(v) / total, 3)}
+                 for k, v in kinds.items()}
+            for st, kinds in per.items()}
 
 
 def rates(scanned: list, total: int) -> dict:

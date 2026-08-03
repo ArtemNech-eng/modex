@@ -127,6 +127,13 @@ def quotation(q) -> float:
     return float(getattr(q, "units", 0) or 0) + float(getattr(q, "nano", 0) or 0) / 1e9
 
 
+# Сколько минутных баров держать на бумагу. 240, а не 60: шаг 15м требует
+# шести закрытых баров, то есть 90 минут, и при памяти в час НЕ СРАБАТЫВАЛ НИ
+# РАЗУ, хотя сканер объявлял его в списке шагов. Замер 03.08 на живой доске:
+# 1м — 16 событий, 5м — 54, 15м — ноль.
+MINUTES_KEPT = 240
+
+
 class Aggregator:
     """
     Накопление пакетов в память до записи в базу.
@@ -768,7 +775,7 @@ class MarketStream:
                "volume": row.get("volume") or 0}
         dq = self.minutes.get(tk)
         if dq is None:
-            dq = self.minutes[tk] = deque(maxlen=60)
+            dq = self.minutes[tk] = deque(maxlen=MINUTES_KEPT)
         if dq and dq[-1]["ts"] == ts:
             dq[-1] = bar
         else:

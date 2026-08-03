@@ -807,10 +807,12 @@ async def get_book_live(ticker: str, light: bool = False):
     # Считаются по ЗАКРЫТЫМ барам, поэтому обновляются раз в минуту, а не раз в
     # секунду: пока минута не закрылась, события не существует.
     try:
-        from src.analysis.price_events import detect as price_detect
-        out["price_events"] = price_detect(
-            rows, tick=out.get("step") or 0.01,
-            levels=out.get("price_levels"))
+        # ТА ЖЕ функция и ТЕ ЖЕ входные данные, что у сканера. Раньше карточка
+        # считала по всей истории дня и шести уровням, а сканер по шестидесяти
+        # барам и четырём — и по одной бумаге выходили разные ответы: RAGR 8
+        # против 4, POSI 3 против 9. Оба были правы, и это худший вид ошибки.
+        from src.analysis.price_events import events_for
+        out["price_events"] = events_for(rows, tick=out.get("step") or 0.01)
     except Exception as e:                                   # noqa: BLE001
         logger.debug(f"price_events {tk}: {e}")
 
@@ -923,7 +925,7 @@ async def get_price_scan(steps: str = "1,5,15", limit: int = 40):
     измерено, и придумывать вес значило бы выдать догадку за знание.
     """
     from src.collector.stream import CURRENT
-    from src.analysis.price_events import scan, rates
+    from src.analysis.price_events import scan, rates, rates_by_step
     from src.analysis.price_levels import levels as chart_levels
     mins = getattr(CURRENT, "minutes", None)
     if not mins:
@@ -947,6 +949,7 @@ async def get_price_scan(steps: str = "1,5,15", limit: int = 40):
     found = scan(mins, ticks=ticks, levels=lv, steps=want)
     return {"scanned": len(mins), "with_events": len(found),
             "steps": list(want), "rates": rates(found, len(mins)),
+            "rates_by_step": rates_by_step(found, len(mins)),
             "results": found[:limit]}
 
 
@@ -988,6 +991,9 @@ async def get_volume_scan(steps: str = "1,5", limit: int = 40):
     from src.collector.stream import CURRENT
     from src.analysis.volume_events import (scan, rates, below_floor,
                                          warming_up, FLOOR_RUB)
+    # Доли по шагам считает общая функция: форма события одна и та же,
+    # а обманывает общая доля одинаково у обоих сканеров.
+    from src.analysis.price_events import rates_by_step
     mins = getattr(CURRENT, "minutes", None)
     if not mins:
         return {"scanned": 0, "results": [], "rates": {},
@@ -1002,6 +1008,7 @@ async def get_volume_scan(steps: str = "1,5", limit: int = 40):
     lots = dict(getattr(CURRENT, "lots", None) or {})
     return {"scanned": len(mins), "with_events": len(found),
             "steps": list(want), "rates": rates(found, len(mins)),
+            "rates_by_step": rates_by_step(found, len(mins)),
             "baseline": "время суток" if profiles else "скользящая",
             "profiles_ready": len(profiles),
             "floor_rub": FLOOR_RUB,

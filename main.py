@@ -824,7 +824,8 @@ async def stream_pipeline():
                 rows = await db.candle_series(tk, day, "1m")
             except Exception:                                # noqa: BLE001
                 continue
-            for r in rows[-60:]:
+            # Столько же, сколько держит память: MINUTES_KEPT.
+            for r in rows[-240:]:
                 stream.note_minute(tk, r)
             if rows:
                 ok += 1
