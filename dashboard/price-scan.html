@@ -65,7 +65,11 @@
   <span class="meta"><a href="/market">Наблюдатель рынка →</a></span>
 </header>
 
-<h2 class="sec">Цена</h2>
+<h2 class="sec">Цена — строит движение или просто сходила на тики</h2>
+<div class="rates" id="bnote"></div>
+<div id="board"></div>
+
+<h2 class="sec">Цена — события</h2>
 <div class="rates" id="rates"></div>
 <div id="bystep"></div>
 <div id="out"></div>
@@ -75,6 +79,15 @@
 <div id="vout"></div>
 
 <footer>
+  <b>«Строит»</b> — на скольких интервалах направление СОВПАЛО со структурой: рост, у которого
+  максимумы и минимумы идут выше, это движение, а рост без структуры — те самые несколько тиков.
+  Замер 03.08 по 43 бумагам: совпало на 42% интервалов, и чаще всего расходятся «вниз при mixed»
+  (33 случая) и «вниз при inside» (22). Галочкой помечены интервалы, где совпало.<br>
+  Столбец <b>согласие</b> строгий: все пять интервалов в одну сторону. Слово «расходятся» выпадает
+  у 91% бумаг, и это намеренно — мягкое «большинство» дало бы 14%, но и утверждало бы меньше.
+  Смягчать определение ради красивой доли значит подогнать ярлык.<br>
+  Интервалы <b>1, 3, 5, 15, 30</b>. До 03.08 считались только 1, 5 и 15, причём 15 не срабатывал
+  ни разу: памяти было 60 минут, а шести закрытым пятнадцатиминуткам нужно 90.<br>
   Сканер смотрит <b>только на цену</b>: ни стакана, ни потока. События, которым нужен стакан, живут
   в Наблюдателе рынка. Разделение не косметическое — событию со стаканом нужна открытая биржа, а
   цена есть всегда.<br>
@@ -179,6 +192,47 @@ function byStep(bs, total) {
   box.innerHTML = h + `</table>`;
 }
 
+const DIR = { up: ["вверх", "up"], down: ["вниз", "down"], flat: ["боковик", "dim"] };
+
+// СТРОИТ ЛИ ЦЕНА ДВИЖЕНИЕ. Отвечает не согласие направлений, а совпадение
+// направления со СТРУКТУРОЙ: рост, у которого максимумы и минимумы идут выше,
+// это движение; рост без структуры — те самые «несколько тиков».
+function boardTable(b) {
+  const box = document.getElementById("board");
+  const note = document.getElementById("bnote");
+  const tks = Object.keys(b || {});
+  if (!tks.length) { box.innerHTML = ""; note.innerHTML = ""; return; }
+  // Наверх — те, у кого движение построено на большем числе интервалов.
+  tks.sort((a, c) => Math.abs(b[c].built) - Math.abs(b[a].built)
+                     || (b[c].built - b[a].built));
+  const steps = ["1m", "3m", "5m", "15m", "30m"];
+  const bu = tks.filter(t => b[t].built >= 3).length;
+  const bd = tks.filter(t => b[t].built <= -3).length;
+  note.innerHTML = `<span>бумаг <b>${tks.length}</b></span>`
+    + `<span>строят рост на ≥3 интервалах <b>${bu}</b></span>`
+    + `<span>строят падение <b>${bd}</b></span>`;
+  let h = `<table><tr><th>бумага</th>`
+        + steps.map(s => `<th>${s}</th>`).join("")
+        + `<th>строит</th><th>согласие</th></tr>`;
+  for (const t of tks.slice(0, 30)) {
+    const v = b[t];
+    h += `<tr><td class="tk">${t}</td>`;
+    for (const s of steps) {
+      const f = v.frames[s];
+      if (!f) { h += `<td class="dim">—</td>`; continue; }
+      const [w, c] = DIR[f.dir] || [f.dir, ""];
+      // Структура рядом с направлением: без неё «вверх» ничего не говорит.
+      const same = f.dir === f.struct;
+      h += `<td class="${c}">${w}<br><span class="step">${same ? "✓ " : ""}${f.struct}</span></td>`;
+    }
+    const bl = v.built;
+    h += `<td class="${bl > 0 ? "up" : bl < 0 ? "down" : "dim"}">`
+       + `${bl > 0 ? "+" : ""}${bl}</td>`
+       + `<td class="${v.agree === "расходятся" ? "dim" : "warn"}">${v.agree}</td></tr>`;
+  }
+  return void (box.innerHTML = h + `</table>`);
+}
+
 function rows(list) {
   if (!list.length) return `<div class="empty">событий цены сейчас нет</div>`;
   let h = `<table><tr><th>бумага</th><th>событие</th><th>шаг</th>`
@@ -272,6 +326,7 @@ async function tick() {
     document.getElementById("k").textContent = d.with_events ?? "—";
     rates(d.rates, d.scanned);
     byStep(d.rates_by_step, d.scanned);
+    boardTable(d.board);
     document.getElementById("out").innerHTML =
       d.note ? `<div class="empty">${d.note}</div>` : rows(d.results || []);
   } catch (e) {

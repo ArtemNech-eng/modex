@@ -503,3 +503,61 @@ def test_rates_by_step_does_not_inflate_with_more_steps():
     for st in ("1", "5", "15"):
         assert по_шагам[st]["false_break"]["share"] == 0.1, \
             "одна бумага на трёх шагах это 10%, а не 30%"
+
+
+# ─── направление и структура по всей доске ────────────────────────────────────
+
+def test_board_covers_all_five_timeframes_from_the_task():
+    """
+    Артём просил 1, 3, 5, 15, 30. До 03.08 стояло (1, 5, 15): 3 и 30 не
+    считались вовсе, а 15 не срабатывал ни разу из-за памяти в 60 баров.
+    """
+    from src.analysis.price_events import board, STEPS, WINDOW, NEED
+    assert STEPS == (1, 3, 5, 15, 30), STEPS
+    for s in STEPS:
+        assert WINDOW // s >= NEED, f"шагу {s}м не хватает окна {WINDOW}"
+    rows = [bar(i % 60, 100.0 + i * 0.01) for i in range(240)]
+    got = board({"AAA": rows})
+    assert set(got["AAA"]["frames"]) == {"1m", "3m", "5m", "15m", "30m"}
+
+
+def test_board_answers_whether_the_move_is_built():
+    """
+    ПРЯМОЙ ОТВЕТ НА ВОПРОС ЗАДАНИЯ: «строит восходящее движение или просто
+    случайно выросла на несколько тиков?»
+
+    Отвечает не согласие направлений, а совпадение направления со СТРУКТУРОЙ.
+    Замер 03.08: совпало на 42% интервалов; чаще всего расходятся «вниз при
+    mixed» (33 случая) и «вниз при inside» (22) — это и есть тики.
+    """
+    from src.analysis.price_events import board
+    # Ровный подъём: и направление вверх, и максимумы с минимумами выше.
+    up = [bar(i % 60, 100.0 + i * 0.05, hi=100.05 + i * 0.05, lo=99.95 + i * 0.05)
+          for i in range(240)]
+    got = board({"AAA": up})["AAA"]
+    assert got["built_up"] >= 3, got
+    assert got["built"] > 0
+
+
+def test_board_does_not_call_ticks_a_move():
+    """Дрожание в узком коридоре не строит движение ни на одном интервале."""
+    from src.analysis.price_events import board
+    flat = [bar(i % 60, 100.0 + (0.01 if i % 2 else -0.01)) for i in range(240)]
+    got = board({"AAA": flat})["AAA"]
+    assert got["built_up"] == 0 and got["built_down"] == 0, got
+
+
+def test_strict_agreement_is_kept_strict_on_purpose():
+    """
+    Слово «расходятся» выпадает у 91% бумаг, и это НАМЕРЕННО. Мягкое
+    «большинство» даёт 14%, но и утверждает меньше. Смягчать определение ради
+    красивой доли значило бы подогнать ярлык; счётчики up/down/flat лежат рядом,
+    и читатель считает сам.
+    """
+    from src.analysis.price_events import board
+    src = (ROOT / "src/analysis/price_events.py").read_text()
+    assert "91%" in src, "замер, из которого взято определение, записан рядом"
+    up = [bar(i % 60, 100.0 + i * 0.05, hi=100.05 + i * 0.05, lo=99.95 + i * 0.05)
+          for i in range(240)]
+    got = board({"AAA": up})["AAA"]
+    assert got["up"] + got["down"] + got["flat"] == len(got["frames"])

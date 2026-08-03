@@ -925,7 +925,7 @@ async def get_price_scan(steps: str = "1,5,15", limit: int = 40):
     измерено, и придумывать вес значило бы выдать догадку за знание.
     """
     from src.collector.stream import CURRENT
-    from src.analysis.price_events import scan, rates, rates_by_step
+    from src.analysis.price_events import scan, rates, rates_by_step, board
     from src.analysis.price_levels import levels as chart_levels
     mins = getattr(CURRENT, "minutes", None)
     if not mins:
@@ -950,6 +950,9 @@ async def get_price_scan(steps: str = "1,5,15", limit: int = 40):
     return {"scanned": len(mins), "with_events": len(found),
             "steps": list(want), "rates": rates(found, len(mins)),
             "rates_by_step": rates_by_step(found, len(mins)),
+            # Направление и структура по ВСЕМ бумагам, не только по сработавшим:
+            # «строит ли цена движение» — вопрос про каждую, а не про событие.
+            "board": board(mins, steps=want),
             "results": found[:limit]}
 
 
