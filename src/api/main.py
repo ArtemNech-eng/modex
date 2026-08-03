@@ -901,7 +901,7 @@ def _scanner_note() -> str:
 
 
 @app.get("/api/price-scan", summary="Сканер цены: что делает цена по всем бумагам")
-async def get_price_scan(steps: str = "1,5,15", limit: int = 40):
+async def get_price_scan(steps: Optional[str] = None, limit: int = 40):
     """
     Восемь событий ЦЕНЫ по всем бумагам разом: резкое ускорение вверх и вниз,
     начало движения, остановка, откат, пробой уровня, ложный пробой, смена
@@ -925,16 +925,25 @@ async def get_price_scan(steps: str = "1,5,15", limit: int = 40):
     измерено, и придумывать вес значило бы выдать догадку за знание.
     """
     from src.collector.stream import CURRENT
-    from src.analysis.price_events import scan, rates, rates_by_step, board
+    from src.analysis.price_events import (scan, rates, rates_by_step, board,
+                                           STEPS as PRICE_STEPS)
     from src.analysis.price_levels import levels as chart_levels
     mins = getattr(CURRENT, "minutes", None)
     if not mins:
         return {"scanned": 0, "results": [], "rates": {},
                 "note": _scanner_note()}
-    try:
-        want = tuple(int(x) for x in steps.split(",") if x.strip())
-    except ValueError:
-        raise HTTPException(status_code=400, detail="steps: например 1,5,15")
+    # ПО УМОЛЧАНИЮ — из модуля, а не своя копия в подписи. 03.08 я поменял STEPS
+    # на (1, 3, 5, 15, 30), выкатил и увидел на проде прежние [1, 5, 15]: у
+    # маршрута был захардкожен свой список, и константа до него не доходила. Тот
+    # же дефект связности, что был между карточкой и сканером, только между
+    # модулем и маршрутом.
+    if not steps:
+        want = PRICE_STEPS
+    else:
+        try:
+            want = tuple(int(x) for x in steps.split(",") if x.strip())
+        except ValueError:
+            raise HTTPException(status_code=400, detail="steps: например 1,5,15")
     ticks = dict(getattr(CURRENT, "steps", None) or {})
     # Уровни С ГРАФИКА, а не из стакана: заявку снимают за секунду, а место,
     # где цена разворачивалась, остаётся.
@@ -957,7 +966,7 @@ async def get_price_scan(steps: str = "1,5,15", limit: int = 40):
 
 
 @app.get("/api/volume-scan", summary="Сканер объёма: пришли ли деньги")
-async def get_volume_scan(steps: str = "1,5", limit: int = 40):
+async def get_volume_scan(steps: Optional[str] = None, limit: int = 40):
     """
     Всплеск оборота и его УСКОРЕНИЕ по всем бумагам разом.
 
@@ -997,14 +1006,19 @@ async def get_volume_scan(steps: str = "1,5", limit: int = 40):
     # Доли по шагам считает общая функция: форма события одна и та же,
     # а обманывает общая доля одинаково у обоих сканеров.
     from src.analysis.price_events import rates_by_step
+    from src.analysis.volume_events import STEPS as VOL_STEPS
     mins = getattr(CURRENT, "minutes", None)
     if not mins:
         return {"scanned": 0, "results": [], "rates": {},
                 "note": _scanner_note()}
-    try:
-        want = tuple(int(x) for x in steps.split(",") if x.strip())
-    except ValueError:
-        raise HTTPException(status_code=400, detail="steps: например 1,5")
+    # По умолчанию — из модуля объёма, не своя копия. См. пояснение в /api/price-scan.
+    if not steps:
+        want = VOL_STEPS
+    else:
+        try:
+            want = tuple(int(x) for x in steps.split(",") if x.strip())
+        except ValueError:
+            raise HTTPException(status_code=400, detail="steps: например 1,5")
     profiles = dict(getattr(CURRENT, "vol_profiles", None) or {})
     found = scan(mins, lots=dict(getattr(CURRENT, "lots", None) or {}),
                  profiles=profiles, steps=want)  # lots ниже — тот же словарь

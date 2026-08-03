@@ -561,3 +561,23 @@ def test_strict_agreement_is_kept_strict_on_purpose():
           for i in range(240)]
     got = board({"AAA": up})["AAA"]
     assert got["up"] + got["down"] + got["flat"] == len(got["frames"])
+
+
+def test_route_default_steps_come_from_the_module():
+    """
+    НАЙДЕНО ПОСЛЕ ДЕПЛОЯ 03.08, ГЛАЗАМИ НА ВЫДАЧЕ.
+
+    Я поменял STEPS на (1, 3, 5, 15, 30), выкатил — и увидел на проде прежние
+    [1, 5, 15]. У маршрута был захардкожен свой список в подписи:
+
+        async def get_price_scan(steps: str = "1,5,15", ...)
+
+    Константа до него не доходила. Тот же дефект связности, что был между
+    карточкой и сканером, только между модулем и маршрутом. Тесты его не видели:
+    на Python 3.9 модуль API не импортируется, а исходник никто не сверял.
+    """
+    api = (ROOT / "src/api/main.py").read_text()
+    assert 'steps: str = "1,5,15"' not in api, "свой список в подписи маршрута"
+    assert 'steps: str = "1,5"' not in api, "то же в маршруте объёма"
+    assert "STEPS as PRICE_STEPS" in api, "шаги цены берутся из модуля"
+    assert "STEPS as VOL_STEPS" in api, "шаги объёма тоже"
