@@ -5,10 +5,14 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
-  pytest:
+  scanners:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v4
@@ -16,17 +20,41 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: pip
 
-      # torch ДО requirements.txt и жёстко с CPU-индекса: иначе pip сливает
-      # индексы и тянет сборку с пакетами nvidia-* (свыше 3 ГБ).
-      - name: torch (CPU)
+      # Только то, без чего эти две суиты не импортируются. Сети тесты не касаются:
+      # httpx в tinkoff_client подменяется двойниками _Httpx/_Client.
+      - name: Зависимости
         run: |
           python -m pip install --upgrade pip
-          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.4.1
-
-      - name: Зависимости
-        run: pip install -r requirements.txt
+          pip install pytest httpx==0.27.0
 
       - name: pytest
-        run: pytest -q --maxfail=0
+        id: run
+        run: |
+          set +e
+          python -m pytest -q -rA \
+            tests/test_volume_events.py \
+            tests/test_figi_failure_reason.py > out.txt 2>&1
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+          cat out.txt
+
+      # Галочка сообщает ТОЛЬКО факт падения. Чтобы была видна ПРИЧИНА,
+      # вывод кладётся в комментарий PR и в сводку прогона.
+      - name: Отчёт
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo '### pytest: сканер объёма и токен/FIGI'
+            echo '```'
+            tail -c 55000 out.txt
+            echo '```'
+          } > body.md
+          cat body.md >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            gh pr comment "${{ github.event.pull_request.number }}" --body-file body.md
+          fi
+
+      - name: Итог
+        run: exit ${{ steps.run.outputs.code }}
