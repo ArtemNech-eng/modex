@@ -68,7 +68,24 @@ PULL_BARS = 2
 #  Догадка. Калибровать по живому рынку через долю сработавших бумаг.
 LEG_SCALE = 3.0
 
-BREAK_TICKS = 2        # на сколько шагов цены надо выйти за уровень
+BREAK_TICKS = 2        # НИЖНЯЯ граница выхода за уровень, в шагах цены
+# Основной порог пробоя — В ДОЛЯХ ОБЫЧНОГО ХОДА САМОЙ БУМАГИ.
+#
+# Порог в шагах цены означал у разных бумаг разное. Замер 03.08 по 43 бумагам:
+# два шага это 0.29 обычного хода у MDMG и 2.0 у HEAD — разброс в семь раз при
+# одном и том же детекторе. Отсюда «ложный пробой» на 72% бумаг: у MOEX два
+# шага при 161.3 — это 0.012%, тень свечи, а не пробой.
+#
+# Доля выбрана по замеру на ТРЁХ окнах одного дня, а не на одном:
+#
+#     окно                   ×0.0    ×1.0    ×1.5    ×2.0
+#     09:45, последние 60    72.1%   37.2%   23.3%   11.6%
+#     часом раньше           41.9%   11.6%    4.7%    0.0%
+#     первый час сессии      53.5%   18.6%    0.0%    0.0%
+#
+# ×1.5 и ×2.0 выглядят лучше на первом окне и дают НОЛЬ на двух других:
+# детектор молчал бы две трети дня. Это подгонка под час. ×1.0 держится везде.
+BREAK_SCALE = 1.0
 FALSE_BARS = 3         # столько баров есть у ложного пробоя, чтобы вернуться
 
 
@@ -92,6 +109,25 @@ def _scale(moves: list) -> Optional[float]:
         return None
     m = median(vals)
     return m if m > 0 else None
+
+
+def _over(close: float, price: float, scale: float, floor_px: float) -> str:
+    """
+    НАСКОЛЬКО вышли за уровень — в ходах самой бумаги.
+
+    Печатать сам порог бесполезно: он у всех событий бумаги одинаков, и строка
+    «на 1 при обычном ходе 1» повторяет одно число дважды. А вот глубина выхода
+    у каждого события своя, и она отвечает на вопрос, решителен ли пробой.
+    """
+    d = abs(close - price)
+    if scale > 0:
+        return f"{d / scale:.1f} хода бумаги"
+    return f"{_num(d)} (ход бумаги нулевой, порог {_num(floor_px)})"
+
+
+def _num(v: float) -> str:
+    """Цена без хвоста нулей: 0.05 вместо 0.05000000000000001."""
+    return f"{v:.6f}".rstrip("0").rstrip(".") or "0"
 
 
 def _ev(kind: str, why: str, step: int, bar: dict, **nums) -> dict:
@@ -182,6 +218,7 @@ def detect_step(rows: list, step: int, tick: float = 0.01,
 DEFAULTS = {"look": LOOK, "sharp": SHARP, "quiet": QUIET,
             "quiet_bars": QUIET_BARS, "pull_min": PULL_MIN,
             "pull_max": PULL_MAX, "break_ticks": BREAK_TICKS,
+            "break_scale": BREAK_SCALE,
             "false_bars": FALSE_BARS, "leg_scale": LEG_SCALE,
             "pull_bars": PULL_BARS}
 
@@ -253,7 +290,11 @@ def _breaks(closed: list, levels: list, tick: float, step: int,
     пробоев в 6.
     """
     out = []
-    step_px = max(tick, 0.0) * p["break_ticks"]
+    # Выход за уровень: не меньше обычного хода бумаги и не меньше двух шагов
+    # цены. Второе — на случай, когда ряд стоит и масштаба нет: без нижней
+    # границы порог обнулился бы и пробоем стало бы любое касание.
+    sc = _scale(_moves(closed)) or 0.0
+    step_px = max(max(tick, 0.0) * p["break_ticks"], sc * p["break_scale"])
     n = p["false_bars"]
     for lv in levels[:6]:
         price = lv.get("price")
@@ -281,7 +322,8 @@ def _breaks(closed: list, levels: list, tick: float, step: int,
                 if i == len(closed) - 1:
                     out.append(_ev(
                         "level_break",
-                        f"закрытие за уровнем {price} на {p['break_ticks']} шага",
+                        f"закрытие за уровнем {price} "
+                        f"на {_over(b['close'], price, sc, step_px)}",
                         step, b, level=price, side="up" if up else "down"))
                 break
             # Возврат: для пробоя вверх — закрытие обратно под уровень, для
@@ -293,12 +335,19 @@ def _breaks(closed: list, levels: list, tick: float, step: int,
             else:
                 back = [x for x in after if x["close"] >= price]
             if back:
+                # ЗА СКОЛЬКО баров вернулись, а не сколько баров закрылось
+                # внутри. Прежняя подпись брала len(back) и расходилась с
+                # фактом у 25 ложных пробоев из 48: писала «за 3 бара», когда
+                # вернулись за один. Правильное число всё это время лежало
+                # рядом, в bars_out, и не использовалось.
+                took = after.index(back[0]) + 1
                 out.append(_ev(
                     "false_break",
-                    f"вышли за {price} и вернулись обратно за {len(back)} бара",
+                    f"вышли за {price} на {_over(b['close'], price, sc, step_px)}"
+                    f" и вернулись "
+                    f"{'через ' + str(took) + ' бара' if took > 1 else 'сразу'}",
                     step, back[0], level=price,
-                    side="up" if up else "down",
-                    bars_out=after.index(back[0]) + 1))
+                    side="up" if up else "down", bars_out=took))
             break
     return out
 

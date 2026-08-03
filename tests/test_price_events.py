@@ -354,3 +354,80 @@ def test_page_says_events_are_not_per_second():
     page = (ROOT / "dashboard/price-scan.html").read_text()
     assert "закрытым барам" in page
     assert "3078" in page, "ошибка причинности названа"
+
+
+# ─── порог пробоя от самой бумаги ─────────────────────────────────────────────
+
+def test_break_threshold_scales_with_the_ticker():
+    """
+    НАЙДЕНО НА ЖИВОМ ЭКРАНЕ 03.08 в 09:43.
+
+        MOEX  ложный пробой  вышли за 161.3 и вернулись за 1 бар
+
+    Порог был два ШАГА ЦЕНЫ: у MOEX это 0.02 ₽ при цене 161.3, то есть 0.012% —
+    тень свечи. Замер по 43 бумагам: два шага это 0.29 обычного хода у MDMG и
+    2.0 у HEAD, разброс в семь раз при одном детекторе. Отсюда «ложный пробой»
+    у 72% бумаг.
+
+    Теперь порог — обычный ход САМОЙ бумаги, и одинаковый выход за уровень
+    значит у тихой и у прыгающей разное.
+    """
+    lvl = [{"price": 100.0}]
+    # Тихая: обычный ход 0.02. Выход на 0.06 — три хода, это пробой.
+    calm = [bar(i, 99.90 + (0.02 if i % 2 else 0.0)) for i in range(10)]
+    calm += [bar(10, 100.06), bar(11, 100.06)]
+    # Прыгающая: обычный ход 2.0. Тот же выход на 0.06 — ничто.
+    jumpy = [bar(i, 97.0 + (2.0 if i % 2 else 0.0)) for i in range(10)]
+    jumpy += [bar(10, 100.06), bar(11, 100.06)]
+    assert "level_break" in kinds(detect_step(calm, 1, tick=0.01, levels=lvl))
+    assert "level_break" not in kinds(detect_step(jumpy, 1, tick=0.01, levels=lvl))
+
+
+def test_flat_series_still_has_an_absolute_floor():
+    """
+    Если ряд стоит, обычный ход равен нулю и порог обнулился бы: пробоем стало
+    бы любое касание. Нижняя граница в шагах цены это закрывает.
+    """
+    lvl = [{"price": 100.0}]
+    rows = [bar(i, 100.0) for i in range(10)]
+    rows += [bar(10, 100.005), bar(11, 100.005)]     # полшага цены
+    assert "level_break" not in kinds(detect_step(rows, 1, tick=0.01, levels=lvl))
+
+
+def test_false_break_says_how_long_it_took_not_how_many_stayed():
+    """
+    ПОДПИСЬ ВРАЛА У 25 ЛОЖНЫХ ПРОБОЕВ ИЗ 48.
+
+    Брала len(back) — сколько баров закрылось обратно внутри — и называла это
+    временем возврата. Писала «вернулись за 3 бара», когда вернулись за один.
+    Правильное число всё это время лежало рядом, в bars_out.
+    """
+    lvl = [{"price": 100.0}]
+    rows = [bar(i, 99.5 + (0.04 if i % 2 else 0.0)) for i in range(10)]
+    rows += [bar(10, 100.20)]                        # вышли
+    rows += [bar(11, 99.50), bar(12, 99.50), bar(13, 99.50)]   # три бара внутри
+    rows.append(bar(14, 99.50))
+    got = [e for e in detect_step(rows, 1, tick=0.01, levels=lvl)
+           if e["kind"] == "false_break"]
+    assert got
+    assert got[0]["bars_out"] == 1, "вернулись за один бар"
+    assert "3 бара" not in got[0]["why"], "три бара ВНУТРИ, а не три до возврата"
+    assert "сразу" in got[0]["why"]
+
+
+def test_break_reason_says_how_deep_in_units_of_the_ticker():
+    """
+    Читателю нужна ГЛУБИНА выхода, а не сам порог. Порог у всех событий бумаги
+    одинаков, и строка «на 1 при обычном ходе 1» повторяет одно число дважды.
+    Глубина у каждого события своя и отвечает, решителен ли пробой.
+    """
+    lvl = [{"price": 100.0}]
+    rows = [bar(i, 99.90 + (0.02 if i % 2 else 0.0)) for i in range(10)]
+    rows += [bar(10, 100.06), bar(11, 100.06)]
+    got = [e for e in detect_step(rows, 1, tick=0.01, levels=lvl)
+           if e["kind"] == "level_break"]
+    assert got
+    why = got[0]["why"]
+    assert "хода бумаги" in why, why
+    # Вышли на 0.06 при обычном ходе 0.02 — это три хода.
+    assert "3.0 хода" in why, why
