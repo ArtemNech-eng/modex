@@ -38,6 +38,7 @@
 а вывод — за тем, кто смотрит.
 """
 from statistics import median
+import datetime as _dt
 import os
 from typing import Optional
 
@@ -139,6 +140,34 @@ def _minute_of_day(ts) -> Optional[int]:
         return None
 
 
+MIN_BARS_DAY = 200     # меньше — это не торговый день, а огрызок
+
+
+def _short(v: float) -> str:
+    """Рубли словами: в тексте события «894 тыс ₽» читается, «893625.0» нет."""
+    a = abs(v)
+    if a >= 1e9: return f"{v / 1e9:.2f} млрд ₽"
+    if a >= 1e6: return f"{v / 1e6:.1f} млн ₽"
+    if a >= 1e3: return f"{v / 1e3:.0f} тыс ₽"
+    return f"{round(v)} ₽"
+
+
+def _trading_days(rows_by_day: dict) -> dict:
+    """Оставить только будни с достаточным числом баров."""
+    out = {}
+    for day, rows in (rows_by_day or {}).items():
+        if not rows or len(rows) < MIN_BARS_DAY:
+            continue
+        try:
+            wd = _dt.datetime.strptime(str(day)[:10], "%Y-%m-%d").weekday()
+        except (TypeError, ValueError):
+            continue                      # дата не разобралась — день не берём
+        if wd >= 5:
+            continue                      # суббота и воскресенье: дилерские
+        out[day] = rows
+    return out
+
+
 def day_profile(rows_by_day: dict, lot: int = 1,
                 min_days: int = MIN_DAYS) -> dict:
     """
@@ -150,11 +179,27 @@ def day_profile(rows_by_day: dict, lot: int = 1,
     Пока дней меньше `min_days`, возвращается пусто. Это не осторожность ради
     осторожности: 02.08 в базе было два дня, оба выходные, оба с дилерскими
     котировками — норма по ним не имела бы отношения к бирже.
+
+    ВЫХОДНЫЕ И ОГРЫЗКИ ОТБРАСЫВАЮТСЯ, И ЭТО НЕ МЕЛОЧЬ. В строке выше написано,
+    что по двум выходным норму строить нельзя, — а считаться днями они всё
+    равно бы стали, и через восемь торговых дней порог `min_days` набрался бы
+    вместе с ними. У выходной сессии другие часы (02:00-23:49 против 06:59),
+    другой объём и нет горбов открытия и закрытия: медиана каждой минуты
+    просела бы, и обычная минута понедельника стала бы «всплеском».
+
+    Огрызок — день, в который поток стоял и легло десять баров вместо шестисот.
+    Такой день не описывает форму суток, но `len()` считает его наравне с
+    полным. Порог `MIN_BARS_DAY` грубый и намеренно грубый: он отделяет день от
+    не-дня, а не хороший день от плохого.
+
+    Отбор делается ЗДЕСЬ, а не у вызывающего: тесты дотягиваются сюда, до
+    main.py — нет, и ровно так однажды прошёл NameError в API.
     """
-    if len(rows_by_day or {}) < min_days:
+    days = _trading_days(rows_by_day or {})
+    if len(days) < min_days:
         return {}
     per: dict = {}
-    for _day, rows in rows_by_day.items():
+    for _day, rows in days.items():
         for r in rows or ():
             mm = _minute_of_day(r.get("ts"))
             if mm is None:
@@ -208,14 +253,21 @@ def detect_step(rows: list, step: int, lot: int = 1,
     out = []
     mult = now / base
     source = "время суток" if tod else "скользящая"
+    # ТОНКАЯ НОРМА. 03.08 в 09:22: ETLN ×255.0 при обороте 894 тыс ₽ и норме
+    # 3 505 ₽. Бар пол прошёл — деньги настоящие, событие настоящее. А число
+    # бессмысленно: знаменатель шум. Пол задаёт, какие деньги считаются
+    # деньгами; к знаменателю он обязан применяться так же, как к числителю.
+    thin = base < p["floor"] * step
 
     # 1. НЕОБЫЧНЫЙ ОБЪЁМ.
     if mult >= p["surge"]:
+        why = (f"оборот {_short(now)} после тишины — норма {_short(base)}, "
+               f"кратность считать не по чему"
+               if thin else f"оборот в {mult:.1f} раза выше нормы ({source})")
         out.append(_ev(
-            "volume_surge",
-            f"оборот в {mult:.1f} раза выше нормы ({source})",
+            "volume_surge", why,
             step, last, rub=round(now), base_rub=round(base),
-            times=round(mult, 2), base_source=source))
+            times=round(mult, 2), base_source=source, base_thin=thin))
 
     # 2. УСКОРЕНИЕ ОБЪЁМА — момент, когда он ПОШЁЛ, а не «сегодня много».
     #
@@ -227,12 +279,15 @@ def detect_step(rows: list, step: int, lot: int = 1,
         steps_ok = all(tail[i + 1] >= tail[i] * p["grow"] and tail[i] > 0
                        for i in range(len(tail) - 1))
         if steps_ok:
+            tail_why = (f"{gb} бара подряд оборот растёт, сейчас {_short(now)} "
+                        f"после тишины" if thin else
+                        f"{gb} бара подряд оборот растёт, сейчас в {mult:.1f} раза выше нормы")
             out.append(_ev(
-                "volume_accelerating",
-                f"{gb} бара подряд оборот растёт, сейчас в {mult:.1f} раза выше нормы",
+                "volume_accelerating", tail_why,
                 step, last, rub=round(now), base_rub=round(base),
                 times=round(mult, 2), bars_growing=gb,
-                series=[round(v) for v in tail], base_source=source))
+                series=[round(v) for v in tail], base_source=source,
+                base_thin=thin))
     return out
 
 

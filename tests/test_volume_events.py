@@ -201,8 +201,36 @@ def test_growth_must_be_uninterrupted():
 
 # ─── норма по времени суток ───────────────────────────────────────────────────
 
-def day_rows(day, vol):
-    return [bar(i, vol, day=day) for i in range(20)]
+def weekdays(n, start="2026-08-03"):
+    """
+    N БУДНЕЙ подряд, а не N календарных дат.
+
+    Первая версия этих тестов брала range(10) подряд идущих чисел месяца и
+    падала: внутри две субботы с воскресеньями, будней остаётся семь. Код был
+    прав, тест считал дни неправильно — четвёртый раз за проект.
+    """
+    import datetime as dt
+    d = dt.datetime.strptime(start, "%Y-%m-%d")
+    out = []
+    while len(out) < n:
+        if d.weekday() < 5:
+            out.append(d.strftime("%Y-%m-%d"))
+        d += dt.timedelta(days=1)
+    return out
+
+
+def day_rows(day, vol, minutes=540):
+    """
+    Правдоподобный торговый день, а не двадцать баров. Основная сессия это
+    примерно 540 минут; день из двадцати баров не описывает форму суток, и
+    считать его днём наравне с полным нельзя.
+    """
+    out = []
+    for k in range(minutes):
+        h, m = 10 + k // 60, k % 60
+        out.append({"ts": f"{day}T{h:02d}:{m:02d}", "open": 100.0, "high": 100.0,
+                    "low": 100.0, "close": 100.0, "volume": vol})
+    return out
 
 
 def test_time_of_day_profile_needs_enough_days():
@@ -210,11 +238,9 @@ def test_time_of_day_profile_needs_enough_days():
     ГЛАВНОЕ ПРО ЧЕСТНОСТЬ. 02.08 в базе было два дня, оба выходные, оба с
     дилерскими котировками. «Обычный объём 14:30» по ним — выдумка.
     """
-    few = {f"2026-07-{20 + i:02d}": day_rows(f"2026-07-{20 + i:02d}", 100)
-           for i in range(MIN_DAYS - 1)}
+    few = {d: day_rows(d, 100) for d in weekdays(MIN_DAYS - 1)}
     assert day_profile(few, lot=1) == {}
-    enough = {f"2026-07-{10 + i:02d}": day_rows(f"2026-07-{10 + i:02d}", 100)
-              for i in range(MIN_DAYS)}
+    enough = {d: day_rows(d, 100) for d in weekdays(MIN_DAYS)}
     assert day_profile(enough, lot=1), "дней хватило — норма построена"
 
 
@@ -417,3 +443,77 @@ def test_suppressed_count_is_reported():
     assert below_floor(quiet) == 1
     assert below_floor(loud) == 0
     assert below_floor({**quiet, **loud}) == 1
+
+
+# ─── какие дни считаются днями ────────────────────────────────────────────────
+
+def test_weekend_days_do_not_count():
+    """
+    МОЯ СОБСТВЕННАЯ ОШИБКА, НАЙДЕННАЯ УТРОМ 03.08.
+
+    В docstring day_profile я написал, что по двум выходным норму строить
+    нельзя, — и оставил их считаться днями. Через восемь торговых дней порог
+    min_days набрался бы вместе с ними, и я бы этого уже не увидел.
+
+    У выходной сессии другие часы (02:00-23:49 против 06:59), другой объём и
+    нет горбов открытия и закрытия. Медиана каждой минуты просела бы, и обычная
+    минута понедельника стала бы «всплеском».
+    """
+    # 01 и 02 августа 2026 — суббота и воскресенье.
+    week = {"2026-08-01": day_rows("2026-08-01", 100),
+            "2026-08-02": day_rows("2026-08-02", 100)}
+    budni = {d: day_rows(d, 100) for d in weekdays(MIN_DAYS)}
+    assert day_profile(week, lot=1) == {}, "две выходных это ноль дней"
+    assert day_profile({**week, **budni}, lot=1), "будней хватило"
+    # И выходные не должны влиять на саму норму.
+    only = day_profile(budni, lot=1)
+    both = day_profile({**week, **budni}, lot=1)
+    assert only == both, "выходные не попали в медиану"
+
+
+def test_short_days_do_not_count():
+    """
+    День, в который поток стоял и легло десять баров вместо шестисот, не
+    описывает форму суток — но len() считает его наравне с полным.
+    """
+    from src.analysis.volume_events import MIN_BARS_DAY
+    full = {d: day_rows(d, 100) for d in weekdays(MIN_DAYS - 1)}
+    stub = {"2026-09-01": day_rows("2026-09-01", 100, minutes=MIN_BARS_DAY - 1)}
+    assert day_profile({**full, **stub}, lot=1) == {}, "огрызок это не день"
+
+
+def test_unparseable_day_key_is_dropped_not_crashed():
+    days = {d: day_rows(d, 100) for d in weekdays(MIN_DAYS)}
+    days["сегодня"] = day_rows("2026-08-04", 100)
+    assert day_profile(days, lot=1), "мусорный ключ не роняет расчёт"
+
+
+# ─── тонкая норма: событие настоящее, число нет ───────────────────────────────
+
+def test_thin_baseline_is_marked_and_not_called_a_multiple():
+    """
+    НАЙДЕНО НА ЖИВОМ ЭКРАНЕ 03.08 в 09:22.
+
+        ETLN  ×255.0   оборот 893 625 ₽   норма 3 505 ₽
+
+    Бар прошёл пол — деньги настоящие, событие настоящее. Но число бессмысленно:
+    знаменатель шум. Пол задаёт, какие деньги считаются деньгами; к знаменателю
+    он обязан применяться так же, как к числителю.
+    """
+    rows = [bar(i, 35, close=100.0) for i in range(12)]      # норма 3 500 ₽
+    rows += [bar(12, 8936, close=100.0), bar(13, 8936, close=100.0)]
+    got = [e for e in detect_step(rows, 1, lot=1) if e["kind"] == "volume_surge"]
+    assert got
+    e = got[0]
+    assert e["base_thin"] is True
+    assert "раза выше нормы" not in e["why"], "кратность считать не по чему"
+    assert "после тишины" in e["why"]
+    assert "894 тыс" in e["why"], "числа в тексте читаемые"
+
+
+def test_normal_baseline_keeps_the_multiple():
+    rows = [bar(i, 4000, close=100.0) for i in range(12)]    # норма 400 тыс ₽
+    rows += [bar(12, 20000, close=100.0), bar(13, 20000, close=100.0)]
+    got = [e for e in detect_step(rows, 1, lot=1) if e["kind"] == "volume_surge"]
+    assert got and got[0]["base_thin"] is False
+    assert "раза выше нормы" in got[0]["why"]
