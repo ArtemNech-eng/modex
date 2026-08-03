@@ -45,12 +45,73 @@ TINKOFF_BASE = "https://invest-public-api.tinkoff.ru/rest"
 # никогда не сверяли с таблицей.
 TICKER_TO_FIGI: dict[str, str] = {}
 
+# Единая точка сборки FindInstrument: и резолвер, и probe зовут ОДИН эндпоинт с
+# ОДНИМ значением instrumentKind, чтобы фильтры не разъехались между местами.
+_FIND = "tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument"
+SHARE_KIND = "INSTRUMENT_TYPE_SHARE"
+
+
+def _clean_token(token: Optional[str]) -> str:
+    r"""
+    Снять с токена мусор, который добавляет ОКРУЖЕНИЕ, а не его значение: перевод
+    строки в конце (Coolify и консоль часто так и хранят), пробелы от копирования,
+    обрамляющие кавычки.
+
+    03.08 прод четыре часа стоял с live 0 из 48, владелец перевыпустил токен — не
+    помогло. Ровно этот симптом даёт хвост `\n`: заголовок `Authorization: Bearer
+    t.xxx\n` Tinkoff отвергает как невалидный на КАЖДОМ запросе, перевыпуск кладёт
+    новое значение в то же хранилище с тем же хвостом, и 401 повторяется. Мусор
+    добавляет (точнее — не снимает) наш код, поэтому снимать его обязан код, и в
+    ЕДИНСТВЕННОМ месте — иначе один путь чинишь, другой нет.
+    """
+    t = (token or "").strip()
+    if len(t) >= 2 and t[0] == t[-1] and t[0] in ("'", '"'):
+        t = t[1:-1].strip()
+    return t
+
+
+def _is_share(inst: dict) -> bool:
+    """
+    Инструмент — именно АКЦИЯ. Страховка на случай, когда фильтр instrumentKind
+    снят: без неё под тикер бумаги мог бы подвернуться фьючерс или бонд того же
+    эмитента — родня той подмены, из-за которой HYDR получал данные FEES.
+    """
+    it = str(inst.get("instrumentType") or "").lower()
+    ik = str(inst.get("instrumentKind") or "")
+    return it == "share" or ik == SHARE_KIND
+
+
+def _pick_share(instruments: list, ticker: str,
+                require_share: bool = True) -> Optional[dict]:
+    """
+    Выбрать из ответа FindInstrument инструмент с ТОЧНО этим тикером.
+
+    Точное совпадение тикера — тот же ключ, которым ловилась подмена. Когда
+    instrumentKind в запросе снят (`require_share=True`), дополнительно требуем
+    тип «акция»: сервер уже не отфильтровал за нас. Если совпадений несколько
+    (одна бумага на разных бордах), предпочитаем торгуемую по API и московский
+    борд TQ*.
+    """
+    tk = ticker.upper()
+    cands = [i for i in (instruments or [])
+             if str(i.get("ticker") or "").upper() == tk
+             and (not require_share or _is_share(i))]
+    if not cands:
+        return None
+    cands.sort(
+        key=lambda i: (bool(i.get("apiTradeAvailableFlag")),
+                       str(i.get("classCode") or "").upper().startswith("TQ")),
+        reverse=True)
+    return cands[0]
+
 
 class TinkoffClient:
     """Клиент Tinkoff Invest REST API."""
 
     def __init__(self, token: str = None):
-        self.token = token or os.getenv("TINKOFF_TOKEN", "")
+        # Нормализуем ЗДЕСЬ, до сборки заголовка: хвост `\n` или кавычки от
+        # окружения давали Bearer, который Tinkoff отвергал на каждом запросе.
+        self.token = _clean_token(token or os.getenv("TINKOFF_TOKEN", ""))
         self.headers = {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
@@ -89,35 +150,66 @@ class TinkoffClient:
             self._fail(f"{type(e).__name__}: {str(e)[:160]}")
             return None
 
+    async def _resolve(self, ticker: str) -> Optional[dict]:
+        """
+        Найти акцию по тикеру, СНИМАЯ фильтры по одному, если строгий запрос
+        вернул 200 без совпадения.
+
+        03.08 прод четыре часа стоял с live 0 из 48 при рабочем перевыпущенном
+        токене, и probe назвал главного подозреваемого: строгий запрос
+        (apiTradeAvailableFlag + instrumentKind) отвечает 200 и НЕ отдаёт ничего.
+        Прежний код на это только жаловался и сдавался. Но FIGI у бумаги один и
+        тот же, доступна она по API или нет, — поэтому здесь резолв ослабляет
+        фильтры и всё равно требует ИМЕННО акцию с ИМЕННО этим тикером. Диагноз
+        (какой фильтр отсёк) остаётся за probe: тот НЕ восстанавливается, а мерит.
+
+        Возвращает выбранный инструмент (dict FindInstrument) или None; причину
+        отказа кладёт в last_error, как и раньше.
+        """
+        ticker = ticker.upper()
+        attempts = (
+            ({"query": ticker, "instrumentKind": SHARE_KIND,
+              "apiTradeAvailableFlag": True}, True),
+            ({"query": ticker, "instrumentKind": SHARE_KIND}, True),
+            ({"query": ticker}, False),      # kind снят — тип проверяем сами
+        )
+        seen: list = []
+        for body, kind_filtered in attempts:
+            data = await self._post(_FIND, body)
+            if data is None:
+                # сеть или HTTP-отказ: причину уже записал _post, ослаблять нечего
+                return None
+            instruments = data.get("instruments", [])
+            if instruments:
+                seen = sorted({str(i.get("ticker")) for i in instruments})[:8]
+            got = _pick_share(instruments, ticker,
+                              require_share=not kind_filtered)
+            if got:
+                self._fail(None)
+                return got
+        # Сюда — только если все три запроса ответили 200 и ни в одном не нашлось
+        # акции с точным тикером. Пустой список и «пришли чужие» лечатся по-разному,
+        # поэтому причина их РАЗЛИЧАЕТ.
+        if seen:
+            self._fail(f"ответ 200 по всем фильтрам, акции {ticker} нет; "
+                       f"пришли: {', '.join(seen)}")
+        else:
+            self._fail(f"ответ 200 по всем фильтрам, instruments пуст — {ticker} "
+                       f"не найден ни без apiTradeAvailableFlag, ни без instrumentKind")
+        return None
+
     async def get_figi(self, ticker: str) -> Optional[str]:
         """Получить FIGI по тикеру (сначала из кэша, потом из API)."""
         ticker = ticker.upper()
         if ticker in TICKER_TO_FIGI:
             return TICKER_TO_FIGI[ticker]
-        # Поиск через API
-        data = await self._post(
-            "tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument",
-            {"query": ticker, "instrumentKind": "INSTRUMENT_TYPE_SHARE", "apiTradeAvailableFlag": True},
-        )
-        if not data:
-            return None
-        instruments = data.get("instruments", [])
-        for inst in instruments:
-            # Только ТОЧНОЕ совпадение тикера. Кэшируем лишь то, что подтвердил
-            # API: любой другой путь в кэш и был причиной подмены данных.
-            if inst.get("ticker", "").upper() == ticker:
-                figi = inst.get("figi")
-                if figi:
-                    TICKER_TO_FIGI[ticker] = figi
-                    self._fail(None)
-                    return figi
-        if not instruments:
-            self._fail("ответ 200, instruments пуст — запрос отсеял всё "
-                       "(проверить фильтр apiTradeAvailableFlag и instrumentKind)")
-        else:
-            got = ", ".join(sorted({str(i.get("ticker")) for i in instruments})[:8])
-            self._fail(f"ответ 200, инструментов {len(instruments)}, "
-                       f"точного совпадения тикера нет: {got}")
+        inst = await self._resolve(ticker)
+        figi = inst.get("figi") if inst else None
+        if figi:
+            # Кэшируем лишь подтверждённое API точное совпадение-акцию: любой
+            # другой путь в кэш и был причиной подмены данных.
+            TICKER_TO_FIGI[ticker] = figi
+            return figi
         logger.warning(f"FIGI для {ticker} не подтверждён API — реалтайм недоступен: "
                        f"{self.last_error}")
         return None
@@ -128,30 +220,11 @@ class TinkoffClient:
         проверить, торгуется ли символ СЕЙЧАС (ловит переименования/делистинги:
         напр. YNDX→YDEX). Работает при закрытом рынке. None → символ не найден.
         """
-        ticker = ticker.upper()
-        data = await self._post(
-            "tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument",
-            {"query": ticker, "instrumentKind": "INSTRUMENT_TYPE_SHARE", "apiTradeAvailableFlag": True},
-        )
-        if data is None:
-            # причину уже записал _post: статус ответа либо отказ сети
-            return None
-        instruments = data.get("instruments", [])
-        for inst in instruments:
-            if inst.get("ticker", "").upper() == ticker:
-                self._fail(None)
-                return {"ticker": inst.get("ticker"), "figi": inst.get("figi"),
-                        "name": inst.get("name"), "trade_available": inst.get("apiTradeAvailableFlag")}
-        # ОТВЕТ 200, А БУМАГИ НЕТ — это НЕ то же самое, что отказ API, и лечится
-        # иначе. Раньше оба случая давали None, и «48 мёртвых» не различало
-        # «Tinkoff молчит» от «наш запрос отсеял всё сам».
-        if not instruments:
-            self._fail("ответ 200, instruments пуст — запрос отсеял всё "
-                       "(проверить фильтр apiTradeAvailableFlag и instrumentKind)")
-        else:
-            got = ", ".join(sorted({str(i.get("ticker")) for i in instruments})[:8])
-            self._fail(f"ответ 200, инструментов {len(instruments)}, "
-                       f"точного совпадения тикера нет: {got}")
+        inst = await self._resolve(ticker)
+        if inst and inst.get("figi"):
+            return {"ticker": inst.get("ticker"), "figi": inst.get("figi"),
+                    "name": inst.get("name"),
+                    "trade_available": inst.get("apiTradeAvailableFlag")}
         return None
 
     async def probe(self, ticker: str = "SBER") -> dict:
@@ -163,7 +236,7 @@ class TinkoffClient:
         Три запроса подряд, снимающие фильтры по одному, отвечают на вопрос
         «отказ на стороне Tinkoff или наш запрос отсеивает всё сам».
         """
-        ep = "tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument"
+        ep = _FIND
         if not self._ok():
             return {"verdict": "TINKOFF_TOKEN не задан", "token_set": False}
 

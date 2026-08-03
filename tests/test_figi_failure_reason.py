@@ -151,20 +151,32 @@ def test_post_reports_missing_token():
     assert "TINKOFF_TOKEN" in (c.last_error or ""), c.last_error
 
 
-# ─── resolve_live различает три случая ────────────────────────────────────────
+# ─── resolve_live: сначала ВОССТАНОВИТЬСЯ, и лишь потом назвать причину ────────
+#
+# Прежде резолв делал ОДИН строгий запрос и, если тот пуст, сдавался с диагнозом.
+# Теперь он снимает фильтры по одному (apiTradeAvailableFlag, затем
+# instrumentKind) и всё равно требует ИМЕННО акцию с ИМЕННО этим тикером. Диагноз
+# остаётся у probe — тот меряет и не восстанавливается. Поэтому «пусто» и «пришли
+# чужие» здесь проверяются на ТРЁХ ответах: причина называется, только когда не
+# помог ни один фильтр.
 
-def test_resolve_live_blames_own_filter_on_empty_list():
-    c = _patch_post(_client(), [{"instruments": []}])
-    assert _run(c.resolve_live("SBER")) is None
-    assert FLAG_HINT in (c.last_error or ""), c.last_error
-
-
-def test_resolve_live_reports_no_exact_match_and_names_what_came():
-    c = _patch_post(_client(), [{"instruments": [{"ticker": "SBERP"},
-                                                 {"ticker": "SBER_OLD"}]}])
+def test_resolve_live_all_filters_empty_names_reason():
+    """Пусто во всех трёх запросах — резолв сдаётся и называет снятые фильтры."""
+    c = _patch_post(_client(), [{"instruments": []},
+                                {"instruments": []},
+                                {"instruments": []}])
     assert _run(c.resolve_live("SBER")) is None
     why = c.last_error or ""
-    assert "совпадения тикера нет" in why, why
+    assert FLAG_HINT in why, why
+    assert "instrumentKind" in why, why
+
+
+def test_resolve_live_no_match_anywhere_names_what_came():
+    """Инструменты приходят, но акции с точным тикером нет ни при каком фильтре."""
+    other = {"instruments": [{"ticker": "SBERP"}, {"ticker": "SBER_OLD"}]}
+    c = _patch_post(_client(), [other, other, other])
+    assert _run(c.resolve_live("SBER")) is None
+    why = c.last_error or ""
     assert "SBERP" in why, why
 
 
@@ -175,11 +187,58 @@ def test_resolve_live_clears_reason_when_found():
     assert c.last_error is None, c.last_error
 
 
+def test_resolve_live_recovers_when_flag_dropped():
+    """Строгий запрос пуст, а без apiTradeAvailableFlag акция находится — берём."""
+    c = _patch_post(_client(), [
+        {"instruments": []},                                            # с флагом
+        {"instruments": [{"ticker": "SBER", "figi": "BBG004730N88"}]},  # без флага
+    ])
+    got = _run(c.resolve_live("SBER"))
+    assert got and got["figi"] == "BBG004730N88", got
+    assert c.last_error is None, c.last_error
+
+
+def test_resolve_live_query_only_picks_share_not_future():
+    """instrumentKind снят — под тем же тикером приходят и не-акции; берём акцию."""
+    c = _patch_post(_client(), [
+        {"instruments": []},
+        {"instruments": []},
+        {"instruments": [
+            {"ticker": "SBER", "instrumentType": "futures", "figi": "FUT"},
+            {"ticker": "SBER", "instrumentType": "share", "figi": "SHR",
+             "apiTradeAvailableFlag": True, "classCode": "TQBR"},
+        ]},
+    ])
+    got = _run(c.resolve_live("SBER"))
+    assert got and got["figi"] == "SHR", got
+
+
+def test_resolve_live_rejects_non_share_even_on_exact_ticker():
+    """Точный тикер, но НЕ акция — не подсовываем (родня подмены HYDR<-FEES)."""
+    c = _patch_post(_client(), [
+        {"instruments": []},
+        {"instruments": []},
+        {"instruments": [{"ticker": "SBER", "instrumentType": "bond", "figi": "BND"}]},
+    ])
+    assert _run(c.resolve_live("SBER")) is None
+
+
+def test_pick_share_prefers_api_and_moex_board():
+    """Одна бумага на разных бордах — предпочесть торгуемую по API и борд TQ*."""
+    got = tc._pick_share([
+        {"ticker": "SBER", "instrumentType": "share", "figi": "SPB",
+         "apiTradeAvailableFlag": False, "classCode": "SPBXM"},
+        {"ticker": "SBER", "instrumentType": "share", "figi": "MOEX",
+         "apiTradeAvailableFlag": True, "classCode": "TQBR"},
+    ], "SBER")
+    assert got and got["figi"] == "MOEX", got
+
+
 def test_two_failure_kinds_give_different_reasons():
-    """Главное утверждение: пустой список и отсутствие совпадения РАЗЛИЧИМЫ."""
-    a = _patch_post(_client(), [{"instruments": []}])
+    """Главное утверждение: пустой список и «пришли чужие» РАЗЛИЧИМЫ в причине."""
+    a = _patch_post(_client(), [{"instruments": []}] * 3)
     _run(a.resolve_live("SBER"))
-    b = _patch_post(_client(), [{"instruments": [{"ticker": "GAZP"}]}])
+    b = _patch_post(_client(), [{"instruments": [{"ticker": "GAZP"}]}] * 3)
     _run(b.resolve_live("SBER"))
     assert a.last_error != b.last_error, "оба отказа дали одну причину"
 
@@ -187,13 +246,33 @@ def test_two_failure_kinds_give_different_reasons():
 # ─── get_figi тоже записывает причину ─────────────────────────────────────────
 
 def test_get_figi_records_reason_and_does_not_cache_miss():
-    c = _patch_post(_client(), [{"instruments": []}])
+    c = _patch_post(_client(), [{"instruments": []}] * 3)
     assert _run(c.get_figi("SBER")) is None
     assert FLAG_HINT in (c.last_error or ""), c.last_error
     assert "SBER" not in tc.TICKER_TO_FIGI, "промах не должен попадать в кэш"
 
 
 # ─── probe называет причину ───────────────────────────────────────────────────
+
+# ─── токен нормализуется, иначе Bearer с хвостом отвергается на КАЖДОМ запросе ──
+
+def test_clean_token_strips_newline_spaces_and_quotes():
+    assert tc._clean_token("t.abc\n") == "t.abc"
+    assert tc._clean_token("  t.abc  ") == "t.abc"
+    assert tc._clean_token('"t.abc"') == "t.abc"
+    assert tc._clean_token("'t.abc'") == "t.abc"
+    assert tc._clean_token(None) == ""
+
+
+def test_client_header_has_no_trailing_junk():
+    """03.08: хвостовой \\n давал Bearer, который Tinkoff отвергал, а перевыпуск
+    токена не помогал — мусор снимался не значением, а кодом. Заголовок обязан
+    быть чистым."""
+    c = TinkoffClient(token="t.abc\n")
+    assert c.token == "t.abc", repr(c.token)
+    assert c.headers["Authorization"] == "Bearer t.abc"
+    assert "\n" not in c.headers["Authorization"]
+
 
 def test_probe_says_token_missing():
     out = _run(TinkoffClient(token="").probe())
