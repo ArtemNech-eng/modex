@@ -517,3 +517,65 @@ def test_normal_baseline_keeps_the_multiple():
     got = [e for e in detect_step(rows, 1, lot=1) if e["kind"] == "volume_surge"]
     assert got and got[0]["base_thin"] is False
     assert "раза выше нормы" in got[0]["why"]
+
+
+# ─── норма считается по СВОЕЙ сессии ──────────────────────────────────────────
+
+def sbar(hh, mm, vol, close=100.0):
+    return {"ts": f"2026-08-03T{hh:02d}:{mm:02d}", "open": close, "high": close,
+            "low": close, "close": close, "volume": vol}
+
+
+def test_morning_bars_are_not_a_baseline_for_the_main_session():
+    """
+    НАЙДЕНО НА ОТКРЫТИИ ОСНОВНОЙ СЕССИИ 03.08.
+
+    Утренняя сессия и основная — разные рынки. Замер: основная тяжелее утренней
+    в 2.5 раза по медиане, у VTBR в 11.8. В 10:05 последние 20 баров это почти
+    целиком утро, и каждая бумага «всплескивает» просто потому, что открылась
+    основная сессия.
+
+        время   сессии смешаны   только своя   нормы ещё нет
+        10:01        7                0            14
+        10:05        8                0            16
+        10:12        1                1             0
+
+    Ровно те минуты, когда на доску смотрят.
+    """
+    # Утро: тонкое. 20 баров по 300 тыс ₽.
+    rows = [sbar(9, 20 + i, 3000) for i in range(20)]
+    # Основная открылась: 6 баров по 900 тыс ₽ — втрое тяжелее утра, но для
+    # основной сессии это обычная минута.
+    rows += [sbar(10, i, 9000) for i in range(6)]
+    rows.append(sbar(10, 6, 9000))
+    got = kinds(detect_step(rows, 1, lot=1))
+    assert "volume_surge" not in got, "утро не норма для основной сессии"
+
+
+def test_not_enough_own_session_bars_means_no_event():
+    """Пока своих баров мало, честнее промолчать, чем сравнить с чужим рынком."""
+    rows = [sbar(9, 20 + i, 3000) for i in range(20)]
+    rows += [sbar(10, 0, 90000), sbar(10, 1, 90000)]      # открылись мощно
+    assert detect_step(rows, 1, lot=1) == [], "своей сессии ещё нет"
+
+
+def test_surge_inside_one_session_still_fires():
+    """Отбор по сессии не должен глушить настоящий всплеск внутри сессии."""
+    rows = [sbar(10, i, 3000) for i in range(12)]         # 300 тыс ₽
+    rows += [sbar(10, 12, 15000), sbar(10, 13, 15000)]    # 1.5 млн ₽, ×5
+    got = [e for e in detect_step(rows, 1, lot=1) if e["kind"] == "volume_surge"]
+    assert got and got[0]["times"] == pytest.approx(5.0, abs=0.1)
+
+
+def test_warming_up_is_counted():
+    """
+    Пустая таблица в 10:01 обязана читаться как «сессия только открылась», а не
+    как «необычного оборота нет».
+    """
+    from src.analysis.volume_events import warming_up
+    fresh = [sbar(9, 20 + i, 3000) for i in range(20)] + [sbar(10, 0, 9000),
+                                                          sbar(10, 1, 9000)]
+    settled = [sbar(10, i, 3000) for i in range(14)]
+    assert warming_up({"A": fresh}) == 1
+    assert warming_up({"B": settled}) == 0
+    assert warming_up({"A": fresh, "B": settled}) == 1

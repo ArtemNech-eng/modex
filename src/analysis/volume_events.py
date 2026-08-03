@@ -143,6 +143,16 @@ def _minute_of_day(ts) -> Optional[int]:
 MIN_BARS_DAY = 200     # меньше — это не торговый день, а огрызок
 
 
+def _phase(ts) -> str:
+    """Фаза сессии бара. Нужна, чтобы не сравнивать разные рынки между собой."""
+    from src.analysis.intraday import session_phase
+    try:
+        d = _dt.datetime.strptime(str(ts)[:16], "%Y-%m-%dT%H:%M")
+    except (TypeError, ValueError):
+        return "?"
+    return session_phase(d.hour * 60 + d.minute, d.weekday())
+
+
 def _short(v: float) -> str:
     """Рубли словами: в тексте события «894 тыс ₽» читается, «893625.0» нет."""
     a = abs(v)
@@ -234,8 +244,28 @@ def detect_step(rows: list, step: int, lot: int = 1,
     if now < p["floor"] * step:
         return []
 
-    # СКОЛЬЗЯЩАЯ НОРМА: по прошлым барам, измеряемый в неё не входит.
-    roll = _baseline(vals[:-1][-p["look"]:])
+    # СКОЛЬЗЯЩАЯ НОРМА: по прошлым барам ТОЙ ЖЕ СЕССИИ.
+    #
+    # Утренняя сессия и основная — разные рынки. Замер 03.08: основная тяжелее
+    # утренней в 2.5 раза по медиане, у VTBR в 11.8. В 10:05 последние 20 баров
+    # это почти целиком утро, и каждая бумага «всплескивает» просто потому, что
+    # открылась основная сессия:
+    #
+    #     время   сессии смешаны   только своя   нормы ещё нет
+    #     10:01        7                0            14
+    #     10:05        8                0            16
+    #     10:12        1                1             0
+    #
+    # Изъян острый первые шесть-восемь минут — то есть ровно тогда, когда
+    # смотрят. Дальше расхождение исчезает само.
+    #
+    # Цена молчания: пока своих баров мало, событий нет и причина названа. Это
+    # хуже, чем правильная норма, и лучше, чем выдуманная. Настоящий ответ —
+    # норма по времени суток: на границе сессий она единственно верная, и
+    # поэтому она не украшение.
+    ph = _phase(last.get("ts"))
+    same = [v for b, v in zip(closed[:-1], vals[:-1]) if _phase(b.get("ts")) == ph]
+    roll = _baseline(same[-p["look"]:]) if len(same) >= NEED else None
     # НОРМА ПО ВРЕМЕНИ СУТОК, если история набралась.
     tod = None
     if profile:
@@ -250,6 +280,7 @@ def detect_step(rows: list, step: int, lot: int = 1,
     base = tod if tod else roll
     if not base:
         return []
+    
     out = []
     mult = now / base
     source = "время суток" if tod else "скользящая"
@@ -344,6 +375,26 @@ def below_floor(minutes: dict, lots: Optional[dict] = None,
         if not bs:
             continue
         if _rub(bs[-1], (lots or {}).get(tk) or 1) < p["floor"]:
+            n += 1
+    return n
+
+
+def warming_up(minutes: dict, steps: tuple = STEPS,
+               p: Optional[dict] = None) -> int:
+    """
+    Сколько бумаг ждут, пока в своей сессии наберётся норма.
+
+    Без этого числа пустая таблица в 10:01 читается как «необычного оборота
+    нет», хотя правда — «сессия только открылась, сравнивать не с чем». Молчание
+    обязано называть причину; это уже третий раз, когда оно этого не делало.
+    """
+    n = 0
+    for _tk, rows in (minutes or {}).items():
+        cl = [b for b in bars(list(rows or ()), 1) if b.get("complete")]
+        if len(cl) < NEED:
+            continue
+        ph = _phase(cl[-1].get("ts"))
+        if sum(1 for b in cl[:-1] if _phase(b.get("ts")) == ph) < NEED:
             n += 1
     return n
 

@@ -973,6 +973,12 @@ async def get_volume_scan(steps: str = "1,5", limit: int = 40):
     Порядок — по КРАТНОСТИ к норме, а не по рублям: миллиард у SBER это обычный
     день, а сто миллионов у DATA — событие.
 
+    НОРМА СЧИТАЕТСЯ ПО СВОЕЙ СЕССИИ. Утренняя и основная — разные рынки:
+    основная тяжелее утренней в 2.5 раза по медиане, у VTBR в 11.8. Сравнивать
+    минуту основной сессии с утренними значило бы объявлять всплеском само
+    открытие; замер 03.08 давал 7-8 ложных событий в первые минуты. Пока своих
+    баров мало, событий нет, а число `warming_up` говорит, у скольких бумаг так.
+
     ПОЛ ПО ОБОРОТУ. Единственный порог, взятый не из самой бумаги, — и взятый
     из размера позиции Артёма. Минута тише его позиции это минута, где он был бы
     всей ликвидностью, и «оборот в 99.7 раза выше нормы» на 39 469 ₽ ничего не
@@ -980,7 +986,8 @@ async def get_volume_scan(steps: str = "1,5", limit: int = 40):
     как «всё выброшено полом», а не как «на рынке спокойно».
     """
     from src.collector.stream import CURRENT
-    from src.analysis.volume_events import scan, rates, below_floor, FLOOR_RUB
+    from src.analysis.volume_events import (scan, rates, below_floor,
+                                         warming_up, FLOOR_RUB)
     mins = getattr(CURRENT, "minutes", None)
     if not mins:
         return {"scanned": 0, "results": [], "rates": {},
@@ -999,6 +1006,7 @@ async def get_volume_scan(steps: str = "1,5", limit: int = 40):
             "profiles_ready": len(profiles),
             "floor_rub": FLOOR_RUB,
             "below_floor": below_floor(mins, lots=lots),
+            "warming_up": warming_up(mins),
             "results": found[:limit]}
 
 
