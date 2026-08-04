@@ -14,7 +14,54 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     curl \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# ─── Корень Минцифры: без него TLS до Tinkoff не поднимается вообще ───────
+#
+# Замерено в боевом контейнере 04.08, три проверки подряд:
+#
+#     getent hosts invest-public-api.tinkoff.ru  -> 178.130.128.33   DNS жив
+#     socket.create_connection((..., 443), 10)   -> TCP OK           фаерволл жив
+#     httpx.post(...)                            -> CERTIFICATE_VERIFY_FAILED
+#                                                   self-signed certificate
+#                                                   in certificate chain
+#
+# Издатель цепочки — Russian Trusted Sub CA, The Ministry of Digital
+# Development and Communications; лист на *.tinkoff.ru (TBank), до 30.09.2026.
+# Этого корня в Debian bookworm нет и не появится, а без него падает КАЖДЫЙ
+# запрос: и REST за FIGI и свечами, и gRPC-стрим стакана.
+#
+# Почему искали сутки: TinkoffClient ловит ЛЮБУЮ ошибку транспорта httpx и
+# докладывает «сеть или таймаут — запрос не дошёл». Формально верно, по сути
+# уводит в сторону: 03.08 токен перевыпускали четыре часа, а дело было в
+# доверии к сертификату. Само разделение вердиктов в probe() надо уточнить
+# отдельно: TLS — это не «сеть».
+#
+# curl с -k здесь не беспечность, а неизбежность: gu-st.ru сам предъявляет
+# сертификат Минцифры, т.е. тот самый корень, который мы только собираемся
+# установить — курица и яйцо. Поэтому доверие проверяется после скачивания
+# и ИНАЧЕ: собранный файл обязан оказаться самоподписанным корнем именно
+# Минцифры, иначе сборка падает. В лог печатается sha256 — сверяйте его
+# между деплоями: тихая смена отпечатка значит подмену файла на источнике.
+RUN set -eu; \
+    cd /usr/local/share/ca-certificates; \
+    curl -fsSLk -o russian_trusted_root_ca.crt \
+        https://gu-st.ru/content/Other/doc/russian_trusted_root_ca.cer; \
+    curl -fsSLk -o russian_trusted_sub_ca.crt \
+        https://gu-st.ru/content/Other/doc/russian_trusted_sub_ca.cer; \
+    python -c "import re, ssl, hashlib, sys; p='/usr/local/share/ca-certificates/russian_trusted_root_ca.crt'; raw=open(p).read(); der=ssl.PEM_cert_to_DER_cert(raw); txt=[x.decode() for x in re.findall(rb'[ -~]{6,}', der)]; print('Корень:', [x for x in txt if 'Russian' in x or 'Ministry' in x]); print('sha256:', hashlib.sha256(der).hexdigest()); sys.exit(0 if any('Russian Trusted Root CA' in x for x in txt) else 1)" \
+        || { echo 'СБОРКА ОСТАНОВЛЕНА: с gu-st.ru пришёл не корень Минцифры.'; head -c 300 russian_trusted_root_ca.crt; exit 1; }; \
+    update-ca-certificates; \
+    python -c "import socket, ssl; ssl.create_default_context().wrap_socket(socket.create_connection(('invest-public-api.tinkoff.ru', 443), 10), server_hostname='invest-public-api.tinkoff.ru'); print('TLS до Tinkoff на сборке: OK')" \
+        || echo 'ПРЕДУПРЕЖДЕНИЕ: проверка TLS на сборке не прошла (сеть сборщика?). Корень установлен, смотри /api/stream/health после деплоя.'
+
+# gRPC НЕ смотрит в системные корни — у него свой встроенный список, вшитый в
+# колёсо grpcio. Без этой переменной установка корня выше починила бы только
+# REST: /api/health/figi стал бы зелёным, а стрим продолжал бы молча не
+# подключаться — ровно та же асимметрия «один путь чинишь, второй мёртв»,
+# что только что была с чисткой токена. Два раза на одни грабли не наступаем.
+ENV GRPC_DEFAULT_SSL_ROOTS_FILE_PATH=/etc/ssl/certs/ca-certificates.crt
 
 # ─── torch: ОТДЕЛЬНЫМ шагом и с --index-url, а не --extra-index-url ───────────
 #
