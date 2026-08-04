@@ -147,3 +147,21 @@ def test_relaxation_happens_only_after_an_empty_answer():
     assert figi == "BBG004730N88"
     assert len(bodies) == 2
     assert "apiTradeAvailableFlag" not in bodies[1]
+
+
+def test_settings_uses_the_very_same_cleaner():
+    """
+    Главный тест всего коммита: токен чистится ОДИНАКОВО на двух путях.
+
+    Проверка по ИСХОДНИКУ, а не по импорту, сознательно: config.settings тянет
+    десятки переменных окружения и dotenv, и перезагружать его внутри теста
+    значит менять глобальное состояние под остальными 943 тестами.
+    В этом репозитории такая проверка уже принята (см. test_volume_events).
+    """
+    src = (ROOT / "config" / "settings.py").read_text(encoding="utf-8")
+    assert "from config.token import clean_token" in src, \
+        "конфиг не берёт общую чистку"
+    assert 'clean_token(os.getenv("TINKOFF_TOKEN"' in src, \
+        "токен в конфиге всё ещё чистится голым .strip()"
+    assert '.strip()' not in src.split("TINKOFF_TOKEN")[1][:80], \
+        "рядом с TINKOFF_TOKEN остался старый .strip()"

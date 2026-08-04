@@ -16,6 +16,13 @@ from typing import Optional
 
 import httpx
 
+# Чистка токена живёт В НЕЙТРАЛЬНОМ модуле, а не здесь. Причина не в красоте:
+# токен уходит в сеть ДВУМЯ независимыми путями — REST отсюда и gRPC из
+# MarketStream, который берёт значение прямо из config.settings. Пока функция
+# лежала здесь, она чинила только первый путь, и значение в кавычках давало
+# самую неприятную картину: health зелёный, реалтайм мёртв.
+from config.token import clean_token
+
 logger = logging.getLogger(__name__)
 
 # Окно запроса сделок у Tinkoff. GetLastTrades отдаёт ВСЕ сделки за период,
@@ -51,23 +58,10 @@ _FIND = "tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument
 SHARE_KIND = "INSTRUMENT_TYPE_SHARE"
 
 
-def _clean_token(token: Optional[str]) -> str:
-    r"""
-    Снять с токена мусор, который добавляет ОКРУЖЕНИЕ, а не его значение: перевод
-    строки в конце (Coolify и консоль часто так и хранят), пробелы от копирования,
-    обрамляющие кавычки.
-
-    03.08 прод четыре часа стоял с live 0 из 48, владелец перевыпустил токен — не
-    помогло. Ровно этот симптом даёт хвост `\n`: заголовок `Authorization: Bearer
-    t.xxx\n` Tinkoff отвергает как невалидный на КАЖДОМ запросе, перевыпуск кладёт
-    новое значение в то же хранилище с тем же хвостом, и 401 повторяется. Мусор
-    добавляет (точнее — не снимает) наш код, поэтому снимать его обязан код, и в
-    ЕДИНСТВЕННОМ месте — иначе один путь чинишь, другой нет.
-    """
-    t = (token or "").strip()
-    if len(t) >= 2 and t[0] == t[-1] and t[0] in ("'", '"'):
-        t = t[1:-1].strip()
-    return t
+# Имя сохранено псевдонимом: на него ссылаются тесты, а ломать имена ради
+# переезда функции незачем. Реализация теперь ровно ОДНА на весь проект,
+# и тест сторожит именно тождество, а не схожесть поведения.
+_clean_token = clean_token
 
 
 def _is_share(inst: dict) -> bool:
@@ -89,8 +83,13 @@ def _pick_share(instruments: list, ticker: str,
     Точное совпадение тикера — тот же ключ, которым ловилась подмена. Когда
     instrumentKind в запросе снят (`require_share=True`), дополнительно требуем
     тип «акция»: сервер уже не отфильтровал за нас. Если совпадений несколько
-    (одна бумага на разных бордах), предпочитаем торгуемую по API и московский
-    борд TQ*.
+    ПОРЯДОК ПРЕДПОЧТЕНИЙ, если совпадений несколько: сначала московский борд
+    TQ*, и только потом apiTradeAvailableFlag. Ключ был расставлен наоборот, и
+    при reverse=True флаг перевешивал борд: внебиржевая бумага с флагом
+    обходила TQBR без флага. Мы торгуем Мосбиржу, и чужой инструмент даст
+    свои свечи и свой стакан — ровно та же тихая подмена, что и HYDR с
+    данными FEES, только не в таблице, а в порядке сортировки. Флаг не
+    отменён — он решает внутри одного борда.
     """
     tk = ticker.upper()
     cands = [i for i in (instruments or [])
@@ -99,8 +98,8 @@ def _pick_share(instruments: list, ticker: str,
     if not cands:
         return None
     cands.sort(
-        key=lambda i: (bool(i.get("apiTradeAvailableFlag")),
-                       str(i.get("classCode") or "").upper().startswith("TQ")),
+        key=lambda i: (str(i.get("classCode") or "").upper().startswith("TQ"),
+                       bool(i.get("apiTradeAvailableFlag"))),
         reverse=True)
     return cands[0]
 
@@ -111,7 +110,7 @@ class TinkoffClient:
     def __init__(self, token: str = None):
         # Нормализуем ЗДЕСЬ, до сборки заголовка: хвост `\n` или кавычки от
         # окружения давали Bearer, который Tinkoff отвергал на каждом запросе.
-        self.token = _clean_token(token or os.getenv("TINKOFF_TOKEN", ""))
+        self.token = clean_token(token or os.getenv("TINKOFF_TOKEN", ""))
         self.headers = {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
