@@ -1,0 +1,74 @@
+name: patch-card
+
+# Применяет точечный патч к большим файлам и сам же убирает скрипт.
+# Перепечатывать файл целиком ради правки в двадцать строк нельзя:
+# так уже дважды приезжал обрезанный файл.
+
+on:
+  push:
+    branches: [feature/ticker-card]
+    paths: ['scripts/_patch_card_bars.py']
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/ticker-card
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Патч
+        run: python scripts/_patch_card_bars.py
+
+      - name: Зависимости
+        run: pip install pytest httpx==0.27.0
+
+      - name: pytest
+        id: run
+        run: |
+          set +e
+          python -m pytest -q -rA \
+            tests/test_volume_events.py \
+            tests/test_figi_failure_reason.py \
+            tests/test_token_and_board.py \
+            tests/test_card.py > out.txt 2>&1
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+          tail -40 out.txt
+
+      - name: Коммит
+        if: steps.run.outputs.code == '0'
+        run: |
+          git config user.name "modex-bot"
+          git config user.email "bot@modex.local"
+          git rm -q --cached scripts/_patch_card_bars.py
+          rm -f scripts/_patch_card_bars.py
+          git add src/analysis/card.py tests/test_card.py
+          git commit -m "Карточка понимает бар живого потока (open/high/low/close/volume)"
+          git push origin HEAD:feature/ticker-card
+
+      - name: Отчёт в PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo '### патч карточки: формат бара'
+            echo '```'
+            tail -c 20000 out.txt
+            echo '```'
+          } > comment.md
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+          gh pr comment 4 --body-file comment.md
+
+      - name: Итог
+        run: exit ${{ steps.run.outputs.code }}
