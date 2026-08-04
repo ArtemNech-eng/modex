@@ -61,7 +61,10 @@ RUN set -eu; \
 # REST: /api/health/figi стал бы зелёным, а стрим продолжал бы молча не
 # подключаться — ровно та же асимметрия «один путь чинишь, второй мёртв»,
 # что только что была с чисткой токена. Два раза на одни грабли не наступаем.
+#
+# SSL_CERT_FILE — для всего остального, что ходит через OpenSSL напрямую.
 ENV GRPC_DEFAULT_SSL_ROOTS_FILE_PATH=/etc/ssl/certs/ca-certificates.crt
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
 # ─── torch: ОТДЕЛЬНЫМ шагом и с --index-url, а не --extra-index-url ───────────
 #
@@ -101,6 +104,42 @@ RUN if pip list 2>/dev/null | grep -qiE '^(nvidia-|triton[[:space:]])'; then \
         pip list | grep -iE '^(nvidia-|triton[[:space:]])'; \
         exit 1; \
     fi
+
+# ─── ТОТ ЖЕ корень — ещё и в бандл certifi ─────────────────────────────
+#
+# Урок, полученный на живом проде через десять минут после предыдущего
+# деплоя. Всё было установлено правильно:
+#
+#     /usr/local/share/ca-certificates/russian_trusted_root_ca.crt   2088 байт
+#     /etc/ssl/certs/ca-certificates.crt                           229155 байт
+#     GRPC_DEFAULT_SSL_ROOTS_FILE_PATH                             выставлен
+#
+# и httpx ВСЁ РАВНО падал с CERTIFICATE_VERIFY_FAILED. Причина: httpx не
+# смотрит в /etc/ssl/certs вообще — он проверяет цепочку по СВОЕМУ бандлу
+# certifi в site-packages. Системная установка лечит curl, openssl и gRPC,
+# но не клиент, которым мы ходим за FIGI и свечами.
+#
+# Итого три НЕЗАВИСИМЫХ хранилища доверия в одном контейнере:
+#
+#     системное  /etc/ssl/certs      -> curl, openssl, healthcheck
+#     grpcio     своё, вшитое       -> стрим стакана (лечится ENV выше)
+#     certifi    site-packages       -> httpx: FIGI, свечи, сделки
+#
+# Починенное одно из трёх даёт самый коварный исход: часть проверок зелёные,
+# данные мёртвые. Поэтому заливаем во все три.
+#
+# Шаг стоит ПОСЛЕ requirements.txt: до этого момента certifi в образе нет,
+# он приходит зависимостью httpx. Заканчивается боевой проверкой: настоящий
+# запрос к FindInstrument. Ожидаемый ответ — 401: токена на сборке нет, значит
+# сеть, TLS и HTTP работают целиком. Проверка НЕ валит сборку: у сборщика
+# может не быть сети до биржи, и деплой из-за диагностики ломаться не должен.
+RUN set -eu; \
+    CB="$(python -c 'import certifi; print(certifi.where())')"; \
+    echo "бандл certifi: $CB"; \
+    cat /usr/local/share/ca-certificates/russian_trusted_root_ca.crt \
+        /usr/local/share/ca-certificates/russian_trusted_sub_ca.crt >> "$CB"; \
+    python -c "import httpx; r = httpx.post('https://invest-public-api.tinkoff.ru/rest/tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument', json={'query': 'SBER'}, timeout=15); print('REST до Tinkoff на сборке, код:', r.status_code)" \
+        || echo 'ПРЕДУПРЕЖДЕНИЕ: запрос к Tinkoff на сборке не прошёл. Смотри /api/stream/health после деплоя.'
 
 # Код приложения
 COPY . .
