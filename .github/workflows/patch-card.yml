@@ -64,13 +64,15 @@ jobs:
         run: |
           git config user.name modex-bot
           git config user.email bot@modex.local
-          git add src/analysis/card.py tests/test_card.py src/api/main.py
+          git add src/analysis/card.py tests/test_card.py src/api/main.py \
+                  src/analysis/volume_events.py tests/test_volume_events.py \
+                  src/collector/stream.py main.py
           git rm -q scripts/_patch_card_*.py
           if git diff --cached --quiet; then
             echo "нечего коммитить"
             exit 0
           fi
-          git commit -m "Патч карточки применён"
+          git commit -m "Патч применён"
           git push origin HEAD:feature/ticker-card
 
       - name: Итог
