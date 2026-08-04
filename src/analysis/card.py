@@ -73,8 +73,35 @@ def _in_atr(distance, atr):
     return round(distance / atr, 2)
 
 
+def _bar(b: dict) -> dict:
+    """
+    Привести минутную запись к коротким ключам o/h/l/c/v.
+
+    В системе живут ДВА вида минутной записи, и это не неряшливость:
+
+      • короткий — {"ts", "o", "h", "l", "c", "v"};
+      • длинный — {"ts", "open", "high", "low", "close", "volume"},
+        именно он лежит в CURRENT.minutes и его ждёт timeframes.bars.
+
+    Переименовать длинный вид в потоке значило бы тронуть сборку баров
+    в 5/15/30 минут и два работающих сканера ради одного читателя.
+
+    Почему не просто b.get("o") or b.get("open"): при отсутствии ключа
+    получились бы нули, и карточка отдала бы правдоподобный ответ с
+    нулевым ATR вместо отказа. Молчаливо неверное число опаснее
+    пустого поля: по пустому полю никто не торгует.
+    """
+    if not isinstance(b, dict):
+        return {}
+    if "c" in b or "o" in b:
+        return b
+    return {"ts": b.get("ts"), "o": b.get("open"), "h": b.get("high"),
+            "l": b.get("low"), "c": b.get("close"), "v": b.get("volume")}
+
+
 def _series(bars: list) -> tuple:
     """Разложить бары в параллельные списки: так их ждёт intraday."""
+    bars = [_bar(b) for b in (bars or [])]
     o = [_f(b.get("o")) for b in bars]
     h = [_f(b.get("h")) for b in bars]
     l = [_f(b.get("l")) for b in bars]

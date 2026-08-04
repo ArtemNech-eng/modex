@@ -249,3 +249,32 @@ def test_phase_and_day_progress_are_present_for_the_reader():
     card = C.build("SBER", bars=_bars(), minute_of_day=810, weekday=1)
     assert card["phase"] == "main"
     assert 0.0 <= card["day_progress"] <= 1.0
+
+
+def test_bars_of_the_live_stream_are_understood():
+    """
+    Запись из CURRENT.minutes должна давать то же, что короткая.
+
+    Стережёт расхождение, найденное 04.08: поток кладёт в minutes
+    open/high/low/close/volume, а карточка читала o/h/l/c/v. На продакшне
+    это не упало бы, а тихо отдало нулевой ATR и нулевой VWAP — то есть
+    числа, которым нельзя верить, вместо отказа.
+    """
+    short = _bars(30)
+    live = [{"ts": b["ts"], "open": b["o"], "high": b["h"], "low": b["l"],
+             "close": b["c"], "volume": b["v"]} for b in short]
+
+    from_short = C.build("SBER", bars=short, minute_of_day=810, weekday=1,
+                         min_step=0.01)
+    from_live = C.build("SBER", bars=live, minute_of_day=810, weekday=1,
+                        min_step=0.01)
+
+    assert from_short["price"] == from_live["price"]
+    assert from_short["geometry"]["atr"] == from_live["geometry"]["atr"]
+    assert from_short["structure"] == from_live["structure"]
+
+    # Главное: числа не нулевые. Иначе равенство выше означало бы лишь
+    # то, что оба пути одинаково ничего не посчитали.
+    assert from_live["geometry"]["atr"] > 0
+    assert from_live["price"]["vwap"] > 0
+    assert from_live["price"]["last"] == short[-1]["c"]
