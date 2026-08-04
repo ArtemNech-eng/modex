@@ -19,23 +19,19 @@ jobs:
 
       - name: Выдержки
         run: |
-          F=src/api/main.py
           S=src/collector/stream.py
           {
-            echo '## main.py 460-500 — свечи из потока'
-            sed -n '460,500p' "$F"
+            echo '## stream.py 175,205 — сборка минутного бара'
+            sed -n '175,205p' "$S"
             echo
-            echo '## main.py 973,1045 — сканер объёма'
-            sed -n '973,1045p' "$F"
+            echo '## stream.py 765,800 — что кладётся в minutes'
+            sed -n '765,800p' "$S"
             echo
-            echo '## main.py 1112,1150 — live по тикеру'
-            sed -n '1112,1150p' "$F"
+            echo '## stream.py 355,400 — объявление состояния'
+            sed -n '355,400p' "$S"
             echo
-            echo '## main.py 580,600 — начало сводки'
-            sed -n '580,600p' "$F"
-            echo
-            echo '## stream.py — где рождаются minutes/lots/steps/atr'
-            grep -n 'minutes\|self.lots\|self.steps\|self.atr\|self.tape\|self.levels\|self.ticks\|def bars\|open\b' "$S" | head -60
+            echo '## card.py — какие ключи бара ждёт карточка'
+            grep -n 'def _series' -A 14 src/analysis/card.py
           } > body.txt
           cat body.txt
 
@@ -45,9 +41,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           {
-            echo '### разведка 2: формат баров и соседние маршруты'
+            echo '### разведка 3: ключи минутной записи'
             echo '```python'
-            tail -c 55000 body.txt
+            tail -c 40000 body.txt
             echo '```'
           } > comment.md
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
