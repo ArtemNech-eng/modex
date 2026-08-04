@@ -104,6 +104,51 @@ def _pick_share(instruments: list, ticker: str,
     return cands[0]
 
 
+# Отказ проверки сертификата — НЕ сетевая ошибка, и это не придирка к словам.
+#
+# 03.08 прод стоял четыре часа, утром 04.08 — ещё три, и оба раза вердикт был
+# один: «сеть или таймаут до Tinkoff — запрос не дошёл». По нему перевыпускали
+# токен, проверяли фаервол и egress. Измерения в живом контейнере показали
+# совсем другое:
+#
+#     getent hosts invest-public-api.tinkoff.ru -> 178.130.128.33   DNS жив
+#     socket.create_connection((..., 443), 10)  -> TCP OK           сеть жива
+#     httpx.post(...)                           -> CERTIFICATE_VERIFY_FAILED
+#
+# Пакеты ходили, соединение открывалось, отвергала нас СВОЯ ЖЕ проверка TLS:
+# в образе python:3.11-slim нет корня Минцифры, которым подписан *.tinkoff.ru
+# (цепочка: лист *.tinkoff.ru <- Russian Trusted Sub CA <- The Ministry of
+# Digital Development and Communications). Вердикт называл слой, где всё было
+# исправно, и умалчивал о единственном слое, где была поломка.
+#
+# Отдельная тонкость, из-за которой одной подсказки мало: хранилищ доверия в
+# контейнере ТРИ, и они независимы. Системное /etc/ssl/certs обслуживает curl,
+# openssl и healthcheck; бандл certifi в site-packages — httpx, то есть весь
+# наш REST за FIGI, свечами и стаканом; grpcio носит свой вшитый список и
+# слушает только GRPC_DEFAULT_SSL_ROOTS_FILE_PATH. Утром 04.08 корень положили
+# в системное хранилище и в gRPC — и httpx продолжал падать при зелёном curl.
+# Поэтому подсказка перечисляет все три места: починить два из трёх означает
+# получить самый дорогой исход — часть проверок зелёные, данных нет.
+TLS_MARK = "CERTIFICATE_VERIFY_FAILED"
+
+TLS_VERDICT = ("сертификат не проверился: нет корня Минцифры. Сеть и TCP исправны, "
+               "запрос отвергает локальная проверка TLS. Корень нужен в ТРЁХ местах: "
+               "системный бандл (curl, healthcheck), certifi (httpx — FIGI, свечи, "
+               "стакан) и GRPC_DEFAULT_SSL_ROOTS_FILE_PATH (стрим)")
+
+
+def _transport_reason(e: Exception) -> str:
+    # Причина отказа транспорта, с РАЗДЕЛЕНИЕМ проверки сертификата и сети.
+    # Текст исключения сохраняется в квадратных скобках: вердикт объясняет, что
+    # делать, а исходная строка нужна, когда причина окажется четвёртой,
+    # непредусмотренной. Ничего не выбрасываем — именно потерянная подробность
+    # и стоила двух простоев.
+    text = "%s: %s" % (type(e).__name__, str(e)[:160])
+    if TLS_MARK in str(e):
+        return TLS_VERDICT + " [" + text + "]"
+    return text
+
+
 class TinkoffClient:
     """Клиент Tinkoff Invest REST API."""
 
@@ -146,7 +191,11 @@ class TinkoffClient:
                 return resp.json()
         except Exception as e:
             logger.warning(f"Tinkoff API error {endpoint}: {e}")
-            self._fail(f"{type(e).__name__}: {str(e)[:160]}")
+            # Раньше здесь стояло f"{type(e).__name__}: ..." — наружу уходило
+            # «ConnectError», и выше по стеку это превращалось в «сеть». Теперь
+            # причина разбирается до записи, потому что читать её будет агент,
+            # у которого нет доступа к логу.
+            self._fail(_transport_reason(e))
             return None
 
     async def _resolve(self, ticker: str) -> Optional[dict]:
@@ -263,7 +312,15 @@ class TinkoffClient:
             elif st:
                 verdict = f"Tinkoff ответил HTTP {st}"
             else:
-                verdict = "сеть или таймаут до Tinkoff — запрос не дошёл"
+                # Статуса нет — значит ответ не пришёл. Но причин этому две, и
+                # они лечатся противоположными действиями: сеть чинит хостер, а
+                # доверие к сертификату — мы сами, в образе. Различаем по тексту
+                # ошибки, который теперь доходит сюда неискажённым.
+                err = str(full.get("error") or "")
+                if TLS_MARK in err or TLS_VERDICT[:24] in err:
+                    verdict = TLS_VERDICT
+                else:
+                    verdict = "сеть или таймаут до Tinkoff — запрос не дошёл"
         elif full.get("count"):
             verdict = "исправно: API отвечает, инструменты приходят"
         elif no_flag.get("count"):

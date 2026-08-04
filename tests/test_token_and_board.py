@@ -165,3 +165,90 @@ def test_settings_uses_the_very_same_cleaner():
         "токен в конфиге всё ещё чистится голым .strip()"
     assert '.strip()' not in src.split("TINKOFF_TOKEN")[1][:80], \
         "рядом с TINKOFF_TOKEN остался старый .strip()"
+
+
+# ─── Вердикт TLS отделён от вердикта «сеть» ───────────────────────────────────
+#
+# Регрессия на два реальных простоя: 03.08 (четыре часа) и утро 04.08. Оба раза
+# сеть была исправна — DNS отвечал, TCP до 178.130.128.33:443 открывался, — а
+# рукопожатие отвергала локальная проверка сертификата, потому что в образе не
+# было корня Минцифры. Вердикт при этом говорил «сеть или таймаут», и по нему
+# перевыпускали токен. Эти тесты сторожат, чтобы диагноз больше не путал слой,
+# где всё исправно, со слоем, где поломка.
+
+
+def _run_tls(coro):
+    import asyncio
+    return asyncio.get_event_loop().run_until_complete(coro)
+
+
+def _client_failing_with(err):
+    # Клиент, у которого каждый запрос падает с заданной причиной. Подменяем
+    # _post, а не httpx: проверяем разбор причины, а не работу библиотеки.
+    from src.collector.tinkoff_client import TinkoffClient
+
+    c = TinkoffClient("t0ken")
+
+    async def _post(endpoint, body):
+        c._fail(err)
+        return None
+
+    c._post = _post
+    return c
+
+
+def test_certificate_failure_is_not_called_network():
+    import httpx
+    from src.collector.tinkoff_client import _transport_reason
+
+    e = httpx.ConnectError(
+        "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+        "self-signed certificate in certificate chain (_ssl.c:1016)")
+    reason = _transport_reason(e)
+
+    assert "сертификат" in reason
+    assert "сеть" not in reason
+    # Исходный текст исключения сохраняется: он понадобится, когда причина
+    # окажется не из известных трёх.
+    assert "CERTIFICATE_VERIFY_FAILED" in reason
+
+
+def test_real_network_failure_is_still_called_network():
+    import httpx
+    from src.collector.tinkoff_client import _transport_reason
+
+    reason = _transport_reason(httpx.ConnectTimeout("timed out"))
+
+    assert "сертификат" not in reason
+    assert "ConnectTimeout" in reason
+
+
+def test_probe_names_the_certificate_and_the_three_stores():
+    reason = ("сертификат не проверился: нет корня Минцифры [ConnectError: "
+              "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed]")
+    out = _run_tls(_client_failing_with(reason).probe("SBER"))
+    verdict = out["verdict"]
+
+    assert "сертификат" in verdict
+    # Подсказка обязана перечислить все три хранилища доверия. Утром 04.08
+    # починили два из трёх — системное и gRPC — и httpx продолжал падать при
+    # зелёном curl. Названное неполно лечится неполно.
+    assert "certifi" in verdict
+    assert "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH" in verdict
+
+
+def test_probe_still_says_network_when_the_request_really_never_left():
+    out = _run_tls(_client_failing_with("ConnectTimeout: timed out").probe("SBER"))
+
+    assert "сеть" in out["verdict"]
+    assert "сертификат" not in out["verdict"]
+
+
+def test_the_two_verdicts_are_different_texts():
+    # Смысл всей правки: два диагноза требуют разных действий, поэтому они
+    # обязаны звучать по-разному. Раньше оба звучали как «сеть».
+    tls = _run_tls(_client_failing_with(
+        "ConnectError: [SSL: CERTIFICATE_VERIFY_FAILED] verify failed").probe("SBER"))
+    net = _run_tls(_client_failing_with("ConnectTimeout: timed out").probe("SBER"))
+
+    assert tls["verdict"] != net["verdict"]
