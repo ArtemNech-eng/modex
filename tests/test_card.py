@@ -337,3 +337,20 @@ def test_book_aggregate_says_it_has_no_levels():
     """Читатель не должен искать здесь цены заявок: их не собирают."""
     bk = C.book_minute_block(_book_min(), lot=1)
     assert "заявок по отдельным ценам здесь нет" in bk["note"]
+
+
+def test_card_routes_exist_and_use_the_minute_aggregate():
+    """Маршруты есть, и стакан в них идёт через минутную агрегацию."""
+    import pathlib
+    src = pathlib.Path("src/api/main.py").read_text(encoding="utf-8")
+    assert '"/api/card/{ticker}"' in src
+    assert '"/api/cards"' in src
+    assert "book_minute_block" in src
+
+
+def test_card_route_names_three_reasons_for_silence():
+    import pathlib
+    src = pathlib.Path("src/api/main.py").read_text(encoding="utf-8")
+    assert "стрим выключен" in src
+    assert "НЕИСПРАВНОСТЬ: " in src
+    assert "резолв FIGI занимает до минуты" in src
