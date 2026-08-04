@@ -21,6 +21,10 @@ GAZP ×10, у UGLD ×1000. Профиль не упал бы и ошибки н�
 value в рублях, то есть контрольная сумма приезжает вместе с данными.
 `turnover_error` сравнивает наш пересчёт с ним и даёт число, а не веру.
 
+А В БАЗУ ИДУТ ТОЛЬКО КЛЮЧИ СТРИМА (`stream_rows`). Служебные поля сверки
+нужны ДО записи и только для неё: дозаливка, кладущая лишние ключи,
+зависела бы от того, как именно merge_candle_minutes разбирает строку.
+
 СЕТИ И БАЗЫ ЗДЕСЬ НЕТ — только сборка адреса и чистые преобразования,
 чтобы всю арифметику можно было проверить тестом без рынка и без ключей.
 """
@@ -33,6 +37,9 @@ ISS = ("https://iss.moex.com/iss/engines/stock/markets/shares/boards/"
 #  у ISS нигде не обещан, а перепутанные value и volume — ровно та же
 #  молчаливая ошибка на лотность, только хуже.
 NEEDED = ("begin", "open", "close", "high", "low", "volume", "value")
+
+#  Ровно то, что кладёт в базу стрим. Больше ничего.
+STREAM_KEYS = ("ts", "open", "high", "low", "close", "volume")
 
 
 def candles_url(ticker: str, day: str, board: str = "TQBR") -> str:
@@ -158,3 +165,20 @@ def turnover_error(bars: list, lot: int = 1) -> Optional[float]:
     if theirs <= 0:
         return None
     return abs(ours - theirs) / theirs
+
+
+def stream_rows(bars: list) -> list:
+    """
+    Строки для базы: ровно те ключи, что кладёт стрим, и ни одного больше.
+
+    Служебные поля (`shares`, `value_rub`, `source`) нужны только для сверки
+    единиц ДО записи. Если отправить их в merge_candle_minutes, дозаливка
+    станет зависеть от того, как запись разбирает строку — от того, что
+    здесь никто не проверял и что поменять могут без меня.
+    """
+    out = []
+    for b in bars or ():
+        if not b or not b.get("ts"):
+            continue
+        out.append({k: b.get(k) for k in STREAM_KEYS})
+    return out
