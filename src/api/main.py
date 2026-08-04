@@ -1150,6 +1150,7 @@ async def get_volume_scan(steps: Optional[str] = None, limit: int = 40):
             "rates_by_step": rates_by_step(found, len(mins)),
             "baseline": "время суток" if profiles else "скользящая",
             "profiles_ready": len(profiles),
+            "profile_note": getattr(CURRENT, "profile_note", None),
             "floor_rub": FLOOR_RUB,
             "below_floor": below_floor(mins, lots=lots),
             "warming_up": warming_up(mins),
