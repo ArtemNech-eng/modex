@@ -1,0 +1,91 @@
+name: patch-card
+
+# Механизм точечных правок в больших файлах: в ветку кладётся
+# идемпотентный скрипт, здесь он применяется и САМ СЕБЯ УДАЛЯЕТ.
+# Коммит происходит ТОЛЬКО при зелёных тестах — красный патч не
+# оставляет следа в коде, только отчёт в PR.
+#
+# ДВА ПРАВИЛА, КУПЛЕННЫЕ ОПЫТОМ:
+#   — список сюит здесь должен совпадать с tests.yml, иначе патч
+#     может заломить то, что здесь никто не запускает;
+#   — файл, не попавший в git add, будет молча выброшен при зелёных
+#     тестах. Добавляешь новый файл — добавь его и сюда.
+
+on:
+  push:
+    branches: [feature/ticker-card]
+    paths: ['scripts/_patch_card_*.py']
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/ticker-card
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Патч
+        run: |
+          for f in scripts/_patch_card_*.py; do
+            echo "== $f"
+            python "$f"
+          done
+
+      - name: Зависимости
+        run: pip install pytest httpx==0.27.0
+
+      - name: pytest
+        id: run
+        run: |
+          set +e
+          python -m pytest -q -rA \
+            tests/test_volume_events.py \
+            tests/test_figi_failure_reason.py \
+            tests/test_token_and_board.py \
+            tests/test_card.py \
+            tests/test_iss_minutes.py \
+            tests/test_iss_write.py \
+            tests/test_api_profile_note.py > out.txt 2>&1
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+          {
+            echo '### патч карточки'
+            echo '```'
+            tail -c 45000 out.txt
+            echo '```'
+          } > comment.md
+
+      - name: Отчёт в PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr comment 4 --body-file comment.md
+
+      - name: Коммит только при зелёных тестах
+        if: steps.run.outputs.code == '0'
+        run: |
+          git config user.name modex-bot
+          git config user.email bot@modex.local
+          git add src/analysis/card.py tests/test_card.py src/api/main.py \
+                  src/analysis/volume_events.py tests/test_volume_events.py \
+                  src/collector/stream.py main.py \
+                  src/collector/iss_minutes.py tests/test_iss_minutes.py \
+                  tests/test_iss_write.py tests/test_api_profile_note.py \
+                  scripts/backfill_iss_minutes.py
+          git rm -q scripts/_patch_card_*.py
+          if git diff --cached --quiet; then
+            echo "нечего коммитить"
+            exit 0
+          fi
+          git commit -m "Патч применён"
+          git push origin HEAD:feature/ticker-card
+
+      - name: Итог
+        run: exit ${{ steps.run.outputs.code }}

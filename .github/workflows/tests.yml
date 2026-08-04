@@ -35,7 +35,11 @@ jobs:
           python -m pytest -q -rA \
             tests/test_volume_events.py \
             tests/test_figi_failure_reason.py \
-            tests/test_token_and_board.py > out.txt 2>&1
+            tests/test_token_and_board.py \
+            tests/test_card.py \
+            tests/test_iss_minutes.py \
+            tests/test_iss_write.py \
+            tests/test_api_profile_note.py > out.txt 2>&1
           echo "code=$?" >> "$GITHUB_OUTPUT"
           cat out.txt
 
@@ -47,7 +51,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           {
-            echo '### pytest: сканер объёма, токен/FIGI и выбор борда'
+            echo '### pytest: сканер объёма, токен/FIGI, выбор борда, карточка, минутки ISS, запись в базу и причина пустого профиля'
             echo '```'
             tail -c 55000 out.txt
             echo '```'

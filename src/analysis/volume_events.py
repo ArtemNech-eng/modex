@@ -318,10 +318,21 @@ def detect_step(rows: list, step: int, lot: int = 1,
         why = (f"оборот {_short(now)} после тишины — норма {_short(base)}, "
                f"кратность считать не по чему"
                if thin else f"оборот в {mult:.1f} раза выше нормы ({source})")
+        # КРАТНОСТЬ ПРОПАДАЕТ ЦЕЛИКОМ, А НЕ ОГОВАРИВАЕТСЯ. Текст говорил
+        # «кратность считать не по чему», а рядом лежало times:30.0 — и 04.08
+        # на экране было ASTR ×30.0 на обороте 11 223 ₽. Кто берёт поля, а
+        # не читает прозу — дашборд, сортировка, агент — видел только
+        # число. Оговорка в соседнем поле — не защита.
+        #
+        # Число не выбрашивается, а ПЕРЕИМЕНОВывается: ×1510 при норме
+        # 856 ₽ — сам по себе признак того, что бумага проснулась из ничего,
+        # и скрывать его совсем значило бы потерять признак.
         out.append(_ev(
             "volume_surge", why,
             step, last, rub=round(now), base_rub=round(base),
-            times=round(mult, 2), base_source=source, base_thin=thin))
+            times=(None if thin else round(mult, 2)),
+            times_vs_thin_base=(round(mult, 2) if thin else None),
+            base_source=source, base_thin=thin))
 
     # 2. УСКОРЕНИЕ ОБЪЁМА — момент, когда он ПОШЁЛ, а не «сегодня много».
     #
@@ -339,7 +350,9 @@ def detect_step(rows: list, step: int, lot: int = 1,
             out.append(_ev(
                 "volume_accelerating", tail_why,
                 step, last, rub=round(now), base_rub=round(base),
-                times=round(mult, 2), bars_growing=gb,
+                times=(None if thin else round(mult, 2)),
+                times_vs_thin_base=(round(mult, 2) if thin else None),
+                bars_growing=gb,
                 series=[round(v) for v in tail], base_source=source,
                 base_thin=thin))
     return out
@@ -373,11 +386,15 @@ def scan(minutes: dict, lots: Optional[dict] = None,
         evs = detect(list(rows or ()), lot=(lots or {}).get(tk) or 1,
                      profile=(profiles or {}).get(tk), steps=steps, p=p)
         if evs:
-            top = max(e.get("times", 0) for e in evs)
+            # СОРТИРОВКА ТОЛЬКО ПО НАСТОЯЩЕЙ КРАТНОСТИ. Раньше верх доски
+            # занимали бумаги с шумом в знаменателе: ASTR ×30.0, RASP ×28.77 —
+            # выше всего, что было на рынке на самом деле.
+            got = [e["times"] for e in evs if e.get("times") is not None]
             out.append({"ticker": tk, "events": evs, "count": len(evs),
-                        "max_times": round(top, 2),
+                        "max_times": round(max(got), 2) if got else None,
+                        "no_multiple": not got,
                         "kinds": sorted({e["kind"] for e in evs})})
-    out.sort(key=lambda x: (-x["max_times"], x["ticker"]))
+    out.sort(key=lambda x: (-(x["max_times"] or 0), x["ticker"]))
     return out
 
 
@@ -437,3 +454,71 @@ def rates(scanned: list, total: int) -> dict:
             per[k] = per.get(k, 0) + 1
     return {k: {"tickers": n, "share": round(n / total, 3)}
             for k, n in sorted(per.items(), key=lambda kv: -kv[1])}
+
+
+def profile_gap(rows_by_day, min_days: int = MIN_DAYS) -> dict:
+    """
+    ПОЧЕМУ профиля нет — числами, а не словами «дней пока мало».
+
+    04.08 в проде: vol_profiles:0 при 240 минутных барах в памяти. По логу
+    нельзя было отличить две разные вещи: история ещё копится (стрим
+    поднялся 01.08, а 01–02.08 — выходные, то есть торговый день в базе
+    всего один) — или строитель молча сломан. Первое требует подождать,
+    второе — починить, и путать их дорого.
+
+    Критерии те же, что у day_profile: выходные не считаются, день короче
+    MIN_BARS_DAY баров не считается. Согласие с настоящим фильтром
+    проверяется тестом ровно на границе: диагностика, которая расходится
+    с тем, что проверяет, хуже отсутствия диагностики.
+    """
+    from datetime import datetime as _dt
+    weekend = short = empty = 0
+    usable = []
+    for day, rows in (rows_by_day or {}).items():
+        n = len(rows or [])
+        try:
+            wd = _dt.strptime(str(day)[:10], "%Y-%m-%d").weekday()
+        except Exception:                                        # noqa: BLE001
+            empty += 1        # ключ дня непонятен — день не считается
+            continue
+        if wd >= 5:
+            weekend += 1
+        elif n == 0:
+            empty += 1
+        elif n < MIN_BARS_DAY:
+            short += 1
+        else:
+            usable.append(str(day)[:10])
+    missing = max(0, min_days - len(usable))
+    return {"days_in_db": len(rows_by_day or {}),
+            "usable_days": len(usable),
+            "need_days": min_days,
+            "missing_days": missing,
+            "weekend_days": weekend,
+            "short_days": short,
+            "empty_days": empty,
+            "min_bars_day": MIN_BARS_DAY,
+            "ready": missing == 0,
+            "days": sorted(usable)}
+
+
+def profile_note(gaps) -> str:
+    """
+    Одна фраза для человека из собранных profile_gap чисел.
+
+    Живёт ЗДЕСЬ, а не в main.py, по двум причинам: её можно проверить
+    тестом без запуска конвейера, и фоновая функция в main.py остаётся
+    короткой — соседний тест смотрит на неё окном в 2500 символов, и
+    раздувшаяся функция его ослепляет. Так упали два прогона 04.08.
+    """
+    if not gaps:
+        return "не построена: минутной истории в базе нет вовсе"
+    g = max(gaps, key=lambda x: x.get("usable_days", 0))
+    return ("не построена: лучшая бумага имеет {u} торговых дней из {n} "
+            "нужных; в базе {d} дней (выходных {w}, коротких {s}, пустых "
+            "{e}), день считается от {b} баров — сканер работает по "
+            "скользящей").format(
+        u=g.get("usable_days", 0), n=g.get("need_days", MIN_DAYS),
+        d=g.get("days_in_db", 0), w=g.get("weekend_days", 0),
+        s=g.get("short_days", 0), e=g.get("empty_days", 0),
+        b=g.get("min_bars_day", MIN_BARS_DAY))
