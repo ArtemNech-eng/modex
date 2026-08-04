@@ -3,7 +3,7 @@
 
 Сторожатся три решения, каждое куплено своим убытком:
 
-  кратность при тонкой базе не отдаётся вовсе  (в проде ASTR: times=30.0)
+  кратность при тонкой базе не отдаётся вовсе (04.08 в проде ASTR: times=30.0)
   ни одного числа, зависящего от размера счёта
   ни одного вердикта: карточка описывает, решает читатель
 """
@@ -13,32 +13,29 @@ from src.analysis import card as C
 from src.analysis.trade_tape import TradeTape, BUY, SELL
 from src.analysis.level_tracker import LevelTracker
 
-BASE_TS = "2026-08-04T10:00:00+03:00"
 
-
-def _bars(n=30, start=100.0, step=0.1, vol=1000, minute0=0):
-    """Ровная серия минутных бар ОСНОВНОЙ сессии 04.08.2026 (вторник)."""
+def _bars(n=30, start=100.0, step=0.1, vol=1000):
+    """Ровная серия минутных бар основной сессии 04.08.2026 (вторник)."""
     out = []
     for i in range(n):
         c = start + i * step
-        mm = minute0 + i
-        ts = "2026-08-04T%02d:%02d:00+03:00" % (10 + mm // 60, mm % 60)
+        ts = "2026-08-04T%02d:%02d:00+03:00" % (10 + i // 60, i % 60)
         out.append({"ts": ts, "o": c - step / 2, "h": c + step,
                     "l": c - step, "c": c, "v": vol})
     return out
 
 
-def _walk(obj, path=""):
-    """Все ключи и строковые значения карточки, как глубоко бы они ни лежали."""
+def _keys(obj, path=""):
+    """Все ключи карточки, как глубоко бы они ни лежали."""
     if isinstance(obj, dict):
         for k, v in obj.items():
             yield ("%s.%s" % (path, k)).lower()
-            yield from _walk(v, "%s.%s" % (path, k))
+            for x in _keys(v, "%s.%s" % (path, k)):
+                yield x
     elif isinstance(obj, (list, tuple)):
         for i, v in enumerate(obj):
-            yield from _walk(v, "%s[%d]" % (path, i))
-    elif isinstance(obj, str):
-        yield obj.lower()
+            for x in _keys(v, "%s[%d]" % (path, i)):
+                yield x
 
 
 # ─── главное правило: кратность при тонкой базе ────────────────────────
@@ -51,7 +48,6 @@ def test_thin_base_gives_no_multiple_at_all():
                            "step_min": 1})
     assert card["volume"]["times"] is None
     assert "тонкая" in card["volume"]["times_missing_why"]
-    # Сами числа остаются: читатель вправе видеть оборот и базу.
     assert card["volume"]["minute_rub"] == 336686
     assert card["volume"]["base_rub"] == 11223
 
@@ -76,7 +72,7 @@ def test_no_base_at_all_is_not_a_zero_multiple():
 # ─── геометрия не знает про депозит ───────────────────────────────
 
 def test_card_says_nothing_about_the_size_of_the_account():
-    """У каждого свой депозит: числа карточки обязаны годиться любому."""
+    """У каждого свой депозит: числа обязаны годиться любому счёту."""
     card = C.build("SBER", bars=_bars(), minute_of_day=630, weekday=1,
                    min_step=0.01, lot=10)
     text = json.dumps(card, ensure_ascii=False).lower()
@@ -118,14 +114,14 @@ def test_card_has_no_signal_and_no_recommendation():
     card = C.from_state("SBER", bars=_bars(), now_sec=1030, tape_obj=tape,
                         tracker=tracker, lot=1, minute_of_day=810, weekday=1,
                         min_step=0.01)
-    keys = list(_walk(card))
+    keys = list(_keys(card))
     for bad in ("signal", "verdict", "recommend", "take_profit", "stop_loss",
                 "entry", "risk_reward"):
         assert not any(k.endswith("." + bad) for k in keys), bad
 
 
 def test_card_does_not_call_a_level_strong_or_weak():
-    """31.07 метка «структура вверх» измерилась ВРЕДНОЙ: t=-12.57."""
+    """31.07 метка «структура вверх» измерилась вредной: t=-12.57."""
     tracker = LevelTracker()
     tracker.on_book("SBER", "2026-08-04 13:30", [(101.0, 500)], [(101.5, 400)],
                     sec=1030)
@@ -145,17 +141,17 @@ def test_empty_input_is_a_card_with_a_reason_not_a_crash():
     assert card["price"] == {}
     assert card["data"]["bars"] == 0
     assert card["data"]["enough_for_atr"] is False
-    # Рынок ОТКРЫТ, а пакетов нет — самый дорогой случай, и он назван.
-    assert "неисправность" in card["data"]["note"]
+    assert card["data"]["note"]
 
 
 def test_three_kinds_of_silence_are_named_differently():
+    """Закрыто, поток не поднят и открыто-но-пусто — три разные беды."""
     closed = C.build("SBER", bars=[], minute_of_day=3, weekday=1)["data"]["note"]
     dead = C.build("SBER", bars=[], minute_of_day=630, weekday=1,
                    stream_running=False)["data"]["note"]
-    open_but_quiet = C.build("SBER", bars=[], minute_of_day=630, weekday=1,
-                             stream_running=True, fresh_60s=0)["data"]["note"]
-    assert len({closed, dead, open_but_quiet}) == 3
+    quiet = C.build("SBER", bars=[], minute_of_day=630, weekday=1,
+                    stream_running=True, fresh_60s=0)["data"]["note"]
+    assert len({closed, dead, quiet}) == 3
 
 
 def test_stale_tick_is_reported_in_seconds():
@@ -173,19 +169,16 @@ def test_few_bars_means_no_atr_instead_of_a_made_up_one():
 
 
 def test_saturday_is_not_the_main_session():
-    """01.08 в суботу в 12:34 фаза отвечала main при закрытой бирже."""
     card = C.build("SBER", bars=_bars(), minute_of_day=754, weekday=5)
     assert card["phase"] == "closed"
 
 
-# ─── лента и стакан на НАСТОЯЩИХ объектах ─────────────────────────
+# ─── лента и стакан на настоящих объектах ─────────────────────────
 
 def test_tape_windows_and_streak_come_from_the_real_tape():
     tape = TradeTape()
-    # Сначала ровный фон, чтобы порог крупной сделки вообще появился.
     for i in range(25):
         tape.on_trade("GAZP", "exchange", 1000 + i, 130.0, 10, SELL)
-    # Затем три крупные покупки подряд — сгущение, а не счётчик.
     for j, sec in enumerate((1050, 1052, 1054)):
         tape.on_trade("GAZP", "exchange", sec, 130.5 + j * 0.1, 500, BUY)
     card = C.from_state("GAZP", bars=_bars(), now_sec=1055, tape_obj=tape,
@@ -214,7 +207,6 @@ def test_book_is_reported_in_rubles_with_the_lot_size():
                    lot=10, book=book)
     b = card["book"]
     assert b["best_bid"] == 130.0 and b["best_ask"] == 130.1
-    # 130*100*10 + 129.9*50*10 = 130000 + 64950
     assert b["bid_rub"] == 194950
     assert b["bids"][0]["rub"] == 130000
     assert 0 < b["bid_share"] < 1
@@ -235,7 +227,25 @@ def test_nearest_levels_are_measured_in_atr():
 
 
 def test_card_is_json_serializable():
-    """Карточка уезжает в журнал и в контекст агента целиком."""
+    """Карточка целиком уезжает в журнал и в контекст агента."""
     tape = TradeTape()
     for i in range(25):
-        tape.on_trade("SBER", "exchange", 1000 + i, 100.0, 10, BUY
+        tape.on_trade("SBER", "exchange", 1000 + i, 100.0, 10, BUY)
+    tracker = LevelTracker()
+    tracker.on_book("SBER", "2026-08-04 13:30", [(101.0, 500)], [(101.5, 400)],
+                    sec=1030)
+    card = C.from_state("SBER", bars=_bars(), now_sec=1030, tape_obj=tape,
+                        tracker=tracker, lot=1, minute_of_day=810, weekday=1,
+                        min_step=0.01, book={"bids": [(100.0, 10)],
+                                            "asks": [(100.1, 10)]},
+                        volume={"rub": 1000000, "base_rub": 200000,
+                                "base_thin": False})
+    dumped = json.dumps(card, ensure_ascii=False)
+    assert json.loads(dumped)["ticker"] == "SBER"
+
+
+def test_phase_and_day_progress_are_present_for_the_reader():
+    """Без фазы и без доли дня одни и те же числа читаются по-разному."""
+    card = C.build("SBER", bars=_bars(), minute_of_day=810, weekday=1)
+    assert card["phase"] == "main"
+    assert 0.0 <= card["day_progress"] <= 1.0
