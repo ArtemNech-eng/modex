@@ -1,9 +1,10 @@
+# ВРЕМЕННЫЙ рабочий инструмент разведки: печатает выдержки из больших
+# файлов в комментарий PR. src/api/main.py — 167 КБ, его нельзя ни читать
+# целиком, ни перепечатывать, а угадывать имена состояния запрещено.
+# УДАЛИТЬ после того, как маршруты карточки будут вшиты и проверены.
 name: inspect
 
-# ВРЕМЕННОЕ задание. Удалить после подключения карточки.
-
-on:
-  pull_request:
+on: pull_request
 
 permissions:
   contents: read
@@ -13,38 +14,38 @@ jobs:
   inspect:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-
     steps:
       - uses: actions/checkout@v4
 
       - name: Выдержки
         run: |
+          M=src/api/main.py
           S=src/collector/stream.py
           {
-            echo '## stream.py 175,205 — сборка минутного бара'
-            sed -n '175,205p' "$S"
+            echo '## где в main.py вообще берётся стакан'
+            grep -n 'bids\|asks\|orderbook\|book_live\|get_orderbook' "$M" | head -40
             echo
-            echo '## stream.py 765,800 — что кладётся в minutes'
-            sed -n '765,800p' "$S"
+            echo '## main.py 563,620 — /api/book-live'
+            sed -n '563,620p' "$M"
             echo
-            echo '## stream.py 355,400 — объявление состояния'
-            sed -n '355,400p' "$S"
+            echo '## main.py 857,907 — /api/micro'
+            sed -n '857,907p' "$M"
             echo
-            echo '## card.py — какие ключи бара ждёт карточка'
-            grep -n 'def _series' -A 14 src/analysis/card.py
-          } > body.txt
-          cat body.txt
+            echo '## stream.py — где хранится стакан в памяти'
+            grep -n 'def book\|self.book\|bids\|asks\|def snapshot' "$S" | head -40
+            echo
+            echo '## book_ticks.py — что отдаёт TickRing'
+            grep -n 'def \|BEST\|bid\|ask' src/analysis/book_ticks.py | head -40
+          } > body.txt 2>&1
+          {
+            echo '### разведка 4: стакан и оборот'
+            echo '```python'
+            head -c 50000 body.txt
+            echo '```'
+          } > comment.md
 
       - name: Отчёт в PR
-        if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          {
-            echo '### разведка 3: ключи минутной записи'
-            echo '```python'
-            tail -c 40000 body.txt
-            echo '```'
-          } > comment.md
-          cat comment.md >> "$GITHUB_STEP_SUMMARY"
           gh pr comment "${{ github.event.pull_request.number }}" --body-file comment.md
