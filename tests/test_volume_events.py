@@ -721,3 +721,83 @@ def test_normal_money_keeps_the_multiple_field():
     got = scan({"REAL": real}, lots={"REAL": 1})
     assert got[0]["max_times"] >= 3
     assert got[0]["no_multiple"] is False
+
+
+from src.analysis.volume_events import (profile_gap, profile_note,  # noqa: E402
+                                        MIN_BARS_DAY)
+
+
+def test_profile_gap_agrees_with_the_real_filter_at_the_boundary():
+    """
+    ГЛАВНОЕ. Диагностика, расходящаяся с настоящим фильтром, хуже
+    её отсутствия: она скажет «готово» при пустом профиле.
+    Проверяется совпадение РОВНО на границе.
+    """
+    days = weekdays(MIN_DAYS)
+    rows = {d: day_rows(d, 100) for d in days}
+    g = profile_gap(rows)
+    assert g["usable_days"] == MIN_DAYS
+    assert g["ready"] is True and g["missing_days"] == 0
+    assert day_profile(rows, lot=1), "профиль строится ровно тогда же"
+
+    fewer = {d: day_rows(d, 100) for d in days[:-1]}
+    g2 = profile_gap(fewer)
+    assert g2["ready"] is False and g2["missing_days"] == 1
+    assert not day_profile(fewer, lot=1), "и не строится ровно тогда же"
+
+
+def test_profile_gap_names_weekends_and_short_days():
+    """Именно это случилось в проде: стрим поднялся в субботу."""
+    rows = {"2026-08-03": day_rows("2026-08-03", 100),            # понедельник
+            "2026-08-04": day_rows("2026-08-04", 100),            # вторник
+            "2026-08-05": day_rows("2026-08-05", 100),            # среда
+            "2026-08-01": day_rows("2026-08-01", 100),            # суббота
+            "2026-08-02": day_rows("2026-08-02", 100),            # воскресенье
+            "2026-07-31": day_rows("2026-07-31", 100, minutes=50)}   # короткий
+    g = profile_gap(rows)
+    assert g["days_in_db"] == 6
+    assert g["weekend_days"] == 2, "выходные названы отдельно"
+    assert g["short_days"] == 1, "короткий день назван отдельно"
+    assert g["usable_days"] == 3
+    assert g["missing_days"] == MIN_DAYS - 3
+    assert g["min_bars_day"] == MIN_BARS_DAY, "порог виден тому, кто читает"
+    assert not day_profile(rows, lot=1)
+
+
+def test_profile_gap_says_when_there_is_nothing_at_all():
+    g = profile_gap({})
+    assert g["days_in_db"] == 0 and g["usable_days"] == 0
+    assert g["ready"] is False and g["missing_days"] == MIN_DAYS
+
+
+def test_unparseable_day_is_not_counted_as_a_trading_day():
+    g = profile_gap({"не-дата": day_rows("2026-08-03", 100)})
+    assert g["usable_days"] == 0 and g["empty_days"] == 1
+
+
+def test_the_note_carries_the_numbers_not_just_words():
+    """«Дней пока мало» звучит одинаково и при поломке строителя."""
+    rows = {"2026-08-03": day_rows("2026-08-03", 100),
+            "2026-08-01": day_rows("2026-08-01", 100)}
+    note = profile_note([profile_gap(rows)])
+    assert "1 торговых дней из %d" % MIN_DAYS in note
+    assert "выходных 1" in note
+    assert str(MIN_BARS_DAY) in note, "порог дня назван"
+
+
+def test_the_note_says_when_there_is_nothing_at_all():
+    assert "нет вовсе" in profile_note([])
+
+
+def test_the_builder_asks_for_the_reason_and_stays_short():
+    """
+    Соседний тест читает РОВНО 2500 символов после начала функции.
+    04.08 два прогона упали именно потому, что добавленные строки
+    вытолкнули sleep(3600) за это окно и тест ОСЛЕП, а не нашёл баг.
+    """
+    m = (ROOT / "main.py").read_text(encoding="utf-8")
+    i = m.index("async def _volume_profiles")
+    body = m[i:i + 2500]
+    assert "profile_gap" in body, "строитель обязан спрашивать причину"
+    assert "profile_note" in body, "и класть её в лог числами"
+    assert "3600" in body, "и оставаться коротким: раз в час видно в окне"

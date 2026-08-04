@@ -879,7 +879,7 @@ async def stream_pipeline():
     # ранние даты. Поэтому day_profile молчит, пока дней меньше MIN_DAYS, и
     # сканер честно помечает, по какой норме посчитано.
     async def _volume_profiles():
-        from src.analysis.volume_events import day_profile, MIN_DAYS
+        from src.analysis.volume_events import day_profile, profile_gap, profile_note, MIN_DAYS
         while True:
             try:
                 today = (datetime.now(timezone.utc) + timedelta(hours=3)
@@ -888,6 +888,7 @@ async def stream_pipeline():
                          - timedelta(days=i)).strftime("%Y-%m-%d")
                         for i in range(1, 31)]        # ПРОШЛЫЕ дни, без сегодня
                 built = 0
+                gaps = []
                 for tk in tickers:
                     per_day = {}
                     for d in days:
@@ -904,11 +905,14 @@ async def stream_pipeline():
                     if prof:
                         stream.vol_profiles[tk] = prof
                         built += 1
+                    else:
+                        gaps.append(profile_gap(per_day, min_days=MIN_DAYS))
                 if built:
                     logger.info(f"Норма объёма по времени суток: {built} бумаг")
                 else:
-                    logger.info("Норма объёма по времени суток: дней пока мало, "
-                                "сканер работает по скользящей")
+                    stream.profile_note = profile_note(gaps)
+                    logger.info("Норма объёма по времени суток %s",
+                                stream.profile_note)
             except Exception as e:                     # noqa: BLE001
                 logger.debug(f"нормы объёма: {e}")
             await asyncio.sleep(3600)
