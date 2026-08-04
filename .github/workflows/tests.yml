@@ -1,0 +1,61 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  scanners:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Только то, без чего эти суиты не импортируются. Сети тесты не касаются:
+      # httpx в tinkoff_client подменяется двойниками _Httpx/_Client.
+      - name: Зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest httpx==0.27.0
+
+      - name: pytest
+        id: run
+        run: |
+          set +e
+          python -m pytest -q -rA \
+            tests/test_volume_events.py \
+            tests/test_figi_failure_reason.py \
+            tests/test_token_and_board.py > out.txt 2>&1
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+          cat out.txt
+
+      # Галочка сообщает ТОЛЬКО факт падения. Чтобы была видна ПРИЧИНА,
+      # вывод кладётся в комментарий PR и в сводку прогона.
+      - name: Отчёт
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo '### pytest: сканер объёма, токен/FIGI и выбор борда'
+            echo '```'
+            tail -c 55000 out.txt
+            echo '```'
+          } > body.md
+          cat body.md >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            gh pr comment "${{ github.event.pull_request.number }}" --body-file body.md
+          fi
+
+      - name: Итог
+        run: exit ${{ steps.run.outputs.code }}
