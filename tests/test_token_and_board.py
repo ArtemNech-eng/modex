@@ -1,0 +1,149 @@
+"""
+Дыры, которые зелёный прогон НЕ закрывал.
+
+Все 71 тест прошли, и при этом оба дефекта ниже были в коде. Так бывает, когда
+тест проверяет случай, где все признаки согласны друг с другом: такой тест
+подтверждает результат, но не ПОРЯДОК предпочтений. Порядок виден только там,
+где признаки СПОРЯТ.
+"""
+import asyncio
+import pathlib
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from config.token import clean_token          # noqa: E402
+from src.collector import tinkoff_client as tc  # noqa: E402
+
+
+def _run(coro):
+    """Свой цикл событий, как в test_figi_failure_reason."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def _share(figi, board, flag, ticker="SBER"):
+    return {"ticker": ticker, "figi": figi, "classCode": board,
+            "instrumentType": "share", "apiTradeAvailableFlag": flag}
+
+
+# ── борд против флага ────────────────────────────────────────────────────────
+
+def test_moex_board_wins_over_trade_flag():
+    """
+    Самый важный случай: признаки указывают НА РАЗНЫЕ бумаги.
+
+    Старый ключ (flag, board) при reverse=True выбирал внебиржевую бумагу.
+    Мы торгуем Мосбиржу, и FIGI нужен именно её: чужой инструмент даст свои
+    свечи и свой стакан, и это ровно та подмена, из-за которой HYDR получал
+    цены FEES.
+    """
+    spb = _share("BBG_SPB_CHUZHOY", "SPBXM", True)
+    tqbr = _share("BBG004730N88", "TQBR", False)
+    got = tc._pick_share([spb, tqbr], "SBER")
+    assert got["figi"] == "BBG004730N88", \
+        "борд TQ* должен быть важнее apiTradeAvailableFlag"
+
+
+def test_order_of_input_does_not_matter():
+    """Сортировка, а не «первый подходящий из ответа»."""
+    spb = _share("BBG_SPB_CHUZHOY", "SPBXM", True)
+    tqbr = _share("BBG004730N88", "TQBR", False)
+    assert tc._pick_share([tqbr, spb], "SBER")["figi"] == "BBG004730N88"
+    assert tc._pick_share([spb, tqbr], "SBER")["figi"] == "BBG004730N88"
+
+
+def test_flag_still_decides_within_the_same_board():
+    """Флаг не отменён, он понижен в приоритете: при равных бордах решает он."""
+    no_flag = _share("BBG_NO", "TQBR", False)
+    with_flag = _share("BBG_YES", "TQBR", True)
+    assert tc._pick_share([no_flag, with_flag], "SBER")["figi"] == "BBG_YES"
+
+
+def test_wrong_ticker_is_never_picked_however_attractive():
+    """Точное совпадение тикера выше любых предпочтений."""
+    other = _share("BBG_FEES", "TQBR", True, ticker="FEES")
+    assert tc._pick_share([other], "HYDR") is None
+
+
+# ── чистка токена в общем модуле ──────────────────────────────────────────────
+
+def test_client_uses_the_shared_cleaner():
+    """
+    Клиент и общий модуль — ОДНА функция, а не две похожие.
+
+    Две похожие — это и есть исходная болезнь: REST чистил кавычки, конфиг нет.
+    """
+    assert tc._clean_token is clean_token
+
+
+def test_quotes_and_newline_never_reach_the_header():
+    client = tc.TinkoffClient('"t.secret"\n')
+    assert client.token == "t.secret"
+    assert client.headers["Authorization"] == "Bearer t.secret"
+
+
+def test_quote_inside_the_value_is_kept():
+    """Непарная кавычка — часть токена, а не мусор окружения."""
+    assert clean_token('t.se"cret') == 't.se"cret'
+
+
+# ── цена счастливого пути ────────────────────────────────────────────────────
+
+class _CountingPost:
+    """Подмена _post: считает запросы и запоминает тела."""
+
+    def __init__(self, payload):
+        self.payload = payload
+        self.bodies = []
+
+    async def __call__(self, endpoint, body):
+        self.bodies.append(body)
+        return self.payload
+
+
+def test_happy_path_costs_exactly_one_request():
+    """
+    Каскад из трёх фильтров — АВАРИЙНЫЙ режим, а не норма.
+
+    Без этой границы подъём 48 бумаг незаметно превратился бы в 144 запроса —
+    и упёрся бы в тот самый 429, который probe умеет распознавать.
+    """
+    tc.TICKER_TO_FIGI.pop("SBER", None)
+    client = tc.TinkoffClient("t.token")
+    post = _CountingPost({"instruments": [_share("BBG004730N88", "TQBR", True)]})
+    client._post = post
+    try:
+        figi = _run(client.get_figi("SBER"))
+    finally:
+        tc.TICKER_TO_FIGI.pop("SBER", None)
+    assert figi == "BBG004730N88"
+    assert len(post.bodies) == 1, f"запросов {len(post.bodies)}, а должен быть один"
+    assert post.bodies[0].get("apiTradeAvailableFlag") is True
+
+
+def test_relaxation_happens_only_after_an_empty_answer():
+    """А вот когда строгий запрос пуст — фильтры снимаются по очереди."""
+    tc.TICKER_TO_FIGI.pop("SBER", None)
+    client = tc.TinkoffClient("t.token")
+    answers = [{"instruments": []},
+               {"instruments": [_share("BBG004730N88", "TQBR", False)]}]
+    bodies = []
+
+    async def _post(endpoint, body):
+        bodies.append(body)
+        return answers[len(bodies) - 1]
+
+    client._post = _post
+    try:
+        figi = _run(client.get_figi("SBER"))
+    finally:
+        tc.TICKER_TO_FIGI.pop("SBER", None)
+    assert figi == "BBG004730N88"
+    assert len(bodies) == 2
+    assert "apiTradeAvailableFlag" not in bodies[1]
