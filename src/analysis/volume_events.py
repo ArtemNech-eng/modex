@@ -318,10 +318,21 @@ def detect_step(rows: list, step: int, lot: int = 1,
         why = (f"оборот {_short(now)} после тишины — норма {_short(base)}, "
                f"кратность считать не по чему"
                if thin else f"оборот в {mult:.1f} раза выше нормы ({source})")
+        # КРАТНОСТЬ ПРОПАДАЕТ ЦЕЛИКОМ, А НЕ ОГОВАРИВАЕТСЯ. Текст говорил
+        # «кратность считать не по чему», а рядом лежало times:30.0 — и 04.08
+        # на экране было ASTR ×30.0 на обороте 11 223 ₽. Кто берёт поля, а
+        # не читает прозу — дашборд, сортировка, агент — видел только
+        # число. Оговорка в соседнем поле — не защита.
+        #
+        # Число не выбрашивается, а ПЕРЕИМЕНОВывается: ×1510 при норме
+        # 856 ₽ — сам по себе признак того, что бумага проснулась из ничего,
+        # и скрывать его совсем значило бы потерять признак.
         out.append(_ev(
             "volume_surge", why,
             step, last, rub=round(now), base_rub=round(base),
-            times=round(mult, 2), base_source=source, base_thin=thin))
+            times=(None if thin else round(mult, 2)),
+            times_vs_thin_base=(round(mult, 2) if thin else None),
+            base_source=source, base_thin=thin))
 
     # 2. УСКОРЕНИЕ ОБЪЁМА — момент, когда он ПОШЁЛ, а не «сегодня много».
     #
@@ -339,7 +350,9 @@ def detect_step(rows: list, step: int, lot: int = 1,
             out.append(_ev(
                 "volume_accelerating", tail_why,
                 step, last, rub=round(now), base_rub=round(base),
-                times=round(mult, 2), bars_growing=gb,
+                times=(None if thin else round(mult, 2)),
+                times_vs_thin_base=(round(mult, 2) if thin else None),
+                bars_growing=gb,
                 series=[round(v) for v in tail], base_source=source,
                 base_thin=thin))
     return out
@@ -373,11 +386,15 @@ def scan(minutes: dict, lots: Optional[dict] = None,
         evs = detect(list(rows or ()), lot=(lots or {}).get(tk) or 1,
                      profile=(profiles or {}).get(tk), steps=steps, p=p)
         if evs:
-            top = max(e.get("times", 0) for e in evs)
+            # СОРТИРОВКА ТОЛЬКО ПО НАСТОЯЩЕЙ КРАТНОСТИ. Раньше верх доски
+            # занимали бумаги с шумом в знаменателе: ASTR ×30.0, RASP ×28.77 —
+            # выше всего, что было на рынке на самом деле.
+            got = [e["times"] for e in evs if e.get("times") is not None]
             out.append({"ticker": tk, "events": evs, "count": len(evs),
-                        "max_times": round(top, 2),
+                        "max_times": round(max(got), 2) if got else None,
+                        "no_multiple": not got,
                         "kinds": sorted({e["kind"] for e in evs})})
-    out.sort(key=lambda x: (-x["max_times"], x["ticker"]))
+    out.sort(key=lambda x: (-(x["max_times"] or 0), x["ticker"]))
     return out
 
 

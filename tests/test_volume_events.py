@@ -119,9 +119,15 @@ def test_baseline_skips_empty_minutes():
 
 def test_baseline_excludes_the_measured_bar():
     """Бар, который меряем, в свою же норму входить не может."""
-    rows = steady(12, vol=100) + [bar(12, 10000), bar(13, 10000)]
+    # НОРМА ЗДЕСЬ ДОЛЖНА БЫТЬ НАСТОЯЩЕЙ. Раньше было 100 лотов × 100 ₽ =
+    # 10 000 ₽ — ниже порога шума (20 000 ₽), то есть тест проверял своё
+    # утверждение на бумаге, которой почти не торгуют. Проверяется
+    # исключение измеряемого бара из своей же нормы, а не поведение
+    # на шуме — для шума есть отдельные тесты.
+    rows = steady(12, vol=1000) + [bar(12, 100000), bar(13, 100000)]
     got = detect_step(rows, 1, lot=1)
-    assert got and got[0]["base_rub"] == round(100 * 100.0)
+    assert got and got[0]["base_rub"] == round(1000 * 100.0)
+    assert got[0]["base_thin"] is False, "норма 100 тыс ₽ — это не шум"
     assert got[0]["times"] >= 50
 
 
@@ -283,8 +289,11 @@ def test_scan_orders_by_multiple_not_by_rubles():
     """
     big = steady(12, vol=100000, close=300.0) + [bar(12, 400000, 300.0),
                                                  bar(13, 400000, 300.0)]
-    small = steady(12, vol=100, close=90.0) + [bar(12, 5000, 90.0),
-                                               bar(13, 5000, 90.0)]
+    # У SMALL теперь норма 90 тыс ₽, а не 9 тыс: проверяется порядок
+    # сортировки, а не поведение на шуме — иначе тест держал бы сразу
+    # две разные вещи и сломался бы от любой из них.
+    small = steady(12, vol=1000, close=90.0) + [bar(12, 10000, 90.0),
+                                                bar(13, 10000, 90.0)]
     got = scan({"BIG": big, "SMALL": small}, lots={"BIG": 1, "SMALL": 1})
     assert [x["ticker"] for x in got][0] == "SMALL", "у SMALL кратность выше"
     assert got[0]["max_times"] > got[1]["max_times"]
@@ -642,7 +651,8 @@ def test_absurd_multiple_is_still_caught():
     got = [e for e in detect_step(rows, 1, lot=1) if e["kind"] == "volume_surge"]
     assert got, "оборот прошёл пол"
     assert got[0]["base_thin"] is True
-    assert got[0]["times"] > 100
+    assert "times" not in got[0], "кратности к шуму не существует"
+    assert got[0]["times_vs_thin_base"] > 100, "но абсурд виден под другим именем"
     assert "раза выше нормы" not in got[0]["why"]
 
 
@@ -656,3 +666,58 @@ def test_real_awakening_keeps_its_multiple():
     got = [e for e in detect_step(rows, 1, lot=1) if e["kind"] == "volume_surge"]
     assert got and got[0]["base_thin"] is False, "34 тыс — не шум"
     assert "раза выше нормы" in got[0]["why"]
+
+
+def test_thin_base_has_no_multiple_field_at_all():
+    """
+    04.08 на живом экране: ASTR times:30.0 при base_rub:11223, RASP
+    times:28.77 при base_rub:8945. Текст честно говорил «кратность считать
+    не по чему», а поле рядом говорило обратное. Побеждает поле: его
+    читают программы.
+    """
+    rows = [bar(i, 35, close=100.0) for i in range(12)]       # норма 3 500 ₽
+    rows += [bar(12, 8936, close=100.0), bar(13, 8936, close=100.0)]
+    got = [e for e in detect_step(rows, 1, lot=1) if e["kind"] == "volume_surge"]
+    assert got
+    e = got[0]
+    assert e["base_thin"] is True
+    assert "times" not in e, "поля кратности нет вовсе"
+    assert e["times_vs_thin_base"] > 200, "число сохранилось под другим именем"
+    assert e["rub"] > 0 and e["base_rub"] > 0, "сами деньги на месте"
+
+
+def test_accelerating_on_thin_base_also_loses_the_multiple():
+    """Разгон из ничего — такая же неправда, что и всплеск из ничего."""
+    rows = [bar(i, 35, close=100.0) for i in range(10)]       # норма 3 500 ₽
+    rows += [bar(10, 3000, 100.0), bar(11, 5000, 100.0), bar(12, 9000, 100.0)]
+    rows.append(bar(13, 9000, 100.0))
+    got = [e for e in detect_step(rows, 1, lot=1)
+           if e["kind"] == "volume_accelerating"]
+    if got:
+        assert "times" not in got[0]
+        assert got[0]["times_vs_thin_base"] > 0
+
+
+def test_thin_ticker_is_not_ranked_above_real_money():
+    """
+    ГЛАВНОЕ ПОСЛЕДСТВИЕ. Сортировка шла по times, и верх доски занимал
+    шум: ASTR ×30 на 11 тыс ₽ стоял выше всего настоящего.
+    """
+    real = steady(12, vol=1000, close=100.0)                 # норма 100 тыс ₽
+    real += [bar(12, 5000, 100.0), bar(13, 5000, 100.0)]     # 500 тыс ₽, ×5
+    thin = [bar(i, 35, close=100.0) for i in range(12)]      # норма 3 500 ₽
+    thin += [bar(12, 8936, close=100.0), bar(13, 8936, close=100.0)]
+    got = scan({"REAL": real, "THIN": thin}, lots={"REAL": 1, "THIN": 1})
+    assert [x["ticker"] for x in got][0] == "REAL", "шум не возглавляет доску"
+    row = [x for x in got if x["ticker"] == "THIN"][0]
+    assert row["max_times"] is None, "кратности нет и у строки целиком"
+    assert row["no_multiple"] is True, "и это названо явно, а не нулём"
+    assert row["events"], "само событие осталось: деньги пришли"
+
+
+def test_normal_money_keeps_the_multiple_field():
+    real = steady(12, vol=1000, close=100.0)
+    real += [bar(12, 5000, 100.0), bar(13, 5000, 100.0)]
+    got = scan({"REAL": real}, lots={"REAL": 1})
+    assert got[0]["max_times"] >= 3
+    assert got[0]["no_multiple"] is False
