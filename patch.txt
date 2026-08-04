@@ -1,8 +1,0 @@
-+ src/collector/tinkoff_client.py: изменён
-+ config/settings.py: изменён
-= .github/workflows/tests.yml: изменений не требуется
-+ tests/test_token_and_board.py: изменён
-- .github/workflows/patch-token-board.yml: удалён после применения
-- scripts/_patch_token_board.py: удалён после применения
-
-все замены прошли
