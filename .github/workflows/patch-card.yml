@@ -1,13 +1,14 @@
 name: patch-card
 
-# Применяет точечный патч к большим файлам и сам же убирает скрипт.
-# Перепечатывать файл целиком ради правки в двадцать строк нельзя:
-# так уже дважды приезжал обрезанный файл.
+# Механизм точечных правок в больших файлах: в ветку кладётся
+# идемпотентный скрипт, здесь он применяется и САМ СЕБЯ УДАЛЯЕТ.
+# Коммит происходит ТОЛЬКО при зелёных тестах — красный патч не
+# оставляет следа в коде, только отчёт в PR.
 
 on:
   push:
     branches: [feature/ticker-card]
-    paths: ['scripts/_patch_card_bars.py']
+    paths: ['scripts/_patch_card_*.py']
 
 permissions:
   contents: write
@@ -17,7 +18,6 @@ jobs:
   patch:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,7 +28,11 @@ jobs:
           python-version: '3.11'
 
       - name: Патч
-        run: python scripts/_patch_card_bars.py
+        run: |
+          for f in scripts/_patch_card_*.py; do
+            echo "== $f"
+            python "$f"
+          done
 
       - name: Зависимости
         run: pip install pytest httpx==0.27.0
@@ -43,32 +47,31 @@ jobs:
             tests/test_token_and_board.py \
             tests/test_card.py > out.txt 2>&1
           echo "code=$?" >> "$GITHUB_OUTPUT"
-          tail -40 out.txt
-
-      - name: Коммит
-        if: steps.run.outputs.code == '0'
-        run: |
-          git config user.name "modex-bot"
-          git config user.email "bot@modex.local"
-          git rm -q --cached scripts/_patch_card_bars.py
-          rm -f scripts/_patch_card_bars.py
-          git add src/analysis/card.py tests/test_card.py
-          git commit -m "Карточка понимает бар живого потока (open/high/low/close/volume)"
-          git push origin HEAD:feature/ticker-card
-
-      - name: Отчёт в PR
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
           {
-            echo '### патч карточки: формат бара'
+            echo '### патч карточки'
             echo '```'
-            tail -c 20000 out.txt
+            tail -c 45000 out.txt
             echo '```'
           } > comment.md
-          cat comment.md >> "$GITHUB_STEP_SUMMARY"
-          gh pr comment 4 --body-file comment.md
+
+      - name: Отчёт в PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr comment 4 --body-file comment.md
+
+      - name: Коммит только при зелёных тестах
+        if: steps.run.outputs.code == '0'
+        run: |
+          git config user.name modex-bot
+          git config user.email bot@modex.local
+          git add src/analysis/card.py tests/test_card.py src/api/main.py
+          git rm -q scripts/_patch_card_*.py
+          if git diff --cached --quiet; then
+            echo "нечего коммитить"
+            exit 0
+          fi
+          git commit -m "Патч карточки применён"
+          git push origin HEAD:feature/ticker-card
 
       - name: Итог
         run: exit ${{ steps.run.outputs.code }}
