@@ -1,0 +1,58 @@
+name: inspect
+
+# ВРЕМЕННОЕ задание. Нужно один раз: узнать, как в src/api/main.py
+# устроен доступ к живому состоянию (стрим, лента, уровни, бары),
+# чтобы подключить карточку не наугад, а по факту. Удалить сразу после.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Выдержки
+        run: |
+          F=src/api/main.py
+          {
+            echo '## размер'
+            wc -l "$F"
+            echo
+            echo '## импорты'
+            grep -n '^\(from\|import\) ' "$F" | head -70
+            echo
+            echo '## глобальное состояние: лента, уровни, стрим'
+            grep -n 'TradeTape\|LevelTracker\|BookTicks\|MarketStream\|CURRENT\|START_ERROR' "$F" | head -60
+            echo
+            echo '## маршрут сканера объёма целиком'
+            awk '/@app.get\("\/api\/volume-scan"\)/{f=1} f{print NR": "$0; c++} c>90{exit}' "$F"
+            echo
+            echo '## где берутся минутные бары'
+            grep -n 'minutes\|bars(\|def _bars\|market\b' "$F" | head -50
+            echo
+            echo '## маршруты со стаканом и лентой'
+            grep -n '@app.get("/api/' "$F" | head -100
+          } > body.txt
+          cat body.txt
+
+      - name: Отчёт в PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo '### разведка src/api/main.py'
+            echo '```'
+            tail -c 55000 body.txt
+            echo '```'
+          } > comment.md
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+          gh pr comment "${{ github.event.pull_request.number }}" --body-file comment.md
