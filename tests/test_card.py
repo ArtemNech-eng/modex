@@ -278,3 +278,62 @@ def test_bars_of_the_live_stream_are_understood():
     assert from_live["geometry"]["atr"] > 0
     assert from_live["price"]["vwap"] > 0
     assert from_live["price"]["last"] == short[-1]["c"]
+
+
+# ─── стакан из минутной агрегации ────────────────────────
+
+def _book_min(upd=100):
+    """Запись той же формы, что кладёт stream.py в self.book."""
+    return {"ts": "2026-08-04 13:30", "session": "main", "updates": upd,
+            "bid_vol_sum": 100.0 * upd, "ask_vol_sum": 50.0 * upd,
+            "bid5_sum": 60.0 * upd, "ask5_sum": 30.0 * upd,
+            "spread_sum": 0.05 * upd, "best_bid": 100.0, "best_ask": 100.02,
+            "imb_min": 0.4, "imb_max": 0.9,
+            "bid_top_max": 400, "ask_top_max": 120}
+
+
+def test_average_of_the_book_is_divided_by_the_number_of_packets():
+    """В памяти лежат СУММЫ по пакетам; без деления цифра бессмысленна."""
+    a = C.book_minute_block(_book_min(upd=100), lot=10)
+    b = C.book_minute_block(_book_min(upd=600), lot=10)
+    assert a["avg_bid_lots"] == 100.0
+    assert a["avg_bid_lots"] == b["avg_bid_lots"]   # частота не влияет
+    assert a["avg_bid_rub"] == 100000              # 100 лотов x 10 x 100 ₽
+    assert a["avg_spread"] == 0.05
+
+
+def test_the_biggest_order_is_never_called_the_whole_bid():
+    """Плита — максимум за минуту, а не объём стороны."""
+    bk = C.book_minute_block(_book_min(), lot=10)
+    assert bk["top_bid_lots"] == 400.0
+    assert bk["avg_bid_lots"] == 100.0
+    assert bk["top_bid_share_of_avg"] == 4.0
+    assert "bid_rub" not in bk and "bids" not in bk
+
+
+def test_book_swing_is_kept_next_to_the_average():
+    bk = C.book_minute_block(_book_min(), lot=1)
+    assert bk["bid_share"] == 0.667
+    assert bk["bid_share_swing"] == 0.5
+
+
+def test_book_spread_is_measured_in_atr_and_steps():
+    bk = C.book_minute_block(_book_min(), lot=1, min_step=0.01, atr=0.5)
+    assert bk["spread"] == 0.02
+    assert bk["spread_in_steps"] == 2.0
+    assert bk["avg_spread_in_steps"] == 5.0
+    assert bk["avg_spread_in_atr"] == 0.1
+
+
+def test_no_book_aggregate_is_a_reason_not_a_crash():
+    for empty in ({}, None, {"updates": 0}):
+        bk = C.book_minute_block(empty, lot=1)
+        assert bk["kind"] == "minute_aggregate"
+        assert bk["note"]
+        assert "avg_bid_lots" not in bk
+
+
+def test_book_aggregate_says_it_has_no_levels():
+    """Читатель не должен искать здесь цены заявок: их не собирают."""
+    bk = C.book_minute_block(_book_min(), lot=1)
+    assert "заявок по отдельным ценам здесь нет" in bk["note"]
