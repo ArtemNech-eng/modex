@@ -1,12 +1,17 @@
 """
-Минутки с ISS. Главное здесь — ЕДИНИЦЫ.
+Минутки с ISS. Главное здесь — ЕДИНИЦЫ и КЛЮЧ МИНУТЫ.
 
 Ошибка на лотность не падает и не логируется: она тихо завышает норму в
-лотность раз, и всякая живая минута начинает выглядеть тишью. Поэтому
-сверка идёт с полем value из того же ответа: источник привозит
-контрольную сумму вместе с данными.
+лотность раз, и всякая живая минута начинает выглядеть тишью.
+
+Ошибка в ключе минуты ещё тише: запись проходит успешно, просто в базе
+появляется вторая сетка минут рядом со стримовой. На живой базе 05.08:
+500 минут у ISS, 777 в базе, общих ноль.
 """
+from datetime import datetime, timezone
+
 from src.collector import iss_minutes as I
+from src.collector.stream import msk_minute
 from src.analysis.volume_events import (_rub, _minute_of_day, day_profile,
                                         profile_gap, MIN_DAYS, MIN_BARS_DAY)
 
@@ -54,10 +59,30 @@ def test_broken_answers_give_nothing_instead_of_crashing():
     assert I.bar_of(None) is None
 
 
-def test_timestamp_has_the_shape_the_stream_writes():
+def test_timestamp_is_exactly_what_the_stream_itself_produces():
+    """
+    Сверка с ФУНКЦИЕЙ стрима, а не с литералом рядом.
+
+    Предыдущая версия этого теста требовала "2026-08-03T10:05:00" и была
+    зелёной всё то время, пока формат расходился со стримом. Тест, сверяющий
+    код с копией его же ответа, не проверяет ничего.
+    """
     b = I.bar_of(dict(zip(COLS, row(hh=10, mm=5))))
-    assert b["ts"] == "2026-08-03T10:05:00"
+    #  ISS отдаёт МОСКОВСКОЕ время, стрим сдвигает UTC на три часа
+    same_moment = datetime(2026, 8, 3, 7, 5, tzinfo=timezone.utc)
+    assert b["ts"] == msk_minute(same_moment)
+    assert b["ts"] == "2026-08-03T10:05", "без секунд, как в базе"
+    assert len(b["ts"]) == I.TS_LEN
     assert _minute_of_day(b["ts"]) == 605, "профиль читает минуту из этого ключа"
+
+
+def test_every_backfilled_bar_matches_the_stream_key_format():
+    """Не одна минута, а весь день: ключ должен совпадать везде."""
+    bars = I.bars_of(payload(day_rows_iss("2026-07-30", minutes=120)))
+    assert len(bars) == 120
+    for b in bars:
+        assert len(b["ts"]) == I.TS_LEN and b["ts"][10] == "T"
+        assert b["ts"].count(":") == 1, "секунды в ключе — это вторая сетка минут"
 
 
 def test_shares_become_lots_and_rubles_match_the_source():
@@ -74,11 +99,14 @@ def test_shares_become_lots_and_rubles_match_the_source():
 def test_raw_shares_would_overstate_turnover_by_the_lot_size():
     """
     Та самая ловушка, написанная числом: если положить штуки туда,
-    где ждут лоты, оборот вырастет в лотность раз — без ошибок и без
-    падений. Именно поэтому сверка обязательна.
+    где ждут лоты, оборот вырастет в лотность раз.
+
+    Но заметить это можно ТОЛЬКО так: когда при пересчёте и при сверке
+    взяты РАЗНЫЕ лоты. Если лот один и тот же — он сокращается, и сверка
+    молчит при любой лотности (см. tests/test_iss_compare.py).
     """
     lot = 10
-    raw = {"ts": "2026-08-03T10:00:00", "close": 100.0,
+    raw = {"ts": "2026-08-03T10:00", "close": 100.0,
            "volume": 1000.0,                     # ШТУКИ вместо лотов
            "value_rub": 100000.0}
     assert _rub(raw, lot) == 1000000.0

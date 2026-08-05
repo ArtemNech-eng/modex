@@ -2,8 +2,12 @@
 Сверка минуток ISS с тем, что стрим записал сам.
 
 Зачем отдельная сверка, если есть turnover_error: потому что turnover_error
-НЕ ЛОВИТ ЛОТНОСТЬ. Первый тест здесь доказывает это числом, чтобы
-никто (в том числе я) больше не называл её защитой от единиц.
+НЕ ЛОВИТ ЛОТНОСТЬ и НЕ ЛОВИТ КЛЮЧ МИНУТЫ. Первый тест доказывает это
+числом, чтобы никто (в том числе я) больше не называл её защитой
+от ошибки в единицах.
+
+Последний тест — тот самый случай с прода 05.08: обе стороны полны,
+общих минут ноль.
 """
 import sys
 import pathlib
@@ -37,8 +41,8 @@ def iss_day(lot, minutes=60, shares=1000):
 
 
 def db_day(volume, minutes=60):
-    """То, что вернёт db.candle_series: только ts и volume нам важны."""
-    return [{"ts": f"{DAY}T10:{i:02d}:00", "volume": volume, "close": 100.0}
+    """Строки стрима: ключ минуты БЕЗ СЕКУНД, как у msk_minute."""
+    return [{"ts": f"{DAY}T10:{i:02d}", "volume": volume, "close": 100.0}
             for i in range(minutes)]
 
 
@@ -104,3 +108,18 @@ def test_one_wild_minute_does_not_decide_the_verdict():
     rows[0]["volume"] = 0.01       # стрим поднялся среди минуты
     got = compare_to_db(bars, rows)
     assert got["ok"] is True
+
+
+def test_full_data_but_zero_overlap_names_the_key_mismatch():
+    """
+    Ровно то, что случилось на проде 05.08: 500 минут у ISS, 777 в базе,
+    общих ноль. Ответ «мало точек» был бы формально верен и совершенно
+    бесполезен — причина в формате ключа, и её надо назвать.
+    """
+    bars = iss_day(lot=10)
+    stale = [{"ts": f"{DAY}T10:{i:02d}:00", "volume": 100.0} for i in range(60)]
+    got = compare_to_db(bars, stale)
+    assert got["ok"] is False
+    assert got["iss_minutes"] == 60 and got["db_minutes"] == 60
+    assert got["common"] == 0
+    assert "РАЗНЫЙ КЛЮЧ" in got["verdict"]
