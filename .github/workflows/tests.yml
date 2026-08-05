@@ -41,7 +41,8 @@ jobs:
             tests/test_iss_write.py \
             tests/test_api_profile_note.py \
             tests/test_iss_compare.py \
-            tests/test_iss_pages.py > out.txt 2>&1
+            tests/test_iss_pages.py \
+            tests/test_profile_note.py > out.txt 2>&1
           echo "code=$?" >> "$GITHUB_OUTPUT"
           cat out.txt
 
@@ -53,7 +54,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           {
-            echo '### pytest: сканер объёма, токен/FIGI, выбор борда, карточка, минутки ISS, запись в базу, причина пустого профиля, сверка единиц со стримом и постраничность ISS'
+            echo '### pytest: сканер объёма, токен/FIGI, выбор борда, карточка, минутки ISS, запись в базу, причина пустого профиля, сверка единиц со стримом, постраничность ISS и надпись о норме объёма'
             echo '```'
             tail -c 55000 out.txt
             echo '```'
