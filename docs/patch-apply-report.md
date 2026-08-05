@@ -1,20 +1,17 @@
 # Отчёт patch-apply
 
-дата: 2026-08-05T14:08:25Z
-коммит: c2506abd9b11ddbe8907811be8de3c0db5e9926d
-запуск: 31013649770
+дата: 2026-08-05T16:54:09Z
+коммит: d9a8873b7d0204b9f8489d860f2d7bbf736dd76a
+запуск: 31027437129
 код патча: 0
 код pytest: 0
 
 ## патч
 ```
-== scripts/_patch_floor.py
-патч пола по обороту: отвязка от депозита, версия 1
-python 3.11.15, cwd /home/runner/work/modex/modex
-ПРИМЕНЕНО:
- + объяснение пола по обороту
- + значение пола по умолчанию
- + фраза о депозите в src/api/main.py: замен сделано 1
+== scripts/_patch_slim.py
+Dockerfile: шаг torch: применено
+sentiment_analyzer: словарный путь без модели: применено
+итог: dockerfile ok, nlp ok
 Скрипт удалил себя.
 ```
 
@@ -97,5 +94,5 @@ PASSED tests/test_floor_reason.py::test_the_explanation_names_the_variable_not_a
 PASSED tests/test_floor_reason.py::test_value_matches_the_source_when_env_is_not_set
 PASSED tests/test_api_profile_note.py::test_the_reason_is_reported_next_to_profiles_ready
 PASSED tests/test_api_profile_note.py::test_the_absent_attribute_cannot_break_the_route
-73 passed in 0.50s
+73 passed in 0.84s
 ```
