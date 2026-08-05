@@ -907,12 +907,9 @@ async def stream_pipeline():
                         built += 1
                     else:
                         gaps.append(profile_gap(per_day, min_days=MIN_DAYS))
-                if built:
-                    logger.info(f"Норма объёма по времени суток: {built} бумаг")
-                else:
-                    stream.profile_note = profile_note(gaps)
-                    logger.info("Норма объёма по времени суток %s",
-                                stream.profile_note)
+                stream.profile_note = profile_note(gaps, built=built)
+                logger.info("Норма объёма по времени суток: %s",
+                            stream.profile_note)
             except Exception as e:                     # noqa: BLE001
                 logger.debug(f"нормы объёма: {e}")
             await asyncio.sleep(3600)

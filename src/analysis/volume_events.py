@@ -502,7 +502,7 @@ def profile_gap(rows_by_day, min_days: int = MIN_DAYS) -> dict:
             "days": sorted(usable)}
 
 
-def profile_note(gaps) -> str:
+def profile_note(gaps, built: int = 0, total: int = 0) -> str:
     """
     Одна фраза для человека из собранных profile_gap чисел.
 
@@ -511,6 +511,21 @@ def profile_note(gaps) -> str:
     короткой — соседний тест смотрит на неё окном в 2500 символов, и
     раздувшаяся функция его ослепляет. Так упали два прогона 04.08.
     """
+    # ФАКТ, А НЕ ТОЛЬКО ОТСУТСТВИЕ. 05.08 в проде рядом стояли
+    # profiles_ready 44 и «не построена: лучшая бумага имеет 2 дней»,
+    # а к вечеру, с 46 профилями, надпись стала null. Надпись писалась
+    # только в ветке «не построено ничего». Диагностика, противоречащая
+    # тому, что она описывает, хуже её отсутствия.
+    if built and not gaps:
+        return ("построена по всем {b} бумагам: норма берётся по этой же "
+                "минуте прошлых дней").format(b=built)
+    if built:
+        g = max(gaps, key=lambda x: x.get("usable_days", 0))
+        return ("построена по {b} бумагам из {t}; у остальных {r} истории "
+                "мало (лучшая имеет {u} торговых дней из {n}) — там "
+                "работает скользящая").format(
+            b=built, t=(total or built + len(gaps)), r=len(gaps),
+            u=g.get("usable_days", 0), n=g.get("need_days", MIN_DAYS))
     if not gaps:
         return "не построена: минутной истории в базе нет вовсе"
     g = max(gaps, key=lambda x: x.get("usable_days", 0))
