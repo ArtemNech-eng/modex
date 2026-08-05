@@ -57,7 +57,8 @@ jobs:
             tests/test_profile_note.py \
             tests/test_floor_reason.py \
             tests/test_scanner_freshness.py \
-            tests/test_api_profile_note.py > out.txt 2>&1
+            tests/test_api_profile_note.py \
+            tests/test_api_stale.py > out.txt 2>&1
           echo "code=$?" >> "$GITHUB_OUTPUT"
           cat out.txt
 
