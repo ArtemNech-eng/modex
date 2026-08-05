@@ -1124,7 +1124,7 @@ async def get_volume_scan(steps: Optional[str] = None, limit: int = 40):
     """
     from src.collector.stream import CURRENT
     from src.analysis.volume_events import (scan, rates, below_floor,
-                                         warming_up, FLOOR_RUB)
+                                         warming_up, stale, FLOOR_RUB)
     # Доли по шагам считает общая функция: форма события одна и та же,
     # а обманывает общая доля одинаково у обоих сканеров.
     from src.analysis.price_events import rates_by_step
@@ -1154,6 +1154,11 @@ async def get_volume_scan(steps: Optional[str] = None, limit: int = 40):
             "floor_rub": FLOOR_RUB,
             "below_floor": below_floor(mins, lots=lots),
             "warming_up": warming_up(mins),
+            # НОЧНАЯ ТИШИНА ОБЯЗАНА НАЗЫВАТЬ СЕБЯ. Событие больше не
+            # выставляется на устаревшем баре, и это верно, но снаружи
+            # такое молчание неотличимо от спокойного рынка. Три причины
+            # пустой таблицы различимы: below_floor, warming_up, stale.
+            "stale": stale(mins),
             "results": found[:limit]}
 
 

@@ -1,36 +1,24 @@
 # Отчёт patch-apply
 
-дата: 2026-08-05T20:06:27Z
-коммит: e10fa36c47248930ec7c2798871b843a07eace7d
-запуск: 31042503839
+дата: 2026-08-05T21:09:24Z
+коммит: e4e88efb2750bd6e286e09a09a1029147b71f137
+запуск: 31047394589
 код патча: 0
 код pytest: 0
 
 ## патч
 ```
-== scripts/_patch_kick.py
-зажигание: правок нет, задача — разбудить прогон
-итог: применено 0, отказов 0
-Скрипт удалил себя.
-== scripts/_patch_scanner.py
-часы и непрерывность: применено
-событие только на свежем баре: применено
-ускорение только подряд: применено
-возраст во всплеске: применено
-возраст в ускорении: применено
-порог возраста в DEFAULTS: применено
-detect протягивает время: применено
-scan принимает время: применено
-scan протягивает время: применено
-счётчик устаревших: применено
-итог: применено 10, отказов 0
+== scripts/_patch_stale_api.py
+stale в импорте маршрута: применено
+счётчик устаревших в ответе: применено
+итог: применено 2, отказов 0
 Скрипт удалил себя.
 ```
 
 ## pytest, последние 12000 символов
 ```
-........................................................................ [ 84%]
-.............                                                            [100%]
+........................................................................ [ 78%]
+....................                                                     [100%]
 ==================================== PASSES ====================================
 =========================== short test summary info ============================
 PASSED tests/test_volume_events.py::test_turnover_is_in_rubles_with_lot_size
@@ -118,5 +106,12 @@ PASSED tests/test_scanner_freshness.py::test_scan_passes_the_clock_down
 PASSED tests/test_scanner_freshness.py::test_without_a_clock_it_uses_moscow_time
 PASSED tests/test_api_profile_note.py::test_the_reason_is_reported_next_to_profiles_ready
 PASSED tests/test_api_profile_note.py::test_the_absent_attribute_cannot_break_the_route
-85 passed in 0.53s
+PASSED tests/test_api_stale.py::test_the_core_knows_how_to_count_stale_tickers
+PASSED tests/test_api_stale.py::test_the_route_imports_the_counter
+PASSED tests/test_api_stale.py::test_the_answer_carries_the_stale_count
+PASSED tests/test_api_stale.py::test_all_three_reasons_for_an_empty_table_are_reported_together
+PASSED tests/test_api_stale.py::test_the_counter_is_not_pasted_twice
+PASSED tests/test_api_stale.py::test_the_field_sits_in_the_volume_scan_and_not_somewhere_else
+PASSED tests/test_api_stale.py::test_the_reason_is_explained_in_words_next_to_the_number
+92 passed in 0.64s
 ```
