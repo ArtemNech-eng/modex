@@ -1,5 +1,5 @@
 """
-Надпись о норме по времени суток обязана описывать ФАКТ.
+Надпись о норме по времени суток обязана описывать ФАКТ (версия 2).
 
 05.08 в проде одновременно: profiles_ready 44, vol_profiles 44 — и рядом
 «не построена: лучшая бумага имеет 2 торговых дней из 10 нужных».
@@ -14,11 +14,14 @@
                                   бумагам» и сколько ждать остальным;
   main.py                       — надпись пишется ВСЕГДА, без ветвления.
 
+Оба якоря сверены с живыми файлами в main перед отправкой, байт в байт.
+
 Скрипт идемпотентен, всегда выходит нулём (об отказе кричит тест, а не
-лог сборки, к которому нет доступа) и удаляет себя при успехе.
+лог сборки) и удаляет себя при успехе.
 """
 import io
 import os
+import sys
 
 VE = "src/analysis/volume_events.py"
 MAIN = "main.py"
@@ -81,9 +84,14 @@ PAIRS = [
 
 
 def main():
+    print("патч надписи о норме объёма, версия 2")
+    print("python " + sys.version.split()[0] + ", cwd " + os.getcwd())
     done, already, missed = [], [], []
     per_file = {}
     for path, name, old, new in PAIRS:
+        if not os.path.exists(path):
+            missed.append(name + " (нет файла " + path + ")")
+            continue
         src = per_file.get(path)
         if src is None:
             src = io.open(path, encoding="utf-8").read()
