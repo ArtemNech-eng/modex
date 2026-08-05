@@ -41,20 +41,18 @@ matplotlib==3.9.0
 mplfinance==0.12.10b0
 pandas==2.2.2
 
-# ─── NLP (RuBERT sentiment) ───────────────────────────────────────────────────
-# Без этих пакетов transformers.pipeline не импортируется и sentiment_analyzer
-# молча падает на словарный fallback (keyword_sentiment).
+# ─── NLP (RuBERT sentiment): ВЫНЕСЕНО В requirements-nlp.txt 05.08 ────────────
 #
-# ВНИМАНИЕ ПРО torch. Строка --extra-index-url ниже НЕ гарантирует CPU-сборку:
-# extra-index не задаёт приоритет источника, pip сливает оба индекса и выбирает
-# по версии. Пин 2.4.1 без суффикса одинаково подходит и к 2.4.1 с PyPI
-# (797 МБ + 12 пакетов nvidia-*, свыше 3 ГБ), и к 2.4.1+cpu (195 МБ).
+# transformers и torch занимали в образе около 2.2 ГБ (колесо torch 195 МБ
+# разворачивается в ~1.5 ГБ) и за один вечер дважды уронили деплой:
+# сначала «no space left on device» на экспорте слоёв, затем pip убили на
+# распаковке пакетов — exit 255 без единой строки ошибки.
 #
-# В Docker это решено жёстко: Dockerfile ставит torch ОТДЕЛЬНЫМ шагом с
-# --index-url на индекс PyTorch, до обработки этого файла, и роняет сборку,
-# если в образе появились пакеты nvidia-*. Строки ниже оставлены для локальной
-# установки, в том числе на macOS, где колёс +cpu нет вовсе.
-# Меняешь версию torch — меняй И в Dockerfile.
---extra-index-url https://download.pytorch.org/whl/cpu
-transformers==4.44.2
-torch==2.4.1
+# Почему можно: тональность в торговом контуре не участвует. Сигналы строятся
+# на объёме, стакане и цене, вердикты сейчас делает агент, Claude отключён.
+# SentimentAnalyzer без пакетов не падает: _load_sync ловит ImportError, а
+# analyze_batch отвечает словарным keyword_sentiment.
+#
+# Нужна модель:  pip install -r requirements.txt -r requirements-nlp.txt
+# Возвращаешь в образ: верни И шаг установки torch в Dockerfile
+# (--index-url, не --extra-index-url), и проверь свободное место на сервере.
