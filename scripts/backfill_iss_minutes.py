@@ -12,11 +12,20 @@
 АВТОЗАПУСКА НЕТ НАМЕРЕННО. Дозаливка нужна один раз; фоновая задача,
 кладущая чужие единицы в базу каждый час, ломала бы норму молча.
 
-СТРОГОЕ ПРАВИЛО: день пишется только если наш пересчёт оборота сошёлся
-с рублями самого ISS с точностью MAX_ERR. Нет сверки (ISS не отдал
-value) — тоже не пишется. Лучше видимая дыра (profile_note её покажет),
-чем норма, завышенная в лотность раз: сканер тогда не упадёт, а будет
-молча считать любой живой выброс тишью.
+ТРИ ОТКАЗА ВМЕСТО МОЛЧАНИЯ. День пишется только если:
+  1) наш пересчёт оборота сошёлся с рублями ISS с точностью MAX_ERR;
+  2) баров не меньше MIN_BARS;
+  3) СТРАНИЦЫ ЗАКОНЧИЛИСЬ САМИ, а не упёрлись в предел MAX_PAGES.
+
+Третий пункт — из живого случая 05.08: ISS отдаёт по 500 строк за запрос,
+а в базе стрима бывает 777 минут. Обрезанный день проходит и порог
+баров, и сверку оборота — а теряет всегда ОДИН край сессии, то есть
+создаёт ровно тот перекос по времени суток, ради которого вся эта
+дозаливка и делалась.
+
+Лучше видимая дыра (profile_note её покажет), чем норма, сдвинутая
+незаметно: сканер тогда не упадёт, а будет молча считать любой живой
+выброс тишью.
 
 В базу уходит stream_rows(...) — ровно те ключи, что кладёт стрим,
 тем же вызовом db.merge_candle_minutes(tk, rows), что в _flush стрима.
@@ -35,7 +44,8 @@ import httpx  # noqa: E402
 
 from src import db  # noqa: E402
 from src.collector.iss_minutes import (  # noqa: E402
-    bars_of, by_day, candles_url, stream_rows, turnover_error,
+    MAX_PAGES, PAGE, bars_of_pages, by_day, candles_url, page_is_full,
+    stream_rows, turnover_error,
 )
 
 MAX_ERR = 0.01          # доля; ошибка на лотность дала бы порядка 9.0, не 0.01
@@ -86,20 +96,44 @@ def tickers_wanted() -> list:
     return list(MOEX_TICKERS)
 
 
+async def fetch_day(client, tk, day, lot):
+    """Все страницы одного дня → (бары, страниц, обрезано ли)."""
+    payloads, start, truncated = [], 0, False
+    for i in range(MAX_PAGES):
+        r = await client.get(candles_url(tk, day, BOARD, start=start), timeout=30)
+        r.raise_for_status()
+        payload = r.json()
+        payloads.append(payload)
+        if not page_is_full(payload):
+            break
+        if i == MAX_PAGES - 1:
+            truncated = True
+            break
+        start += PAGE
+        await asyncio.sleep(PACE)
+    return bars_of_pages(payloads, lot=lot), len(payloads), truncated
+
+
 async def one_day(client, tk, day, lot, dry):
     """Один тикер за один день. Возвращает (итог, пояснение)."""
     try:
-        r = await client.get(candles_url(tk, day, BOARD), timeout=30)
-        r.raise_for_status()
-        payload = r.json()
+        bars, pages, truncated = await fetch_day(client, tk, day, lot)
     except Exception as e:                      # сеть/формат — не повод ронять всю заливку
         return "error", f"запрос не удался: {type(e).__name__}"
 
-    bars = bars_of(payload, lot=lot)
     if not bars:
         return "empty", "нет данных (праздник или бумага не торговалась)"
+    if truncated:
+        return "truncated", (f"страницы не кончились за {MAX_PAGES} по {PAGE} — "
+                             "день неполный, не пишу")
     if len(bars) < MIN_BARS:
         return "short", f"только {len(bars)} баров, порог {MIN_BARS}"
+
+    #  День берётся одним днём, но ISS иногда присылает соседние сутки
+    #  краем страницы — пишем только запрошенный день.
+    bars = by_day(bars).get(day, [])
+    if len(bars) < MIN_BARS:
+        return "short", f"за сам {day} только {len(bars)} баров, порог {MIN_BARS}"
 
     err = turnover_error(bars, lot=lot)
     if err is None:
@@ -108,12 +142,12 @@ async def one_day(client, tk, day, lot, dry):
         return "mismatch", f"расхождение оборота {err:.4f} > {MAX_ERR} — не пишу"
 
     if dry:
-        return "ok-dry", f"{len(bars)} баров, сверка {err:.5f}"
+        return "ok-dry", f"{len(bars)} баров с {pages} страниц, сверка {err:.5f}"
     try:
         await db.merge_candle_minutes(tk, stream_rows(bars))
     except Exception as e:
         return "error", f"запись не удалась: {type(e).__name__}: {e}"
-    return "ok", f"{len(bars)} баров, сверка {err:.5f}"
+    return "ok", f"{len(bars)} баров с {pages} страниц, сверка {err:.5f}"
 
 
 async def main():
@@ -125,6 +159,7 @@ async def main():
 
     print(f"дозаливка: {len(tickers)} бумаг × {len(days)} дней "
           f"({days[0]}..{days[-1]}){' — без записи' if dry else ''}")
+    print(f"день берётся целиком: страница ISS = {PAGE} минут, до {MAX_PAGES} страниц")
 
     if not dry:
         await db.setup_db()
@@ -141,16 +176,18 @@ async def main():
             if not lot:
                 tally["no-lot"] = tally.get("no-lot", 0) + len(days)
                 continue
-            wrote = 0
+            wrote, bars_seen = 0, []
             for day in days:
                 res, why = await one_day(client, tk, day, lot, dry)
                 tally[res] = tally.get(res, 0) + 1
                 if res in ("ok", "ok-dry"):
                     wrote += 1
-                elif res in ("mismatch", "unchecked", "error"):
+                    bars_seen.append(int(why.split()[0]))
+                elif res in ("mismatch", "unchecked", "error", "truncated"):
                     notes.append(f"  {tk} {day}: {why}")
                 await asyncio.sleep(PACE)
-            print(f"{tk:<6} лот {lot:<5} дней годных {wrote}/{len(days)}")
+            span = f", минут в дне {min(bars_seen)}-{max(bars_seen)}" if bars_seen else ""
+            print(f"{tk:<6} лот {lot:<5} дней годных {wrote}/{len(days)}{span}")
 
     print("\nитог: " + ", ".join(f"{k} {v}" for k, v in sorted(tally.items())))
     if notes:
