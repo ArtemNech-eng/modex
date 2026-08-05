@@ -72,7 +72,11 @@ def test_the_note_is_not_hidden_behind_the_empty_branch():
     i = src.find("async def _volume_profiles")
     assert i > 0, "фоновая сборка норм переименована — тест ослеп"
     window = src[i:i + WINDOW]
-    assert window.count("stream.profile_note") == 1, \
+    # Считаются ПРИСВАИВАНИЯ, а не упоминания. Первая версия этого теста
+    # требовала ровно одного упоминания `stream.profile_note` и была КРАСНОЙ
+    # на верном патче: ту же строку законно передают в logger, и это второе
+    # упоминание. Тест обязан запрещать второе место записи, а не чтение.
+    assert window.count("stream.profile_note = ") == 1, \
         "надпись присваивается не в одном месте — ветвление вернулось"
     assert "if built:" not in window, \
         "надпись снова зависит от того, построено ли хоть что-то"

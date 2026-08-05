@@ -1,29 +1,19 @@
-# Применение патч-скрипта к main.py и volume_events.py.
-#
-# Зачем workflow: у агента нет построчной правки файлов, только запись файла
-# целиком, а main.py это 50 КБ — перепечатывание уже обрывалось на середине.
-#
-# ВЕРСИЯ 2, и причина переделки важнее самого патча. Первый запуск не дал
-# коммита, и разобраться было НЕЧЕМ: весь отчёт шёл в лог job и в summary,
-# а к ним у агента доступа нет. Диагностика, которая существует только там,
-# куда нельзя заглянуть, — не диагностика. Теперь отчёт уходит комментарием
-# в PR #4 — его видно через API, и шаг стоит под if: always().
-#
-# paths ограничивает запуск самим скриптом, а скрипт удаляет себя — повторных
-# запусков не будет. Пуши бота workflow не поднимают (так устроен GITHUB_TOKEN),
-# цикла не возникает.
 name: patch-note
+
+# ОТЧЁТ КОММИТИТСЯ ФАЙЛОМ, а не комментарием в PR. Версия 2 публиковала его
+# через `gh pr comment ... || true`: шаг был зелёным, комментарий не появился
+# ни разу, и падение теста осталось невидимым. Права contents: write в этом
+# репозитории проверены множеством прошлых патчей, поэтому отчёт кладётся в
+# docs/patch-note-report.md — его видно и без доступа к логам сборки.
 
 on:
   push:
     branches: [main]
-    paths:
-      - 'scripts/_patch_note.py'
+    paths: ['scripts/_patch_note.py']
   workflow_dispatch:
 
 permissions:
   contents: write
-  pull-requests: write
 
 jobs:
   patch:
@@ -31,22 +21,18 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # Патч не валит job сразу при неудачном якоре: сначала нужен отчёт и
-      # результат тестов, иначе разбираться будет нечем. Скрипт всегда
-      # выходит нулём, а об отказе кричит тест.
       - name: Патч
         id: patch
         continue-on-error: true
         run: |
           set +e
-          python scripts/_patch_note.py > patch.log 2>&1
-          echo "code=$?" >> $GITHUB_OUTPUT
-          cat patch.log
+          python scripts/_patch_note.py > patch.txt 2>&1
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+          cat patch.txt
 
       - name: Зависимости
         run: pip install pytest httpx==0.27.0
@@ -56,48 +42,44 @@ jobs:
         continue-on-error: true
         run: |
           set +e
-          python -m pytest -q \
-            tests/test_volume_events.py \
-            tests/test_profile_note.py \
-            tests/test_figi_failure_reason.py > out.txt 2>&1
-          echo "code=$?" >> $GITHUB_OUTPUT
+          python -m pytest -q tests/test_volume_events.py tests/test_profile_note.py tests/test_figi_failure_reason.py > out.txt 2>&1
+          echo "code=$?" >> "$GITHUB_OUTPUT"
           tail -c 20000 out.txt
 
-      # ОТЧЁТ ТУДА, КУДА МОЖНО ЗАГЛЯНУТЬ. Без этого шага красный job
-      # неотличим от очереди Actions: видно только, что коммита нет.
-      - name: Отчёт комментарием
+      - name: Отчёт файлом
         if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set +e
+          mkdir -p docs
           {
-            echo "### patch-note: патч код ${{ steps.patch.outputs.code }}, тесты код ${{ steps.run.outputs.code }}"
+            echo "# Отчёт patch-note"
+            echo
+            echo "дата: $(date -u +%FT%TZ)"
+            echo "коммит: $GITHUB_SHA"
+            echo "запуск: $GITHUB_RUN_ID"
+            echo "код патча: ${{ steps.patch.outputs.code }}"
+            echo "код pytest: ${{ steps.run.outputs.code }}"
+            echo
+            echo '## патч'
             echo '```'
-            cat patch.log 2>/dev/null || echo "patch.log отсутствует"
+            cat patch.txt 2>/dev/null || echo 'patch.txt не создан'
             echo '```'
+            echo
+            echo '## pytest, последние 12000 символов'
             echo '```'
-            tail -c 20000 out.txt 2>/dev/null || echo "out.txt отсутствует"
+            tail -c 12000 out.txt 2>/dev/null || echo 'out.txt не создан'
             echo '```'
-          } > report.md
-          gh pr comment 4 --body-file report.md || true
-
-      # Коммитим ТОЛЬКО ожидаемые пути. git add -A однажды затащил в
-      # репозиторий временный patch.txt — второй раз этой ошибки не будет.
-      # Коммит только на зелёных тестах: применённый и непроверенный патч
-      # хуже неприменённого.
-      - name: Коммит
-        if: steps.run.outputs.code == '0'
-        run: |
-          rm -f out.txt patch.log report.md
+          } > docs/patch-note-report.md
           git config user.name "modex-bot"
           git config user.email "bot@modex.local"
-          git add main.py src/analysis/volume_events.py
-          git add -u scripts/_patch_note.py
-          git commit -m "Надпись о норме объёма описывает факт (применено патч-скриптом)" \
-            || echo "нечего коммитить"
-          git push
+          git add docs/patch-note-report.md
+          if [ "${{ steps.run.outputs.code }}" = "0" ]; then
+            git add src/analysis/volume_events.py main.py
+            git add -A scripts
+          fi
+          git commit -m "patch-note: отчёт, и патч если тесты зелёные" || echo "нечего коммитить"
+          git push || echo "push не прошёл"
 
       - name: Итог
         run: |
-          test "${{ steps.patch.outputs.code }}" = "0" || exit 1
           test "${{ steps.run.outputs.code }}" = "0" || exit 1
