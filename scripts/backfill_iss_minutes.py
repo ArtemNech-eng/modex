@@ -8,6 +8,7 @@
     python scripts/backfill_iss_minutes.py 15          # глубже
     python scripts/backfill_iss_minutes.py 12 --dry    # только считать и сверять
     TICKERS=SBER,GAZP python scripts/backfill_iss_minutes.py 3 --dry   # проба
+    BACKFILL_UNIVERSE=0 python scripts/backfill_iss_minutes.py 12      # только конфиг
 
 АВТОЗАПУСКА НЕТ НАМЕРЕННО. Дозаливка нужна один раз; фоновая задача,
 кладущая чужие единицы в базу каждый час, ломала бы норму молча.
@@ -89,11 +90,51 @@ async def lots(client: httpx.AsyncClient) -> dict:
 
 
 def tickers_wanted() -> list:
+    """
+    Кого заливать. По умолчанию — СОСТАВ ПРОДА, а не список из конфига.
+
+    Прежняя версия брала MOEX_TICKERS (48 бумаг), и это МОЛЧА создало дыру:
+    стрим и сканер работают по составу ИЗ ОБОРОТА (80 бумаг), поэтому 05.08
+    прод говорил ровно так: «построена по 46 бумагам из 80; у остальных 34
+    истории мало — там работает скользящая». А скользящая при затяжном росте
+    объёма ползёт вместе с ним и гасит всплеск — то есть треть доски смотрела
+    худшим глазом без всякого предупреждения в логе.
+
+    Порядок: TICKERS= (проба) → состав из оборота → список из конфига.
+    Падение ISS не должно оставлять дозаливку вовсе без списка, поэтому
+    конфиг остаётся подкладкой, а не источником истины.
+
+    BACKFILL_UNIVERSE=0 возвращает старое поведение — на случай, если состав
+    из оборота окажется странным и надо будет сравнить с известным списком.
+    """
     env = (os.getenv("TICKERS") or "").strip()
     if env:
         return [t.strip().upper() for t in env.split(",") if t.strip()]
-    from config.settings import MOEX_TICKERS
-    return list(MOEX_TICKERS)
+    from config.settings import MOEX_TICKERS, SNAPSHOT_MAX
+    static = list(MOEX_TICKERS)
+    if (os.getenv("BACKFILL_UNIVERSE") or "").strip().lower() in ("0", "no", "false"):
+        print(f"состав: список из конфига, {len(static)} бумаг (BACKFILL_UNIVERSE=0)")
+        return static
+    try:
+        from src.analysis.universe import cached_universe
+        uni = cached_universe(max_n=(SNAPSHOT_MAX if SNAPSHOT_MAX > 0 else 80),
+                             fallback=static)
+        got = [str(t).upper() for t in (uni.get("tickers") or [])]
+        source = uni.get("source") or "оборот"
+    except Exception as e:                                       # noqa: BLE001
+        print(f"состав из оборота не получен ({type(e).__name__}) — "
+              f"беру список из конфига, {len(static)} бумаг")
+        return static
+    if not got:
+        print(f"состав из оборота пуст — беру список из конфига, {len(static)} бумаг")
+        return static
+    #  Бумаги из конфига, выпавшие из сегодняшнего оборота, всё равно
+    #  заливаются: по ним уже есть история, и терять её из-за смены
+    #  лидеров дня незачем: норма строится по ПРОШЛЫМ дням.
+    extra = [t for t in static if t not in set(got)]
+    print(f"состав: {len(got)} бумаг из оборота ({source})"
+          + (f" + {len(extra)} из конфига сверх него" if extra else ""))
+    return got + extra
 
 
 async def fetch_day(client, tk, day, lot):
