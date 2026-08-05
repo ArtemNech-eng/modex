@@ -258,9 +258,59 @@ def day_profile(rows_by_day: dict, lot: int = 1,
     return {mm: median(v) for mm, v in per.items() if v}
 
 
+# СВЕЖЕСТЬ ДАННЫХ. Бар не становится неправдой оттого, что состарился, но
+# СОБЫТИЕ становится: «оборот в 12 раз выше нормы» читается как «сейчас», а
+# метку времени рядом читает человек и не читает дашборд.
+#
+# Часы московские. Минутные ключи в базе московские (msk_minute в stream.py), а
+# контейнер живёт по UTC: сравнение московского бара с UTC-часами состарило бы
+# каждый бар ровно на три часа и выключило бы сканер целиком.
+MSK_SHIFT_H = 3
+
+# Предельный возраст меряется в ШАГАХ: у минутки три минуты, у пятиминутки
+# пятнадцать. Отрицательный возраст не отбрасывается — это разметка бара
+# минутой вперёд, а не данные из будущего.
+MAX_AGE_STEPS = 3
+
+
+def _now_msk():
+    return _dt.datetime.utcnow() + _dt.timedelta(hours=MSK_SHIFT_H)
+
+
+def _as_dt(ts):
+    try:
+        return _dt.datetime.strptime(str(ts)[:16], "%Y-%m-%dT%H:%M")
+    except (TypeError, ValueError):
+        return None
+
+
+def _age_min(ts, at=None) -> Optional[float]:
+    """Сколько минут назад закрылся бар. `at` — «сейчас», задаётся в тестах."""
+    t = _as_dt(ts)
+    ref = _as_dt(at) if at else _now_msk()
+    if t is None or ref is None:
+        return None
+    return round((ref - t).total_seconds() / 60.0, 1)
+
+
+def _contiguous(bs: list, step: int) -> bool:
+    """
+    Идут ли бары подряд, минута в минуту.
+
+    Срез списка ничего не говорит о времени: между соседними элементами может
+    лежать пропущенная тихая минута или целая ночь. Ряд 23:47 → 23:49 → 06:52
+    как срез выглядит непрерывным.
+    """
+    ts = [_as_dt(b.get("ts")) for b in (bs or ())]
+    if len(ts) < 2 or any(t is None for t in ts):
+        return False
+    gap = _dt.timedelta(minutes=step)
+    return all(b - a == gap for a, b in zip(ts, ts[1:]))
+
+
 def detect_step(rows: list, step: int, lot: int = 1,
                 profile: Optional[dict] = None,
-                p: Optional[dict] = None) -> list:
+                p: Optional[dict] = None, at=None) -> list:
     """
     События объёма одного шага. Считается ТОЛЬКО по закрытым барам.
 
@@ -277,6 +327,12 @@ def detect_step(rows: list, step: int, lot: int = 1,
     last = closed[-1]
     now = vals[-1]
     if now <= 0:
+        return []
+    # СТАРЫЙ БАР — НЕ СОБЫТИЕ. Поток мог встать, бумага могла уйти с торгов, а
+    # на дворе может быть ночь после вечерней сессии. Возраст кладётся в само
+    # событие: пусть тот, кто берёт поля, видит его наравне с кратностью.
+    age = _age_min(last.get("ts"), at)
+    if age is None or age > p["max_age"] * step:
         return []
     # Ниже собственной позиции сравнивать не с чем: он был бы всей минутой.
     if now < p["floor"] * step:
@@ -347,14 +403,17 @@ def detect_step(rows: list, step: int, lot: int = 1,
             step, last, rub=round(now), base_rub=round(base),
             times=(None if thin else round(mult, 2)),
             times_vs_thin_base=(round(mult, 2) if thin else None),
-            base_source=source, base_thin=thin))
+            age_min=age, base_source=source, base_thin=thin))
 
     # 2. УСКОРЕНИЕ ОБЪЁМА — момент, когда он ПОШЁЛ, а не «сегодня много».
     #
     #    Требуется и то, и другое: подряд растущие бары И значимость. Ряд
     #    1 → 1.4 → 2 → 2.8 формально ускоряется, но это ничто.
     gb = p["grow_bars"]
-    if len(vals) >= gb + 1 and mult >= p["grow_min_mult"]:
+    # Непрерывность обязательна: «подряд» — про время, а не про соседство в
+    # списке. Дыра в ряду превращала вечер и следующее утро в один разгон.
+    if (len(vals) >= gb + 1 and mult >= p["grow_min_mult"]
+            and _contiguous(closed[-gb - 1:], step)):
         tail = vals[-gb - 1:]
         steps_ok = all(tail[i + 1] >= tail[i] * p["grow"] and tail[i] > 0
                        for i in range(len(tail) - 1))
@@ -367,7 +426,7 @@ def detect_step(rows: list, step: int, lot: int = 1,
                 step, last, rub=round(now), base_rub=round(base),
                 times=(None if thin else round(mult, 2)),
                 times_vs_thin_base=(round(mult, 2) if thin else None),
-                bars_growing=gb,
+                bars_growing=gb, age_min=age,
                 series=[round(v) for v in tail], base_source=source,
                 base_thin=thin))
     return out
@@ -375,20 +434,21 @@ def detect_step(rows: list, step: int, lot: int = 1,
 
 DEFAULTS = {"look": LOOK, "surge": SURGE, "grow_bars": GROW_BARS,
             "grow": GROW, "grow_min_mult": GROW_MIN_MULT,
-            "floor": FLOOR_RUB, "thin": THIN_RUB}
+            "floor": FLOOR_RUB, "thin": THIN_RUB,
+            "max_age": MAX_AGE_STEPS}
 
 
 def detect(rows: list, lot: int = 1, profile: Optional[dict] = None,
-           steps: tuple = STEPS, p: Optional[dict] = None) -> list:
+           steps: tuple = STEPS, p: Optional[dict] = None, at=None) -> list:
     out = []
     for st in steps:
-        out.extend(detect_step(rows, st, lot=lot, profile=profile, p=p))
+        out.extend(detect_step(rows, st, lot=lot, profile=profile, p=p, at=at))
     return out
 
 
 def scan(minutes: dict, lots: Optional[dict] = None,
          profiles: Optional[dict] = None, steps: tuple = STEPS,
-         p: Optional[dict] = None) -> list:
+         p: Optional[dict] = None, at=None) -> list:
     """
     Пройти по всем бумагам и вернуть тех, у кого объём необычен.
 
@@ -399,7 +459,8 @@ def scan(minutes: dict, lots: Optional[dict] = None,
     out = []
     for tk, rows in (minutes or {}).items():
         evs = detect(list(rows or ()), lot=(lots or {}).get(tk) or 1,
-                     profile=(profiles or {}).get(tk), steps=steps, p=p)
+                     profile=(profiles or {}).get(tk), steps=steps, p=p,
+                     at=at)
         if evs:
             # СОРТИРОВКА ТОЛЬКО ПО НАСТОЯЩЕЙ КРАТНОСТИ. Раньше верх доски
             # занимали бумаги с шумом в знаменателе: ASTR ×30.0, RASP ×28.77 —
@@ -450,6 +511,26 @@ def warming_up(minutes: dict, steps: tuple = STEPS,
             continue
         ph = _phase(cl[-1].get("ts"))
         if sum(1 for b in cl[:-1] if _phase(b.get("ts")) == ph) < NEED:
+            n += 1
+    return n
+
+
+def stale(minutes: dict, at=None, p: Optional[dict] = None) -> int:
+    """
+    Сколько бумаг молчат не потому, что тихо, а потому что данные устарели.
+
+    Без этого числа пустая таблица читается как «на рынке спокойно», хотя
+    правда может быть «поток встал полчаса назад». Это тот же урок, что дали
+    below_floor и warming_up: молчание обязано называть причину.
+    """
+    p = {**DEFAULTS, **(p or {})}
+    n = 0
+    for _tk, rows in (minutes or {}).items():
+        cl = [b for b in bars(list(rows or ()), 1) if b.get("complete")]
+        if not cl:
+            continue
+        age = _age_min(cl[-1].get("ts"), at)
+        if age is None or age > p["max_age"]:
             n += 1
     return n
 
