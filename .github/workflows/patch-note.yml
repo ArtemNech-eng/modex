@@ -1,0 +1,78 @@
+# Применение патч-скрипта к main.py и volume_events.py.
+#
+# Зачем workflow: у агента нет построчной правки файлов, только запись файла
+# целиком, а main.py это 50 КБ — перепечатывание уже обрывалось на середине.
+# Поэтому правка описывается точными заменами в скрипте, а применяет их CI,
+# где есть и файл, и git.
+#
+# paths ограничивает запуск самим скриптом, а скрипт удаляет себя — повторных
+# запусков не будет. Пуши бота workflow не поднимают (так устроен GITHUB_TOKEN),
+# цикла не возникает.
+name: patch-note
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/_patch_note.py'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Патч не валит job сразу при неудачном якоре: сначала нужен отчёт и
+      # результат тестов, иначе разбираться будет нечем. Скрипт всегда
+      # выходит нулём, а об отказе кричит тест.
+      - name: Патч
+        id: patch
+        run: |
+          set +e
+          python scripts/_patch_note.py | tee patch.log
+          echo "code=$?" >> $GITHUB_OUTPUT
+          cat patch.log >> $GITHUB_STEP_SUMMARY
+
+      - name: Зависимости
+        run: pip install pytest httpx==0.27.0
+
+      - name: pytest
+        id: run
+        run: |
+          set +e
+          python -m pytest -q -rA \
+            tests/test_volume_events.py \
+            tests/test_profile_note.py \
+            tests/test_figi_failure_reason.py > out.txt 2>&1
+          echo "code=$?" >> $GITHUB_OUTPUT
+          echo '### pytest: сканер объёма, надпись о норме, причина пустого FIGI' >> $GITHUB_STEP_SUMMARY
+          tail -c 50000 out.txt >> $GITHUB_STEP_SUMMARY
+
+      # Коммитим ТОЛЬКО ожидаемые пути. git add -A однажды затащил в
+      # репозиторий временный patch.txt — второй раз этой ошибки не будет.
+      # Коммит только на зелёных тестах: применённый и непроверенный патч
+      # хуже неприменённого.
+      - name: Коммит
+        if: steps.run.outputs.code == '0'
+        run: |
+          rm -f out.txt patch.log
+          git config user.name "modex-bot"
+          git config user.email "bot@modex.local"
+          git add main.py src/analysis/volume_events.py
+          git add -u scripts/_patch_note.py
+          git commit -m "Надпись о норме объёма описывает факт (применено патч-скриптом)" \
+            || echo "нечего коммитить"
+          git push
+
+      - name: Итог
+        run: |
+          test "${{ steps.patch.outputs.code }}" = "0" || exit 1
+          exit ${{ steps.run.outputs.code }}
