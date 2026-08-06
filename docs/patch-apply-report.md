@@ -1,46 +1,23 @@
 # Отчёт patch-apply
 
-дата: 2026-08-06T09:24:34Z
-коммит: 1a027083b96f471f2cad56e1e6972822e3adf56c
-запуск: 31088958499
+дата: 2026-08-06T13:43:25Z
+коммит: 6c3ea384abf6a36a57f8d5a1a1a41e2552e197cb
+запуск: 31107247386
 код патча: 0
-код pytest: 0
+код pytest: 1
 
 ## патч
 ```
-== scripts/_patch_turnover_store.py
-turnover: импорт money: применено
-turnover: колонки CandleMinute: применено
-turnover: миграция candle_minute: применено
-turnover: создание строки: применено
-turnover: подсчёт рублей: применено
-итог: применено 5, уже было 0, отказов 0
+== scripts/_patch_market_minute.py
+market: модель MarketMinute: применено
+market: запись и чтение фона: применено
+итог: применено 2, уже было 0, отказов 0
 скрипт удалил себя
 ```
 
 ## pytest, последние 12000 символов
 ```
-short_days_do_not_count
-PASSED tests/test_volume_events.py::test_unparseable_day_key_is_dropped_not_crashed
-PASSED tests/test_volume_events.py::test_thin_baseline_is_marked_and_not_called_a_multiple
-PASSED tests/test_volume_events.py::test_normal_baseline_keeps_the_multiple
-PASSED tests/test_volume_events.py::test_morning_bars_are_not_a_baseline_for_the_main_session
-PASSED tests/test_volume_events.py::test_not_enough_own_session_bars_means_no_event
-PASSED tests/test_volume_events.py::test_surge_inside_one_session_still_fires
-PASSED tests/test_volume_events.py::test_warming_up_is_counted
-PASSED tests/test_volume_events.py::test_thin_threshold_is_not_the_floor
-PASSED tests/test_volume_events.py::test_thin_does_not_scale_with_step
-PASSED tests/test_volume_events.py::test_absurd_multiple_is_still_caught
-PASSED tests/test_volume_events.py::test_real_awakening_keeps_its_multiple
-PASSED tests/test_volume_events.py::test_thin_base_has_no_multiple_field_at_all
-PASSED tests/test_volume_events.py::test_accelerating_on_thin_base_also_loses_the_multiple
-PASSED tests/test_volume_events.py::test_thin_ticker_is_not_ranked_above_real_money
-PASSED tests/test_volume_events.py::test_normal_money_keeps_the_multiple_field
-PASSED tests/test_volume_events.py::test_profile_gap_agrees_with_the_real_filter_at_the_boundary
-PASSED tests/test_volume_events.py::test_profile_gap_names_weekends_and_short_days
-PASSED tests/test_volume_events.py::test_profile_gap_says_when_there_is_nothing_at_all
-PASSED tests/test_volume_events.py::test_unparseable_day_is_not_counted_as_a_trading_day
-PASSED tests/test_volume_events.py::test_the_note_carries_the_numbers_not_just_words
+rries_the_numbers_not_just_words
 PASSED tests/test_volume_events.py::test_the_note_says_when_there_is_nothing_at_all
 PASSED tests/test_volume_events.py::test_the_builder_asks_for_the_reason_and_stays_short
 PASSED tests/test_profile_note.py::test_nothing_built_keeps_the_old_explanation
@@ -173,5 +150,20 @@ PASSED tests/test_money.py::test_цена_бара_пустой_свечи_эт�
 PASSED tests/test_money.py::test_свеча_целиком
 PASSED tests/test_money.py::test_свеча_без_лотности_не_считается
 PASSED tests/test_money.py::test_свеча_пустая_не_падает
-188 passed in 0.80s
+PASSED tests/test_iss_index.py::test_живой_ответ_разбирается
+PASSED tests/test_iss_index.py::test_возраст_считается_от_метки_биржи
+PASSED tests/test_iss_index.py::test_возраст_не_от_времени_запроса
+PASSED tests/test_iss_index.py::test_свежее_значение_не_помечается_несвежим
+PASSED tests/test_iss_index.py::test_часы_разошлись_на_секунды_это_не_ошибка
+PASSED tests/test_iss_index.py::test_метка_из_будущего_всё_же_подозрительна
+PASSED tests/test_iss_index.py::test_нет_текущего_значения_значит_нет_ответа
+PASSED tests/test_iss_index.py::test_нулевое_значение_индекса_это_мусор
+PASSED tests/test_iss_index.py::test_колонки_читаются_по_имени_а_не_по_номеру
+PASSED tests/test_iss_index.py::test_пустой_и_сломанный_ответ_не_падают
+PASSED tests/test_iss_index.py::test_строка_короче_колонок_это_отказ_а_не_сдвиг
+PASSED tests/test_iss_index.py::test_метка_времени_мусорная_возраст_неизвестен
+PASSED tests/test_iss_index.py::test_отсутствующее_поле_отсутствует_а_не_равно_нулю
+PASSED tests/test_iss_index.py::test_адрес_без_токена_и_с_нужным_именем
+FAILED tests/test_iss_index.py::test_граница_свежести_это_число_в_коде - ValueError: second must be in 0..59
+1 failed, 202 passed in 0.82s
 ```
