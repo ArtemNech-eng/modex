@@ -172,3 +172,31 @@ def test_полнота_не_превышает_единицы_на_потоке
     comp = ds.completeness(rows, DAY, AT)
     assert comp["основная"]["есть"] == 60
     assert comp["основная"]["доля"] <= 1.0
+
+
+def test_рубли_пришиваются_к_своей_минуте():
+    candles = [c("2026-08-06T10:00"), c("2026-08-06T10:01")]
+    money = [{"ts": "2026-08-06T10:01", "turnover_rub": 520271.244, "lot": 10}]
+    out = ds.attach_money(candles, money)
+    assert "turnover_rub" not in out[0]
+    assert out[1]["turnover_rub"] == 520271.24
+    assert out[1]["lot"] == 10
+
+
+def test_нулевой_лот_не_выдаётся_за_знание():
+    """Ноль в базе — это «не знаем». Наружу он идти не должен."""
+    out = ds.attach_money([c("2026-08-06T10:00")],
+                          [{"ts": "2026-08-06T10:00", "turnover_rub": 0.0, "lot": 0}])
+    assert "turnover_rub" not in out[0] and "lot" not in out[0]
+
+
+def test_исходные_свечи_не_меняются():
+    candles = [c("2026-08-06T10:00")]
+    ds.attach_money(candles, [{"ts": "2026-08-06T10:00", "turnover_rub": 5, "lot": 1}])
+    assert "turnover_rub" not in candles[0]
+
+
+def test_секунды_в_ключе_не_мешают_совпадению():
+    out = ds.attach_money([c("2026-08-06T10:00")],
+                          [{"ts": "2026-08-06T10:00:00", "turnover_rub": 7, "lot": 1}])
+    assert out[0]["turnover_rub"] == 7.0

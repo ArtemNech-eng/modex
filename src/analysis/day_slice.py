@@ -244,6 +244,43 @@ def block(rows, day, at=None):
     }
 
 
+def attach_money(candles, money):
+    """
+    Пришить к свечам рубли и лотность из сырых строк таблицы.
+
+    ЗАЧЕМ ЭТО НУЖНО. Колонки lot и turnover_rub в базе есть и заполняются,
+    но читатель свечей собирает словарь руками из девяти полей и новые
+    колонки туда не попадают. Наличие колонки в таблице НЕ ЗНАЧИТ, что
+    читатель её отдаёт.
+
+    НОЛЬ НЕ ПРОХОДИТ. lot = 0 в базе означает «не знаем», а не «лот нулевой»;
+    turnover_rub = 0 означает «не посчитано», а не «торгов не было». Такой ноль
+    наружу не едет: лучше отсутствующий ключ и пункт в missing, чем число,
+    на которое потребитель тихо умножит.
+
+    Строки не мутируются — возвращаются копии.
+    """
+    money_by_ts = {}
+    for r in money or []:
+        ts = str(r.get("ts") or "")[:16]
+        if ts:
+            money_by_ts[ts] = r
+    out = []
+    for c in candles or []:
+        ts = str(c.get("ts") or "")[:16]
+        row = dict(c)
+        src = money_by_ts.get(ts)
+        if src:
+            rub = src.get("turnover_rub")
+            lot = src.get("lot")
+            if rub:
+                row["turnover_rub"] = round(float(rub), 2)
+            if lot:
+                row["lot"] = int(lot)
+        out.append(row)
+    return out
+
+
 def assemble(ticker, day, blocks, history=None, market=None, at=None):
     """
     Собрать день по одной бумаге.
