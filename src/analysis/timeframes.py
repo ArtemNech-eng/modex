@@ -27,6 +27,7 @@
 ПРИЧИННОСТЬ. Всё считается по прошлым и текущим барам, ничего из будущего. Ряд
 ожидается по возрастанию времени.
 """
+from datetime import date
 from typing import Optional
 
 STEPS = (1, 3, 5, 15, 30)      # минут в баре
@@ -57,6 +58,27 @@ def _vol(row: dict) -> float:
         return 0.0
 
 
+def _abs_minute(ts: str) -> Optional[int]:
+    """
+    Минута от начала эпохи, а не минута суток.
+
+    Ключ бара считался как минута суток, делённая на шаг. Из-за этого вчерашние
+    10:30 и сегодняшние 10:30 были ОДНИМ ключом: вчерашний бар помечался
+    формирующимся и выбрасывался из середины истории, а ночь склеивалась с утром.
+
+    Границы баров остаются там же, где были: день делится на шаг нацело
+    (1440 % шаг == 0 для 1, 3, 5, 15 и 30).
+    """
+    mm = _minute_of_day(ts)
+    if mm is None:
+        return None
+    try:
+        base = date(int(ts[0:4]), int(ts[5:7]), int(ts[8:10])).toordinal()
+    except (TypeError, ValueError, IndexError):
+        return mm
+    return base * 1440 + mm
+
+
 def _minute_of_day(ts: str) -> Optional[int]:
     try:
         return int(ts[11:13]) * 60 + int(ts[14:16])
@@ -79,11 +101,11 @@ def bars(rows: list, step: int) -> list:
     out: list = []
     last_ts = rows[-1].get("ts")
     last_key = None
-    mm_last = _minute_of_day(last_ts)
+    mm_last = _abs_minute(last_ts)
     if mm_last is not None:
         last_key = mm_last // step
     for r in rows:
-        mm = _minute_of_day(r.get("ts"))
+        mm = _abs_minute(r.get("ts"))
         hi, lo, cl = _num(r, "high"), _num(r, "low"), _num(r, "close")
         if mm is None or hi is None or lo is None or cl is None:
             continue

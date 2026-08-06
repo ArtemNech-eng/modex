@@ -29,6 +29,7 @@
 Это не довод против детектора: детектор ОПИСЫВАЕТ, что случилось. Но ни одно
 поле здесь не называется сигналом, и «найден откат» не значит «пора покупать».
 """
+from datetime import datetime, timedelta, timezone
 from statistics import median
 from typing import Optional
 
@@ -127,6 +128,65 @@ BREAK_SCALE = 1.0
 FALSE_BARS = 3         # столько баров есть у ложного пробоя, чтобы вернуться
 
 
+MSK_SHIFT_H = 3        # контейнер живёт по UTC, ключи баров московские
+MAX_AGE_STEPS = 2      # столько баров своего шага событию позволено прожить
+MAX_HOLE_MIN = 15      # дыра длиннее — разрыв сессии, а не тихие минуты
+
+
+def _now_msk() -> datetime:
+    """Московское время без зоны: метки баров тоже без зоны и московские."""
+    return (datetime.now(timezone.utc).replace(tzinfo=None)
+            + timedelta(hours=MSK_SHIFT_H))
+
+
+def _as_dt(ts):
+    try:
+        return datetime(int(ts[0:4]), int(ts[5:7]), int(ts[8:10]),
+                        int(ts[11:13]), int(ts[14:16]))
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _age_min(ts, step: int = 1, at=None):
+    """
+    Сколько минут прошло с ЗАКРЫТИЯ бара.
+
+    Метка бара — его ПЕРВАЯ минута, поэтому к ней прибавляется шаг. Иначе
+    только что закрывшийся получасовой бар выглядел бы получасовой стариной.
+
+    Отрицательный возраст допустим: метки биржи бывают впереди часов.
+    """
+    dt = _as_dt(ts)
+    if dt is None:
+        return None
+    end = dt + timedelta(minutes=max(1, int(step or 1)))
+    return round(((at or _now_msk()) - end).total_seconds() / 60.0, 1)
+
+
+def _last_run(closed: list, step: int, max_hole_min: int) -> list:
+    """
+    Оставить последний отрезок баров, идущих подряд ВО ВРЕМЕНИ.
+
+    Почему здесь, а не в каждом детекторе: разрыв одинаково портит и ходы, и
+    структуру, и откат, и пробои. Одно место лечения вместо четырёх.
+
+    Пятнадцать минут выбраны так, чтобы вечерний перерыв 18:40–18:59 рвал
+    отрезок, а тихие минуты неликвида — нет.
+    """
+    if len(closed) < 2:
+        return closed
+    i = len(closed) - 1
+    while i > 0:
+        k1 = closed[i].get("key")
+        k0 = closed[i - 1].get("key")
+        if not isinstance(k1, int) or not isinstance(k0, int):
+            break
+        if (k1 - k0 - 1) * max(1, int(step or 1)) > max_hole_min:
+            break
+        i -= 1
+    return closed[i:]
+
+
 def _moves(closed: list) -> list:
     """Ходы между закрытиями соседних баров."""
     return [closed[i]["close"] - closed[i - 1]["close"]
@@ -181,16 +241,28 @@ def _ev(kind: str, why: str, step: int, bar: dict, **nums) -> dict:
 
 
 def detect_step(rows: list, step: int, tick: float = 0.01,
-                levels: Optional[list] = None, p: Optional[dict] = None) -> list:
+                levels: Optional[list] = None, p: Optional[dict] = None,
+                at=None) -> list:
     """
     События одного шага. `rows` — минутные бары по возрастанию времени.
 
     Считается ТОЛЬКО по закрытым барам: незакрытый отбрасывается целиком.
+
+    И только по последнему НЕПРЕРЫВНОМУ отрезку: дыра длиннее `max_hole`
+    минут обрывает историю — ночь не является ходом цены.
+
+    И только если последний бар свежий: событие не переживает бар, который
+    описывает. Часы можно передать параметром `at` — иначе правило невозможно
+    проверить тестом.
     """
     p = {**DEFAULTS, **(p or {})}
     bs = bars(rows, step)
     closed = [b for b in bs if b.get("complete")]
+    closed = _last_run(closed, step, p["max_hole"])
     if len(closed) < NEED:
+        return []
+    age = _age_min(closed[-1].get("ts"), step, at)
+    if age is None or age > p["max_age"] * max(1, int(step or 1)):
         return []
     moves = _moves(closed)
     scale = _scale(moves[-p["look"]:])
@@ -250,6 +322,10 @@ def detect_step(rows: list, step: int, tick: float = 0.01,
     if flip:
         out.append(_ev("direction_changed", flip[1], step, last,
                        was=flip[0], now=flip[2]))
+    #  Возраст СВОЙ у каждого события, а не общий: ложный пробой датируется
+    #  баром возврата, и один на всех возраст был бы ложью.
+    for e in out:
+        e["age_min"] = _age_min(e.get("ts"), step, at)
     return out
 
 
@@ -258,7 +334,8 @@ DEFAULTS = {"look": LOOK, "sharp": SHARP, "quiet": QUIET,
             "pull_max": PULL_MAX, "break_ticks": BREAK_TICKS,
             "break_scale": BREAK_SCALE,
             "false_bars": FALSE_BARS, "leg_scale": LEG_SCALE,
-            "pull_bars": PULL_BARS}
+            "pull_bars": PULL_BARS,
+            "max_age": MAX_AGE_STEPS, "max_hole": MAX_HOLE_MIN}
 
 
 def _leg(closed: list, look: int) -> Optional[dict]:
@@ -418,16 +495,16 @@ def _structure_flip(closed: list, min_move: float = 0.0):
 
 
 def detect(rows: list, tick: float = 0.01, levels: Optional[list] = None,
-           steps: tuple = STEPS, p: Optional[dict] = None) -> list:
+           steps: tuple = STEPS, p: Optional[dict] = None, at=None) -> list:
     """Все события бумаги по всем шагам, от старых к новым."""
     out = []
     for st in steps:
-        out.extend(detect_step(rows, st, tick=tick, levels=levels, p=p))
+        out.extend(detect_step(rows, st, tick=tick, levels=levels, p=p, at=at))
     return out
 
 
 def events_for(rows: list, tick: float = 0.01, steps: tuple = STEPS,
-               p: Optional[dict] = None) -> list:
+               p: Optional[dict] = None, at=None) -> list:
     """
     События одной бумаги с КАНОНИЧЕСКИМИ входными данными.
 
@@ -443,7 +520,8 @@ def events_for(rows: list, tick: float = 0.01, steps: tuple = STEPS,
                            price_now=rows[-1].get("close"), top=LEVELS_TOP)
     except Exception:                                        # noqa: BLE001
         lv = []
-    return detect(rows, tick=tick or 0.01, levels=lv, steps=steps, p=p)
+    return detect(rows, tick=tick or 0.01, levels=lv, steps=steps, p=p,
+                  at=at)
 
 
 def board(minutes: dict, steps: tuple = STEPS) -> dict:
@@ -508,7 +586,7 @@ def board(minutes: dict, steps: tuple = STEPS) -> dict:
 
 def scan(minutes: dict, ticks: Optional[dict] = None,
          levels: Optional[dict] = None, steps: tuple = STEPS,
-         p: Optional[dict] = None) -> list:
+         p: Optional[dict] = None, at=None) -> list:
     """
     Пройти по ВСЕМ бумагам и вернуть список тех, у кого что-то нашлось.
 
@@ -527,15 +605,35 @@ def scan(minutes: dict, ticks: Optional[dict] = None,
         if levels is not None and tk in levels:
             # Уровни переданы снаружи — уважаем их (так делают тесты).
             evs = detect(list(rows or ())[-WINDOW:], tick=tick,
-                         levels=levels[tk], steps=steps, p=p)
+                         levels=levels[tk], steps=steps, p=p,
+                         at=at)
         else:
             # Иначе КАНОНИЧЕСКИЙ путь, тот же, что у карточки.
-            evs = events_for(rows, tick=tick, steps=steps, p=p)
+            evs = events_for(rows, tick=tick, steps=steps, p=p, at=at)
         if evs:
             out.append({"ticker": tk, "events": evs, "count": len(evs),
                         "kinds": sorted({e["kind"] for e in evs})})
     out.sort(key=lambda x: (-x["count"], x["ticker"]))
     return out
+
+
+def stale(minutes: dict, at=None, p=None) -> int:
+    """
+    Сколько бумаг молчат не потому, что тихо, а потому, что данные протухли.
+
+    Пустая таблица имеет несколько разных причин, и они обязаны различаться.
+    Без этого числа молчание сканера неотличимо от исправной тишины.
+    """
+    p = {**DEFAULTS, **(p or {})}
+    n = 0
+    for rows in (minutes or {}).values():
+        rows = list(rows or ())
+        if not rows:
+            continue
+        age = _age_min(rows[-1].get("ts"), 1, at)
+        if age is None or age > p["max_age"]:
+            n += 1
+    return n
 
 
 def rates_by_step(scanned: list, total: int) -> dict:

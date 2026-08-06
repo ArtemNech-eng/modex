@@ -1,10 +1,10 @@
 # Отчёт patch-apply
 
-дата: 2026-08-06T08:06:38Z
-коммит: e3aa1d389b223bbf23861b9c1293685d3e02814c
-запуск: 31083532399
+дата: 2026-08-06T08:19:56Z
+коммит: bd9ba406a8c6267db8e0220a6efae306d037241d
+запуск: 31084441138
 код патча: 0
-код pytest: 1
+код pytest: 0
 
 ## патч
 ```
@@ -27,11 +27,18 @@ timeframes: ключ последнего бара: применено
 timeframes: ключ строки: применено
 итог: применено 15, уже было 1, отказов 0
 Скрипт удалил себя.
+== scripts/_patch_scan_signature.py
+scan: применено
+итог: применено 1, уже было 0, отказов 0
+Скрипт удалил себя.
 ```
 
 ## pytest, последние 12000 символов
 ```
-ts.py::test_measured_flatness_of_rvol_is_written_next_to_the_code
+ase_frequency
+PASSED tests/test_volume_events.py::test_scan_survives_junk
+PASSED tests/test_volume_events.py::test_no_verdict_fields
+PASSED tests/test_volume_events.py::test_measured_flatness_of_rvol_is_written_next_to_the_code
 PASSED tests/test_volume_events.py::test_thresholds_are_marked_as_guesses
 PASSED tests/test_volume_events.py::test_rubles_are_documented_as_an_approximation
 PASSED tests/test_volume_events.py::test_scanner_endpoint_exists
@@ -119,6 +126,9 @@ PASSED tests/test_price_events.py::test_no_levels_no_break_events
 PASSED tests/test_price_events.py::test_direction_change_is_structural_not_one_bar
 PASSED tests/test_price_events.py::test_one_red_bar_inside_a_rise_is_not_a_direction_change
 PASSED tests/test_price_events.py::test_events_carry_their_timeframe
+PASSED tests/test_price_events.py::test_scan_returns_a_list_of_tickers_not_cards
+PASSED tests/test_price_events.py::test_scan_orders_by_count_then_alphabet
+PASSED tests/test_price_events.py::test_scan_survives_junk
 PASSED tests/test_price_events.py::test_no_verdict_fields
 PASSED tests/test_price_events.py::test_measured_negatives_are_written_next_to_the_code
 PASSED tests/test_price_events.py::test_thresholds_are_marked_as_guesses
@@ -131,6 +141,7 @@ PASSED tests/test_price_events.py::test_flat_series_still_has_an_absolute_floor
 PASSED tests/test_price_events.py::test_false_break_says_how_long_it_took_not_how_many_stayed
 PASSED tests/test_price_events.py::test_break_reason_says_how_deep_in_units_of_the_ticker
 PASSED tests/test_price_events.py::test_card_and_scanner_give_the_same_answer
+PASSED tests/test_price_events.py::test_scan_uses_the_canonical_path_too
 PASSED tests/test_price_events.py::test_window_is_long_enough_for_every_advertised_step
 PASSED tests/test_price_events.py::test_rates_by_step_does_not_inflate_with_more_steps
 PASSED tests/test_price_events.py::test_board_covers_all_five_timeframes_from_the_task
@@ -180,9 +191,5 @@ PASSED tests/test_price_freshness.py::test_quiet_minutes_do_not_break_the_run
 PASSED tests/test_price_freshness.py::test_silence_from_staleness_is_counted
 PASSED tests/test_price_freshness.py::test_without_a_clock_it_uses_moscow_time
 PASSED tests/test_price_freshness.py::test_the_gate_is_a_number_and_not_a_guess_in_the_code
-FAILED tests/test_price_events.py::test_scan_returns_a_list_of_tickers_not_cards - NameError: name 'at' is not defined
-FAILED tests/test_price_events.py::test_scan_orders_by_count_then_alphabet - NameError: name 'at' is not defined
-FAILED tests/test_price_events.py::test_scan_survives_junk - NameError: name 'at' is not defined
-FAILED tests/test_price_events.py::test_scan_uses_the_canonical_path_too - NameError: name 'at' is not defined
-4 failed, 171 passed in 0.74s
+175 passed in 0.79s
 ```
