@@ -6,6 +6,10 @@
     python scripts/export_day.py SBER 2026-08-05 # конкретный день
     python scripts/export_day.py SBER 2026-08-05 5   # и 5 дней истории для нормы
 
+ПРО ПУТЬ ИМПОРТА. При запуске python scripts/файл.py интерпретатор кладёт
+в sys.path каталог САМОГО ФАЙЛА, а не корень проекта, и пакет src оказывается
+невидим. Поэтому корень добавляется явно и ДО импортов проекта.
+
 Вся логика сборки лежит в src/analysis/day_slice.py и покрыта тестами.
 Здесь только чтение таблиц: база в CI недоступна, поэтому этот файл
 никогда не импортируется тестами.
@@ -14,9 +18,12 @@ import asyncio
 import datetime
 import json
 import sys
+from pathlib import Path
 
-from src import db
-from src.analysis import day_slice as ds
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src import db                                    # noqa: E402
+from src.analysis import day_slice as ds              # noqa: E402
 
 
 def msk_today():
