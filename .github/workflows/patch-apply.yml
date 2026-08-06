@@ -47,6 +47,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install pytest httpx==0.27.0
 
+      #  СТАРЫЕ НАБОРЫ ЗДЕСЬ НЕ ДЛЯ ПОЛНОТЫ, А ДЛЯ ЗАЩИТЫ. Патч правит
+      #  price_events.py и timeframes.py; если он сломает обнаружение, это
+      #  увидят test_price_events.py и test_timeframes.py — и код НЕ будет
+      #  закоммичен, потому что коммит кода привязан к нулевому коду pytest.
       - name: pytest
         id: run
         continue-on-error: true
@@ -58,7 +62,10 @@ jobs:
             tests/test_floor_reason.py \
             tests/test_scanner_freshness.py \
             tests/test_api_profile_note.py \
-            tests/test_api_stale.py > out.txt 2>&1
+            tests/test_api_stale.py \
+            tests/test_price_events.py \
+            tests/test_timeframes.py \
+            tests/test_price_freshness.py > out.txt 2>&1
           echo "code=$?" >> "$GITHUB_OUTPUT"
           cat out.txt
 
@@ -90,6 +97,7 @@ jobs:
           git add docs/patch-apply-report.md
           if [ "${{ steps.run.outputs.code }}" = "0" ]; then
             git add src/analysis/volume_events.py src/api/main.py
+            git add src/analysis/price_events.py src/analysis/timeframes.py
             git add -A scripts
           fi
           git commit -m "patch-apply: отчёт, и патч если тесты зелёные" || echo "нечего коммитить"
