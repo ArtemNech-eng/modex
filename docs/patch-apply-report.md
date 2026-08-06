@@ -1,10 +1,10 @@
 # Отчёт patch-apply
 
-дата: 2026-08-06T13:43:25Z
-коммит: 6c3ea384abf6a36a57f8d5a1a1a41e2552e197cb
-запуск: 31107247386
+дата: 2026-08-06T16:26:09Z
+коммит: d53201fe0a7a08ccf580f3cf0f230ea2ed0b21f4
+запуск: 31119284876
 код патча: 0
-код pytest: 1
+код pytest: 0
 
 ## патч
 ```
@@ -13,11 +13,14 @@ market: модель MarketMinute: применено
 market: запись и чтение фона: применено
 итог: применено 2, уже было 0, отказов 0
 скрипт удалил себя
+== scripts/_patch_wake.py
+wake: будильник, код не трогал
+wake: удалил себя
 ```
 
 ## pytest, последние 12000 символов
 ```
-rries_the_numbers_not_just_words
+ED tests/test_volume_events.py::test_the_note_carries_the_numbers_not_just_words
 PASSED tests/test_volume_events.py::test_the_note_says_when_there_is_nothing_at_all
 PASSED tests/test_volume_events.py::test_the_builder_asks_for_the_reason_and_stays_short
 PASSED tests/test_profile_note.py::test_nothing_built_keeps_the_old_explanation
@@ -154,6 +157,7 @@ PASSED tests/test_iss_index.py::test_живой_ответ_разбираетс�
 PASSED tests/test_iss_index.py::test_возраст_считается_от_метки_биржи
 PASSED tests/test_iss_index.py::test_возраст_не_от_времени_запроса
 PASSED tests/test_iss_index.py::test_свежее_значение_не_помечается_несвежим
+PASSED tests/test_iss_index.py::test_граница_свежести_это_число_в_коде
 PASSED tests/test_iss_index.py::test_часы_разошлись_на_секунды_это_не_ошибка
 PASSED tests/test_iss_index.py::test_метка_из_будущего_всё_же_подозрительна
 PASSED tests/test_iss_index.py::test_нет_текущего_значения_значит_нет_ответа
@@ -164,6 +168,5 @@ PASSED tests/test_iss_index.py::test_строка_короче_колонок_э
 PASSED tests/test_iss_index.py::test_метка_времени_мусорная_возраст_неизвестен
 PASSED tests/test_iss_index.py::test_отсутствующее_поле_отсутствует_а_не_равно_нулю
 PASSED tests/test_iss_index.py::test_адрес_без_токена_и_с_нужным_именем
-FAILED tests/test_iss_index.py::test_граница_свежести_это_число_в_коде - ValueError: second must be in 0..59
-1 failed, 202 passed in 0.82s
+203 passed in 0.81s
 ```
