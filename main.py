@@ -645,6 +645,17 @@ async def stream_pipeline():
                                                 instance=stream.instance)
                 counts[f"стакан/{src}"] = counts.get(f"стакан/{src}", 0) + n
         for tk, rows in candle.items():
+            # ЛОТНОСТЬ ЕДЕТ ВМЕСТЕ СО СВЕЧОЙ. merge_candle_minutes умеет считать
+            # оборот в рублях, но только когда в строке есть lot >= 1. Стрим её
+            # в строку не клал, поэтому в базе у всех свечей lot = 0 и
+            # turnover_rub = 0, а ноль здесь читается как «рубли НЕ посчитаны» —
+            # это не то же самое, что тишина на бирже.
+            #
+            # Неизвестная лотность НЕ подменяется единицей: единица это тоже
+            # утверждение о бумаге, и для GAZP (10) или UGLD (1000) оно ложное.
+            lot = (stream.lots or {}).get(tk)
+            if lot:
+                rows = [{**r, "lot": int(lot)} for r in rows]
             n = await db.merge_candle_minutes(tk, rows)
             counts["свечи"] = counts.get("свечи", 0) + n
             # МИНУТНАЯ ИСТОРИЯ в память — для широты рынка. Считать её из базы
