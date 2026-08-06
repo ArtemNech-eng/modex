@@ -10,7 +10,7 @@
 в sys.path каталог САМОГО ФАЙЛА, а не корень проекта, и пакет src оказывается
 невидим. Поэтому корень добавляется явно и ДО импортов проекта.
 
-ДВЕ ЛОВУШКИ ЧИТАТЕЛЕЙ, ОПЛАЧЕННЫЕ ПУСТЫМИ БЛОКАМИ.
+ТРИ ЛОВУШКИ ЧИТАТЕЛЕЙ, ОПЛАЧЕННЫЕ ПУСТЫМИ БЛОКАМИ.
 
 1. У micro_series третий аргумент — source, а не шаг ряда. Переданный туда
    "1m" превращается в фильтр по несуществующему источнику и даёт МОЛЧАЛИВЫЙ
@@ -18,6 +18,9 @@
 2. У level_series limit=400 по умолчанию при сортировке по возрастанию ts,
    то есть без явного лимита видно только утро. За день по одной бумаге
    там десятки тысяч событий (61 615 на 1020 минут у SBER 06.08).
+3. candle_series не отдаёт lot и turnover_rub: словарь собирается руками из
+   девяти полей. Колонки в таблице есть и заполнены, поэтому рубли
+   берутся отдельным запросом и пришиваются по минуте (attach_money).
 
 Вся логика сборки лежит в src/analysis/day_slice.py и покрыта тестами.
 Здесь только чтение таблиц: база в CI недоступна, поэтому этот файл
@@ -31,8 +34,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src import db                                    # noqa: E402
-from src.analysis import day_slice as ds              # noqa: E402
+from sqlalchemy import select                          # noqa: E402
+
+from src import db                                     # noqa: E402
+from src.analysis import day_slice as ds               # noqa: E402
 
 # Потолок для чтения уровней. Наружу едет не сырой ряд, а сводка,
 # поэтому большое число строк раздувает память, а не ответ.
@@ -52,6 +57,24 @@ def prev_days(day, n):
             for i in range(1, n + 1)]
 
 
+async def money_rows(ticker, day):
+    """
+    Сырые рубли и лотность по минутам — три колонки и ничего больше.
+
+    Отдельный запрос вместо правки candle_series: читатель живёт в db.py
+    рядом с тремя тысячами строк боевого кода, а применить к нему патч
+    сейчас нечем: Actions не выделяют раннеры.
+    """
+    async with db.async_session() as s:
+        q = (select(db.CandleMinute.ts,
+                    db.CandleMinute.lot,
+                    db.CandleMinute.turnover_rub)
+             .where(db.CandleMinute.ticker == ticker.upper(),
+                    db.CandleMinute.ts.like(f"{day}%")))
+        rows = (await s.execute(q)).all()
+    return [{"ts": r[0], "lot": r[1], "turnover_rub": r[2]} for r in rows]
+
+
 async def main():
     ticker = (sys.argv[1] if len(sys.argv) > 1 else "SBER").upper()
     day = sys.argv[2] if len(sys.argv) > 2 else msk_today()
@@ -59,8 +82,11 @@ async def main():
 
     await db.setup_db()
 
+    candles = ds.attach_money(await db.candle_series(ticker, day, "1m"),
+                              await money_rows(ticker, day))
+
     blocks = {
-        "свечи": await db.candle_series(ticker, day, "1m"),
+        "свечи": candles,
         "поток": await db.flow_series(ticker, day, "1m"),
         "стакан": await db.book_series(ticker, day, "1m"),
         "секунды": await db.micro_series(ticker, day),
@@ -69,7 +95,8 @@ async def main():
 
     history = []
     for d in prev_days(day, hist_days):
-        history.extend(await db.candle_series(ticker, d, "1m"))
+        history.extend(ds.attach_money(await db.candle_series(ticker, d, "1m"),
+                                       await money_rows(ticker, d)))
 
     try:
         market = await db.market_series("IMOEX", day)
