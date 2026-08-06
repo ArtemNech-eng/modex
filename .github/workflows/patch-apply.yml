@@ -65,7 +65,8 @@ jobs:
             tests/test_api_stale.py \
             tests/test_price_events.py \
             tests/test_timeframes.py \
-            tests/test_price_freshness.py > out.txt 2>&1
+            tests/test_price_freshness.py \
+            tests/test_money.py > out.txt 2>&1
           echo "code=$?" >> "$GITHUB_OUTPUT"
           cat out.txt
 
@@ -98,6 +99,10 @@ jobs:
           if [ "${{ steps.run.outputs.code }}" = "0" ]; then
             git add src/analysis/volume_events.py src/api/main.py
             git add src/analysis/price_events.py src/analysis/timeframes.py
+            #  src/db.py и money.py — хранение оборота в рублях. Без этой строки
+            #  патч базы применялся бы, тесты проходили, а изменение МОЛЧА
+            #  не сохранялось — самый дорогой вид зелёного отчёта.
+            git add src/db.py src/analysis/money.py
             git add -A scripts
           fi
           git commit -m "patch-apply: отчёт, и патч если тесты зелёные" || echo "нечего коммитить"
