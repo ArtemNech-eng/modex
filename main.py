@@ -761,6 +761,8 @@ async def stream_pipeline():
     async def _market_background():
         import urllib.request as u, json as j
         from datetime import datetime as _dt
+        from src.collector.index_poll import (NAMES as INDEX_NAMES,
+                                              poll as poll_index)
         SECTORS = {
             "MOEXOG": "нефть и газ", "MOEXEU": "электроэнергетика",
             "MOEXTL": "телекомы", "MOEXMM": "металлы и добыча",
@@ -827,6 +829,13 @@ async def stream_pipeline():
                 pass
             return out
 
+        # Опросчику нужен способ достать JSON по адресу. Отдаём ему ту же
+        # urllib, что и остальному фону: лишней зависимости не заводим, а он
+        # остаётся проверяемым — в тестах вместо этой функции подставляется
+        # словарь-заглушка.
+        def _fetch_json(url):
+            return j.load(u.urlopen(url, timeout=25))
+
         try:
             sect = await asyncio.to_thread(_fetch_sectors)
             if sect:
@@ -842,6 +851,25 @@ async def stream_pipeline():
                     stream.imoex = got
             except Exception as e:                               # noqa: BLE001
                 logger.debug(f"IMOEX: {e}")
+            # ЗАПИСЬ ФОНА В БАЗУ. Выше значение кладётся в память и исчезает при
+            # каждом деплое; вопрос «что было с рынком в 14:32» отвечать нечем.
+            # Строки минутные, ключ «минута:имя», повтор той же минуты заменяет
+            # значение, а не складывает.
+            #
+            # ОТСУТСТВИЕ ОТВЕТА НЕ ПИШЕТСЯ НУЛЁМ: пропавшие имена уходят в
+            # missing и логируются. Ноль вместо «нет данных» аналитик прочитает
+            # как штиль на рынке, а это разные вещи.
+            try:
+                out = await asyncio.to_thread(poll_index, _fetch_json,
+                                              INDEX_NAMES)
+                rows = out.get("rows") or []
+                if rows:
+                    await db.merge_market_minutes(rows)
+                if out.get("missing"):
+                    logger.debug("фон рынка: нет ответа по %s",
+                                 ", ".join(out["missing"]))
+            except Exception as e:                               # noqa: BLE001
+                logger.debug(f"фон рынка в базу: {e}")
             await asyncio.sleep(30)
 
     # ЗАСЕВ МИНУТНОЙ ПАМЯТИ ИЗ БАЗЫ.
