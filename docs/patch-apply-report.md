@@ -1,49 +1,37 @@
 # Отчёт patch-apply
 
-дата: 2026-08-05T21:09:24Z
-коммит: e4e88efb2750bd6e286e09a09a1029147b71f137
-запуск: 31047394589
+дата: 2026-08-06T08:06:38Z
+коммит: e3aa1d389b223bbf23861b9c1293685d3e02814c
+запуск: 31083532399
 код патча: 0
-код pytest: 0
+код pytest: 1
 
 ## патч
 ```
-== scripts/_patch_stale_api.py
-stale в импорте маршрута: применено
-счётчик устаревших в ответе: применено
-итог: применено 2, отказов 0
+== scripts/_patch_price_scanner.py
+price: импорт времени: применено
+price: часы, возраст и непрерывный отрезок: применено
+price: пороги времени в DEFAULTS: применено
+price: ворота свежести в detect_step: применено
+price: возраст на каждом событии: применено
+price: часы через detect: применено
+price: часы в events_for: применено
+price: events_for передаёт часы: применено
+price: часы в scan: уже было
+price: scan → detect с часами: применено
+price: scan → events_for с часами: применено
+price: счётчик протухших: применено
+timeframes: импорт даты: применено
+timeframes: минута с датой: применено
+timeframes: ключ последнего бара: применено
+timeframes: ключ строки: применено
+итог: применено 15, уже было 1, отказов 0
 Скрипт удалил себя.
 ```
 
 ## pytest, последние 12000 символов
 ```
-........................................................................ [ 78%]
-....................                                                     [100%]
-==================================== PASSES ====================================
-=========================== short test summary info ============================
-PASSED tests/test_volume_events.py::test_turnover_is_in_rubles_with_lot_size
-PASSED tests/test_volume_events.py::test_price_enters_the_turnover
-PASSED tests/test_volume_events.py::test_forming_bar_is_ignored
-PASSED tests/test_volume_events.py::test_too_little_history
-PASSED tests/test_volume_events.py::test_baseline_skips_empty_minutes
-PASSED tests/test_volume_events.py::test_baseline_excludes_the_measured_bar
-PASSED tests/test_volume_events.py::test_no_baseline_no_events
-PASSED tests/test_volume_events.py::test_surge_is_the_case_from_the_request
-PASSED tests/test_volume_events.py::test_ordinary_volume_is_not_a_surge
-PASSED tests/test_volume_events.py::test_acceleration_matches_the_example
-PASSED tests/test_volume_events.py::test_growth_from_nothing_is_not_acceleration
-PASSED tests/test_volume_events.py::test_one_spike_is_not_acceleration
-PASSED tests/test_volume_events.py::test_growth_must_be_uninterrupted
-PASSED tests/test_volume_events.py::test_time_of_day_profile_needs_enough_days
-PASSED tests/test_volume_events.py::test_time_of_day_profile_is_used_when_present
-PASSED tests/test_volume_events.py::test_source_of_the_baseline_is_always_reported
-PASSED tests/test_volume_events.py::test_five_minute_step_sums_the_minutes_of_the_profile
-PASSED tests/test_volume_events.py::test_scan_orders_by_multiple_not_by_rubles
-PASSED tests/test_volume_events.py::test_scan_skips_quiet_tickers
-PASSED tests/test_volume_events.py::test_rates_report_base_frequency
-PASSED tests/test_volume_events.py::test_scan_survives_junk
-PASSED tests/test_volume_events.py::test_no_verdict_fields
-PASSED tests/test_volume_events.py::test_measured_flatness_of_rvol_is_written_next_to_the_code
+ts.py::test_measured_flatness_of_rvol_is_written_next_to_the_code
 PASSED tests/test_volume_events.py::test_thresholds_are_marked_as_guesses
 PASSED tests/test_volume_events.py::test_rubles_are_documented_as_an_approximation
 PASSED tests/test_volume_events.py::test_scanner_endpoint_exists
@@ -113,5 +101,88 @@ PASSED tests/test_api_stale.py::test_all_three_reasons_for_an_empty_table_are_re
 PASSED tests/test_api_stale.py::test_the_counter_is_not_pasted_twice
 PASSED tests/test_api_stale.py::test_the_field_sits_in_the_volume_scan_and_not_somewhere_else
 PASSED tests/test_api_stale.py::test_the_reason_is_explained_in_words_next_to_the_number
-92 passed in 0.64s
+PASSED tests/test_price_events.py::test_forming_bar_is_ignored
+PASSED tests/test_price_events.py::test_too_little_history_gives_nothing
+PASSED tests/test_price_events.py::test_flat_series_produces_no_events
+PASSED tests/test_price_events.py::test_sharp_threshold_scales_with_the_ticker
+PASSED tests/test_price_events.py::test_sharp_up_and_down_are_separate_kinds
+PASSED tests/test_price_events.py::test_move_started_needs_quiet_before_it
+PASSED tests/test_price_events.py::test_no_move_started_when_it_was_already_moving
+PASSED tests/test_price_events.py::test_move_stalled_after_a_one_sided_run
+PASSED tests/test_price_events.py::test_no_stall_while_it_keeps_going
+PASSED tests/test_price_events.py::test_pullback_returns_part_of_the_leg
+PASSED tests/test_price_events.py::test_a_single_counter_bar_is_not_a_pullback
+PASSED tests/test_price_events.py::test_full_retrace_is_not_a_pullback
+PASSED tests/test_price_events.py::test_level_break_on_the_last_bar
+PASSED tests/test_price_events.py::test_false_break_is_dated_by_the_return_bar
+PASSED tests/test_price_events.py::test_no_levels_no_break_events
+PASSED tests/test_price_events.py::test_direction_change_is_structural_not_one_bar
+PASSED tests/test_price_events.py::test_one_red_bar_inside_a_rise_is_not_a_direction_change
+PASSED tests/test_price_events.py::test_events_carry_their_timeframe
+PASSED tests/test_price_events.py::test_no_verdict_fields
+PASSED tests/test_price_events.py::test_measured_negatives_are_written_next_to_the_code
+PASSED tests/test_price_events.py::test_thresholds_are_marked_as_guesses
+PASSED tests/test_price_events.py::test_scanner_endpoint_exists_and_reports_rates
+PASSED tests/test_price_events.py::test_card_shows_the_tickers_own_price_events
+PASSED tests/test_price_events.py::test_scanner_page_is_a_list_not_cards
+PASSED tests/test_price_events.py::test_page_says_events_are_not_per_second
+PASSED tests/test_price_events.py::test_break_threshold_scales_with_the_ticker
+PASSED tests/test_price_events.py::test_flat_series_still_has_an_absolute_floor
+PASSED tests/test_price_events.py::test_false_break_says_how_long_it_took_not_how_many_stayed
+PASSED tests/test_price_events.py::test_break_reason_says_how_deep_in_units_of_the_ticker
+PASSED tests/test_price_events.py::test_card_and_scanner_give_the_same_answer
+PASSED tests/test_price_events.py::test_window_is_long_enough_for_every_advertised_step
+PASSED tests/test_price_events.py::test_rates_by_step_does_not_inflate_with_more_steps
+PASSED tests/test_price_events.py::test_board_covers_all_five_timeframes_from_the_task
+PASSED tests/test_price_events.py::test_board_answers_whether_the_move_is_built
+PASSED tests/test_price_events.py::test_board_does_not_call_ticks_a_move
+PASSED tests/test_price_events.py::test_strict_agreement_is_kept_strict_on_purpose
+PASSED tests/test_price_events.py::test_route_default_steps_come_from_the_module
+PASSED tests/test_timeframes.py::test_minutes_group_into_bars_of_the_step
+PASSED tests/test_timeframes.py::test_bar_takes_extremes_and_last_close
+PASSED tests/test_timeframes.py::test_current_bar_is_marked_forming
+PASSED tests/test_timeframes.py::test_full_bar_containing_the_last_minute_is_still_forming
+PASSED tests/test_timeframes.py::test_empty_and_broken_input
+PASSED tests/test_timeframes.py::test_non_numeric_volume_does_not_kill_the_whole_block
+PASSED tests/test_timeframes.py::test_higher_high_and_higher_low_is_up
+PASSED tests/test_timeframes.py::test_lower_high_and_lower_low_is_down
+PASSED tests/test_timeframes.py::test_outside_bar_is_expanding_not_up
+PASSED tests/test_timeframes.py::test_inside_bar_is_compression
+PASSED tests/test_timeframes.py::test_structure_needs_two_bars
+PASSED tests/test_timeframes.py::test_direction_up_on_rising_series
+PASSED tests/test_timeframes.py::test_direction_down_on_falling_series
+PASSED tests/test_timeframes.py::test_flat_is_an_answer_not_a_gap
+PASSED tests/test_timeframes.py::test_structure_uses_only_closed_bars
+PASSED tests/test_timeframes.py::test_acceleration_is_detected
+PASSED tests/test_timeframes.py::test_deceleration_is_detected
+PASSED tests/test_timeframes.py::test_turn_of_the_last_bar_is_flagged
+PASSED tests/test_timeframes.py::test_no_pace_without_three_closed_bars
+PASSED tests/test_timeframes.py::test_all_frames_agree_on_a_clean_trend
+PASSED tests/test_timeframes.py::test_fast_turns_up_while_slow_still_down
+PASSED tests/test_timeframes.py::test_agreement_line_is_readable
+PASSED tests/test_timeframes.py::test_all_five_steps_are_present
+PASSED tests/test_timeframes.py::test_profile_survives_short_history
+PASSED tests/test_timeframes.py::test_profile_on_empty_input
+PASSED tests/test_timeframes.py::test_no_signal_or_recommendation_fields
+PASSED tests/test_timeframes.py::test_caveat_is_written_next_to_the_code
+PASSED tests/test_timeframes.py::test_profile_is_wired_into_the_card
+PASSED tests/test_timeframes.py::test_page_shows_all_five_and_the_disagreement
+PASSED tests/test_price_freshness.py::test_fresh_bar_still_gives_an_event
+PASSED tests/test_price_freshness.py::test_a_two_hour_old_bar_is_not_an_event
+PASSED tests/test_price_freshness.py::test_the_event_carries_its_age
+PASSED tests/test_price_freshness.py::test_a_bar_marked_one_minute_ahead_is_not_dropped
+PASSED tests/test_price_freshness.py::test_the_age_is_measured_from_the_close_of_the_bar
+PASSED tests/test_price_freshness.py::test_the_night_gap_is_not_a_price_move
+PASSED tests/test_price_freshness.py::test_yesterdays_bar_is_not_called_forming
+PASSED tests/test_price_freshness.py::test_two_days_do_not_melt_into_one_bar
+PASSED tests/test_price_freshness.py::test_a_long_hole_breaks_the_run
+PASSED tests/test_price_freshness.py::test_quiet_minutes_do_not_break_the_run
+PASSED tests/test_price_freshness.py::test_silence_from_staleness_is_counted
+PASSED tests/test_price_freshness.py::test_without_a_clock_it_uses_moscow_time
+PASSED tests/test_price_freshness.py::test_the_gate_is_a_number_and_not_a_guess_in_the_code
+FAILED tests/test_price_events.py::test_scan_returns_a_list_of_tickers_not_cards - NameError: name 'at' is not defined
+FAILED tests/test_price_events.py::test_scan_orders_by_count_then_alphabet - NameError: name 'at' is not defined
+FAILED tests/test_price_events.py::test_scan_survives_junk - NameError: name 'at' is not defined
+FAILED tests/test_price_events.py::test_scan_uses_the_canonical_path_too - NameError: name 'at' is not defined
+4 failed, 171 passed in 0.74s
 ```
