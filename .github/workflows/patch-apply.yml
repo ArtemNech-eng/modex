@@ -67,7 +67,8 @@ jobs:
             tests/test_timeframes.py \
             tests/test_price_freshness.py \
             tests/test_money.py \
-            tests/test_iss_index.py > out.txt 2>&1
+            tests/test_iss_index.py \
+            tests/test_index_poll.py > out.txt 2>&1
           echo "code=$?" >> "$GITHUB_OUTPUT"
           cat out.txt
 
@@ -104,6 +105,8 @@ jobs:
             #  патч базы применялся бы, тесты проходили, а изменение МОЛЧА
             #  не сохранялось — самый дорогой вид зелёного отчёта.
             git add src/db.py src/analysis/money.py src/collector/iss_index.py
+            #  main.py и index_poll.py — врезка фона рынка в фоновый цикл.
+            git add main.py src/collector/index_poll.py
             git add -A scripts
           fi
           git commit -m "patch-apply: отчёт, и патч если тесты зелёные" || echo "нечего коммитить"
