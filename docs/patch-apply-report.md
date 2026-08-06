@@ -1,57 +1,26 @@
 # Отчёт patch-apply
 
-дата: 2026-08-06T08:19:56Z
-коммит: bd9ba406a8c6267db8e0220a6efae306d037241d
-запуск: 31084441138
+дата: 2026-08-06T09:24:34Z
+коммит: 1a027083b96f471f2cad56e1e6972822e3adf56c
+запуск: 31088958499
 код патча: 0
 код pytest: 0
 
 ## патч
 ```
-== scripts/_patch_price_scanner.py
-price: импорт времени: применено
-price: часы, возраст и непрерывный отрезок: применено
-price: пороги времени в DEFAULTS: применено
-price: ворота свежести в detect_step: применено
-price: возраст на каждом событии: применено
-price: часы через detect: применено
-price: часы в events_for: применено
-price: events_for передаёт часы: применено
-price: часы в scan: уже было
-price: scan → detect с часами: применено
-price: scan → events_for с часами: применено
-price: счётчик протухших: применено
-timeframes: импорт даты: применено
-timeframes: минута с датой: применено
-timeframes: ключ последнего бара: применено
-timeframes: ключ строки: применено
-итог: применено 15, уже было 1, отказов 0
-Скрипт удалил себя.
-== scripts/_patch_scan_signature.py
-scan: применено
-итог: применено 1, уже было 0, отказов 0
-Скрипт удалил себя.
+== scripts/_patch_turnover_store.py
+turnover: импорт money: применено
+turnover: колонки CandleMinute: применено
+turnover: миграция candle_minute: применено
+turnover: создание строки: применено
+turnover: подсчёт рублей: применено
+итог: применено 5, уже было 0, отказов 0
+скрипт удалил себя
 ```
 
 ## pytest, последние 12000 символов
 ```
-ase_frequency
-PASSED tests/test_volume_events.py::test_scan_survives_junk
-PASSED tests/test_volume_events.py::test_no_verdict_fields
-PASSED tests/test_volume_events.py::test_measured_flatness_of_rvol_is_written_next_to_the_code
-PASSED tests/test_volume_events.py::test_thresholds_are_marked_as_guesses
-PASSED tests/test_volume_events.py::test_rubles_are_documented_as_an_approximation
-PASSED tests/test_volume_events.py::test_scanner_endpoint_exists
-PASSED tests/test_volume_events.py::test_profile_is_built_in_background_from_past_days_only
-PASSED tests/test_volume_events.py::test_page_has_a_second_table_and_names_the_baseline
-PASSED tests/test_volume_events.py::test_huge_multiple_on_tiny_turnover_is_not_an_event
-PASSED tests/test_volume_events.py::test_the_exact_acceleration_series_from_the_screen
-PASSED tests/test_volume_events.py::test_floor_scales_with_step_length
-PASSED tests/test_volume_events.py::test_real_money_still_passes
-PASSED tests/test_volume_events.py::test_floor_is_configurable_without_deploy
-PASSED tests/test_volume_events.py::test_suppressed_count_is_reported
-PASSED tests/test_volume_events.py::test_weekend_days_do_not_count
-PASSED tests/test_volume_events.py::test_short_days_do_not_count
+short_days_do_not_count
 PASSED tests/test_volume_events.py::test_unparseable_day_key_is_dropped_not_crashed
 PASSED tests/test_volume_events.py::test_thin_baseline_is_marked_and_not_called_a_multiple
 PASSED tests/test_volume_events.py::test_normal_baseline_keeps_the_multiple
@@ -191,5 +160,18 @@ PASSED tests/test_price_freshness.py::test_quiet_minutes_do_not_break_the_run
 PASSED tests/test_price_freshness.py::test_silence_from_staleness_is_counted
 PASSED tests/test_price_freshness.py::test_without_a_clock_it_uses_moscow_time
 PASSED tests/test_price_freshness.py::test_the_gate_is_a_number_and_not_a_guess_in_the_code
-175 passed in 0.79s
+PASSED tests/test_money.py::test_лотность_неизвестна_возвращается_none_а_не_ноль
+PASSED tests/test_money.py::test_лотность_не_подменяется_единицей
+PASSED tests/test_money.py::test_бумаги_сравнимы_только_в_рублях
+PASSED tests/test_money.py::test_нулевой_объём_это_ноль_рублей_а_не_пробел
+PASSED tests/test_money.py::test_без_цены_считать_нечего
+PASSED tests/test_money.py::test_отрицательный_объём_это_порча_данных
+PASSED tests/test_money.py::test_цена_бара_средняя_по_трём_а_не_close
+PASSED tests/test_money.py::test_цена_бара_игнорирует_нули
+PASSED tests/test_money.py::test_цена_бара_падает_на_open_если_больше_ничего_нет
+PASSED tests/test_money.py::test_цена_бара_пустой_свечи_это_none
+PASSED tests/test_money.py::test_свеча_целиком
+PASSED tests/test_money.py::test_свеча_без_лотности_не_считается
+PASSED tests/test_money.py::test_свеча_пустая_не_падает
+188 passed in 0.80s
 ```

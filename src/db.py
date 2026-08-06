@@ -17,6 +17,10 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from sqlalchemy import String, Integer, Float, Boolean, DateTime, Text, select, delete
+
+#  Чистая арифметика лотов в рубли. Вынесена отдельно, чтобы её можно было
+#  проверять тестами без базы и без SQLAlchemy.
+from src.analysis.money import candle_turnover_rub
 from sqlalchemy.ext.asyncio import (
     create_async_engine, async_sessionmaker, AsyncSession,
 )
@@ -426,6 +430,14 @@ class CandleMinute(Base):
     volume: Mapped[int] = mapped_column(Integer, default=0)          # лоты
     volume_buy: Mapped[int] = mapped_column(Integer, default=0)
     volume_sell: Mapped[int] = mapped_column(Integer, default=0)
+    #  Рубли рядом с лотами, а не вместо них: сравнивать бумаги можно только
+    #  в рублях, а сверяться с биржей — только в лотах.
+    #
+    #  lot = 0 читается как «рубли НЕ посчитаны». Это НЕ то же самое, что
+    #  turnover_rub = 0 при lot >= 1, где ноль — факт о рынке. Смешать их значит
+    #  выдать собственный пробел за тишину на бирже.
+    lot: Mapped[int] = mapped_column(Integer, default=0)             # 0 = не знаем
+    turnover_rub: Mapped[float] = mapped_column(Float, default=0.0)  # оценка
     updates: Mapped[int] = mapped_column(Integer, default=0)         # версий свечи
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -679,6 +691,10 @@ _PREDICTION_ADDED_COLUMNS = {
 # анализ не попадают.
 _ADDED_COLUMNS = {
     "predictions": _PREDICTION_ADDED_COLUMNS,
+    #  Оборот в рублях добавлен, когда таблица уже жила на сервере, —
+    #  только миграция, create_all тут бессилен.
+    "candle_minute": {"lot": "INTEGER DEFAULT 0",
+                      "turnover_rub": "DOUBLE PRECISION DEFAULT 0"},
     "flow_minute": {"source": "VARCHAR(8) DEFAULT 'mixed'"},
     "book_minute": {"source": "VARCHAR(8) DEFAULT 'mixed'",
                     "bid5_sum": "DOUBLE PRECISION DEFAULT 0",
@@ -2577,7 +2593,8 @@ async def merge_candle_minutes(ticker: str, rows: list[dict]) -> int:
                         high=float(r.get("high") or 0.0),
                         low=float(r.get("low") or 0.0),
                         close=float(r.get("close") or 0.0),
-                        volume=0, volume_buy=0, volume_sell=0, updates=0)
+                        volume=0, volume_buy=0, volume_sell=0, updates=0,
+                        lot=0, turnover_rub=0.0)
                     session.add(row)
                 else:
                     row.high = max(row.high, float(r.get("high") or 0.0))
@@ -2588,6 +2605,18 @@ async def merge_candle_minutes(ticker: str, rows: list[dict]) -> int:
                 row.volume = int(r.get("volume") or 0)
                 row.volume_buy = int(r.get("volume_buy") or 0)
                 row.volume_sell = int(r.get("volume_sell") or 0)
+                #  Рубли тоже ЗАМЕНЯЮТСЯ, а не прибавляются: они считаются от
+                #  накопительного объёма текущей версии свечи.
+                #
+                #  Если лотность не пришла, СТАРОЕ значение НЕ затирается. Справочник
+                #  ISS может отвалиться на одном цикле и вернуться на следующем;
+                #  обнулять из-за этого уже посчитанный оборот нельзя.
+                lot = int(r.get("lot") or 0)
+                if lot >= 1:
+                    rub = candle_turnover_rub(r, lot)
+                    if rub is not None:
+                        row.lot = lot
+                        row.turnover_rub = rub
                 row.updates += int(r.get("updates") or 1)
                 row.updated_at = datetime.now(timezone.utc)
                 n += 1
