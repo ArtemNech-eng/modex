@@ -10,6 +10,15 @@
 в sys.path каталог САМОГО ФАЙЛА, а не корень проекта, и пакет src оказывается
 невидим. Поэтому корень добавляется явно и ДО импортов проекта.
 
+ДВЕ ЛОВУШКИ ЧИТАТЕЛЕЙ, ОПЛАЧЕННЫЕ ПУСТЫМИ БЛОКАМИ.
+
+1. У micro_series третий аргумент — source, а не шаг ряда. Переданный туда
+   "1m" превращается в фильтр по несуществующему источнику и даёт МОЛЧАЛИВЫЙ
+   пустой список. Здесь источник оставлен по умолчанию (exchange).
+2. У level_series limit=400 по умолчанию при сортировке по возрастанию ts,
+   то есть без явного лимита видно только утро. За день по одной бумаге
+   там десятки тысяч событий (61 615 на 1020 минут у SBER 06.08).
+
 Вся логика сборки лежит в src/analysis/day_slice.py и покрыта тестами.
 Здесь только чтение таблиц: база в CI недоступна, поэтому этот файл
 никогда не импортируется тестами.
@@ -24,6 +33,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src import db                                    # noqa: E402
 from src.analysis import day_slice as ds              # noqa: E402
+
+# Потолок для чтения уровней. Наружу едет не сырой ряд, а сводка,
+# поэтому большое число строк раздувает память, а не ответ.
+LEVEL_LIMIT = 200000
 
 
 def msk_today():
@@ -50,8 +63,8 @@ async def main():
         "свечи": await db.candle_series(ticker, day, "1m"),
         "поток": await db.flow_series(ticker, day, "1m"),
         "стакан": await db.book_series(ticker, day, "1m"),
-        "секунды": await db.micro_series(ticker, day, "1m"),
-        "уровни": await db.level_series(ticker, day),
+        "секунды": await db.micro_series(ticker, day),
+        "уровни": await db.level_series(ticker, day, limit=LEVEL_LIMIT),
     }
 
     history = []
