@@ -3,7 +3,7 @@
 
 Образец взят не из головы, а из живого ответа 06.08.2026 13:34.
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from src.collector.iss_index import (STALE_SEC, age_sec, index_url,
                                      parse_index, parse_systime)
@@ -19,6 +19,9 @@ LIVE = {"marketdata": {
               2316.85, 2270.1, "2026-08-06"]]}}
 
 AT = datetime(2026, 8, 6, 13, 34, 14)
+
+#  Метка биржи в образце. От неё считается возраст, а не от наших часов.
+STAMP = datetime(2026, 8, 6, 13, 34, 0)
 
 
 def test_живой_ответ_разбирается():
@@ -38,7 +41,7 @@ def test_возраст_считается_от_метки_биржи():
 def test_возраст_не_от_времени_запроса():
     #  Закрытая биржа: спросили только что, а значению двое суток.
     #  Именно так ошиблись 02.08 — показывалось «11 секунд».
-    late = datetime(2026, 8, 8, 13, 34, 0)
+    late = STAMP + timedelta(days=2)
     r = parse_index(LIVE, at=late)
     assert r["age_sec"] == 2 * 24 * 3600
     assert r["stale"] is True
@@ -49,9 +52,14 @@ def test_свежее_значение_не_помечается_несвежи�
 
 
 def test_граница_свежести_это_число_в_коде():
+    #  Секунда за границей — уже несвежее, секунда до неё — ещё свежее.
+    #  Сдвиг делает timedelta: 181 в поле секунд — это ValueError,
+    #  а не момент времени. Именно на этом тест упал в первый раз.
     assert STALE_SEC == 180
-    late = datetime(2026, 8, 6, 13, 34, 0 + STALE_SEC + 1)
+    late = STAMP + timedelta(seconds=STALE_SEC + 1)
     assert parse_index(LIVE, at=late).get("stale") is True
+    edge = STAMP + timedelta(seconds=STALE_SEC - 1)
+    assert "stale" not in parse_index(LIVE, at=edge)
 
 
 def test_часы_разошлись_на_секунды_это_не_ошибка():
