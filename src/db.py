@@ -2771,6 +2771,7 @@ def aggregate_candles(rows: list[dict], step: int, ticker: str = "") -> list[dic
             buckets[k] = {"ts": ts, "o": r.get("open") or 0.0,
                           "h": r.get("high") or 0.0, "l": r.get("low") or 0.0,
                           "c": r.get("close") or 0.0, "v": 0, "vb": 0, "vs": 0,
+                          "rub": 0.0, "lot": 0,
                           "session": r.get("session") or "main"}
             order.append(k)
         b = buckets[k]
@@ -2781,6 +2782,13 @@ def aggregate_candles(rows: list[dict], step: int, ticker: str = "") -> list[dic
         b["v"] += r.get("volume") or 0
         b["vb"] += r.get("volume_buy") or 0
         b["vs"] += r.get("volume_sell") or 0
+        # Рубли складываем по той же причине, что и объём: минуты внутри
+        # бара не пересекаются. Лотность одна на бумагу, берём максимум —
+        # ноль означает "не знаем" и не должен вытеснять known-значение.
+        b["rub"] += float(r.get("turnover_rub") or 0.0)
+        lot_row = int(r.get("lot") or 0)
+        if lot_row > b["lot"]:
+            b["lot"] = lot_row
     out = []
     for k in order:
         b = buckets[k]
@@ -2789,6 +2797,8 @@ def aggregate_candles(rows: list[dict], step: int, ticker: str = "") -> list[dic
             "ts": b["ts"], "ticker": ticker.upper(), "session": b["session"],
             "open": b["o"], "high": b["h"], "low": b["l"], "close": b["c"],
             "volume": b["v"], "volume_buy": b["vb"], "volume_sell": b["vs"],
+            "turnover_rub": round(b["rub"], 2) if b["rub"] else None,
+            "lot": b["lot"] or None,
             "buy_ratio": round(b["vb"] / tot, 4) if tot else None,
             "range": round(b["h"] - b["l"], 6) if b["h"] and b["l"] else None,
             "change": round(b["c"] - b["o"], 6) if b["o"] else None,
@@ -2807,7 +2817,8 @@ async def candle_series(ticker: str, day: str, res: str = "1m") -> list[dict]:
         rows = (await session.execute(q)).scalars().all()
     plain = [{"ts": r.ts, "session": r.session, "open": r.open, "high": r.high,
               "low": r.low, "close": r.close, "volume": r.volume,
-              "volume_buy": r.volume_buy, "volume_sell": r.volume_sell}
+              "volume_buy": r.volume_buy, "volume_sell": r.volume_sell,
+              "lot": r.lot, "turnover_rub": r.turnover_rub}
              for r in rows]
     return aggregate_candles(plain, step, ticker)
 

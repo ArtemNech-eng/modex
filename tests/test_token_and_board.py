@@ -20,11 +20,20 @@ from src.collector import tinkoff_client as tc  # noqa: E402
 
 def _run(coro):
     """Свой цикл событий, как в test_figi_failure_reason."""
+    try:
+        prev = asyncio.get_event_loop_policy().get_event_loop()
+    except RuntimeError:
+        prev = None
     loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
         return loop.run_until_complete(coro)
     finally:
-        loop.close()
+        try:
+            loop.close()
+        except Exception:                                        # noqa: BLE001
+            pass
+        asyncio.set_event_loop(prev)
 
 
 def _share(figi, board, flag, ticker="SBER"):

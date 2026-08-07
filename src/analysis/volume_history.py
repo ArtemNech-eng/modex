@@ -47,7 +47,7 @@
 """
 from statistics import median
 
-from src.analysis.timeframes import bars
+from src.analysis.timeframes import bars, _abs_minute
 
 STEPS = (1, 3, 5, 15)
 BASE_BARS = 20          # сколько прошлых закрытых бар берётся за норму
@@ -76,8 +76,8 @@ def _bar_minutes(rows: list, bar: dict, step: int) -> list:
         return []
     out = []
     for r in rows:
-        mm = _minute_of_day(r.get("ts"))
-        if mm >= 0 and mm // step == key:
+        mm = _abs_minute(r.get("ts"))
+        if mm is not None and mm // step == key:
             out.append(_vol(r))
     return out
 

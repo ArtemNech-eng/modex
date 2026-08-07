@@ -129,6 +129,9 @@ class SentimentAnalyzer:
         if not texts:
             return []
 
+        if self._pipeline is None:
+            return [keyword_sentiment(t) for t in texts]
+
         loop = asyncio.get_event_loop()
         raw_results = await loop.run_in_executor(
             self._executor, self._predict_sync, texts
