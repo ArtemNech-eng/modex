@@ -136,7 +136,7 @@ async def check_ticker(ticker: str) -> Optional[dict]:
     ctx = await ia.build_intraday_context(
         ticker, tf_min=INTRADAY_TF_MIN,
         opening_range_bars=INTRADAY_OPENING_RANGE_BARS, reference_price=ref)
-    if ctx.get("stale") or ctx.get("mismatch"):
+    if not ctx or ctx.get("stale") or ctx.get("mismatch"):
         return None                                  # данные не годятся — не сигналим
 
     # НАБЛЮДЕНИЕ или СИГНАЛ. Сетап пробоя в режиме observe приходит отдельным полем
