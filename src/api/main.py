@@ -2194,6 +2194,36 @@ async def setup_watch_status():
     return setup_watcher.status()
 
 
+@app.get("/api/early-moves", summary="Список субминутных событий EARLY_MOVE")
+async def get_early_moves(ticker: Optional[str] = None, limit: int = 50):
+    """
+    События раннего обнаружения движения (EARLY_MOVE_UP / EARLY_MOVE_DOWN),
+    сработавшие до закрытия минутного бара при одновременном изменении
+    скорости цены, притоке оборота и изменении стакана/потока.
+    """
+    from src.analysis.early_move import DETECTOR
+    return {"count": len(DETECTOR.get_recent_events(ticker, limit)),
+            "events": DETECTOR.get_recent_events(ticker, limit)}
+
+
+@app.get("/api/early-moves/stats", summary="Эмпирическая статистика исходов EARLY_MOVE")
+async def get_early_move_stats():
+    """
+    Что происходило с ценой через 1, 3, 5, 15 и 30 минут после каждого
+    события EARLY_MOVE_UP и EARLY_MOVE_DOWN (эмпирический бэктест без догадок).
+    """
+    from src.analysis.early_move import DETECTOR
+    return DETECTOR.get_statistics()
+
+
+@app.get("/api/early-moves/{ticker}", summary="События EARLY_MOVE по конкретному тикеру")
+async def get_early_moves_for_ticker(ticker: str, limit: int = 20):
+    """Ранние события по конкретному тикеру Мосбиржи."""
+    from src.analysis.early_move import DETECTOR
+    return {"ticker": ticker.upper(),
+            "events": DETECTOR.get_recent_events(ticker, limit)}
+
+
 @app.get("/api/analyst-brief/{ticker}", summary="Полная сводка по бумаге для аналитика")
 async def analyst_brief(ticker: str):
     """ВСЁ, что нужно для решения по бумаге, одним вызовом.

@@ -489,6 +489,8 @@ class MarketStream:
             self.tape.on_trade(tk, src, int(when.timestamp()), price,
                                int(t.quantity), int(t.direction), bb, ba)
             self.stats["trades_dealer" if src == "dealer" else "trades"] += 1
+            if src == "exchange":
+                self._check_early_move(tk, price)
         elif name == "orderbook":
             ob = resp.orderbook
             tk = (ob.ticker or "").upper()
@@ -533,6 +535,8 @@ class MarketStream:
             self.ticks.on_book(tk, src, int(when.timestamp()), bid, ask,
                                bid5, ask5, bb, ba, bid_top, ask_top)
             self.stats["books_dealer" if src == "dealer" else "books"] += 1
+            if src == "exchange" and (bb or ba):
+                self._check_early_move(tk, bb or ba)
         elif name == "candle":
             cd = resp.candle
             tk = (cd.ticker or "").upper()
@@ -543,9 +547,46 @@ class MarketStream:
                                 int(cd.volume), int(cd.volume_buy),
                                 int(cd.volume_sell))
             self.stats["candles"] += 1
+            self._check_early_move(tk, quotation(cd.close))
         elif name in SUB_FIELD:
             self._handle_subscription(name, getattr(resp, name))
         self.stats["messages"] += 1
+
+    def _check_early_move(self, ticker: str, price: float) -> None:
+        if not price or price <= 0:
+            return
+        try:
+            from src.analysis.early_move import DETECTOR as EARLY_DETECTOR
+            c_min = (self.agg.candle.get(ticker) or {}) if hasattr(self.agg, "candle") else {}
+            c_vol_buy = int(c_min.get("volume_buy") or 0)
+            c_vol_sell = int(c_min.get("volume_sell") or 0)
+            c_rub = float(c_min.get("turnover_rub") or 0.0)
+            b_min = ((self.agg.book.get(ticker) or {}).get("exchange") or {}) if hasattr(self.agg, "book") else {}
+            bid_vol = float(b_min.get("bid_vol_sum") or 0.0)
+            ask_vol = float(b_min.get("ask_vol_sum") or 0.0)
+            nearest_lvl = None
+            if hasattr(self, "levels") and hasattr(self.levels, "best_support_resistance"):
+                try:
+                    sr = self.levels.best_support_resistance(ticker)
+                    if sr:
+                        nearest_lvl = sr.get("nearest")
+                except Exception:
+                    pass
+            ev = EARLY_DETECTOR.add_snapshot(
+                ticker=ticker,
+                price=price,
+                turnover_rub=c_rub,
+                buy_lots=c_vol_buy,
+                sell_lots=c_vol_sell,
+                bid_vol=bid_vol,
+                ask_vol=ask_vol,
+                nearest_level=nearest_lvl,
+            )
+            if ev:
+                logger.info("⚡ EARLY MOVE DETECTED: %s %s at %s | %s",
+                            ev.direction, ev.ticker, ev.price, "; ".join(ev.what_changed))
+        except Exception as e:
+            logger.debug("early move error %s: %s", ticker, e)
 
     def _handle_subscription(self, name: str, payload) -> None:
         """
