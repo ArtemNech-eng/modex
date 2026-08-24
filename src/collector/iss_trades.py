@@ -1,35 +1,39 @@
 """
 ISS Trades — ground truth дельты по BUYSELL
+Обновление 21.08.2026 13:50 MSK на выборке 14 дней — заменяет раздел «Индексный протокол» 19.08.
 
 19.08 ЗАФИКСИРОВАНО: flow.buy_pct/delta из Tinkoff инвертированы.
-Примеры:
   CBOM -7.76% при bid/ask 0.43 но buy 93.8%
-  ASTR бриф +6238 vs ISS -7586 (знак противоположный, модуль близок)
+  ASTR бриф +6238 vs ISS -7586 (знак противоположный)
   NVTK/SBER аналогично
+Ground truth ISS trades.json BUYSELL: B=buyer hits ask, S=seller hits bid (aggressor removes liquidity)
 
-Ground truth:
-  ISS trades.json поле BUYSELL:
-    B = buyer aggressor = покупка по ask (снимает ликвидность с ask)
-    S = seller aggressor = продажа по bid
-  Это соответствует определению aggressor (investopedia):
-    aggressor removes liquidity, buying at ask / selling at bid
+21.08 ИНДЕКСНЫЙ ПРОТОКОЛ — 14 дней (3–7.08, 11–14.08, 17–21.08):
+  Главное: порог 3× выжил как детектор старта и провалился как источник прибыли — вся + сумма в 1 дне из 14.
+  Статистика сжатых: 4 победы /2 убытка /1 ноль +3.73% на 7 сделок, без 14.08 +2.72% vs -2.39% = +0.33% на 6 = ноль до издержек минус после, точность 57% монета.
+  Утренний оборот ОТМЕНЁН: 04.08 утро 15.1 млрд сжатый, 06.08 утро 17.2 млрд сжатый — связи нет, в 09:50 режим предсказать нельзя, границу 10.3 млрд убрать, единственный фильтр 09:50–10:49 <7.5 млрд.
+  Первое срабатывание 10:40 а не 10:50: база 5 бакетов основной 09:50 → 5 полных к 10:40, решает 07.08 3.98× 10:40 -1.21% по конвенции 10:50 этого входа нет (макс дня 2.18×). Фиксируем 10:40.
+  Что выдержало: фильтр молчания — 5 плотных дней 0 срабатываний (03.08 1.95×, 05.08 1.99×, 11.08,13.08,17.08), цена полноты пропущено 4 тренда +1.5% +1.27% -3.01% -2.02%.
+  Порог 7.5 млрд хрупкий ±0.6 млрд: 06.08 7.24 ноль, 20.08 7.44 лучшая +1.56%, 03.08 8.06 плотный пропущен +1.5% — граница на глаз, 0.75 медианы ест сам себя.
+  Размах бакета как предиктор не работает: 04.08 0.54% убыток, 07.08 0.66% убыток, 20.08 0.81% победа, 06.08 1.06% ноль.
+  Таблица 14д см docs/TRADER_PROTOCOL_21_08.md и trader_protocol.py index_protocol_14d.
 
 Эндпоинты:
   trades: https://iss.moex.com/iss/engines/stock/markets/shares/securities/{TICKER}/trades.json
-    params: iss.meta=off, iss.only=trades, limit=100, start=NUMTRADES-100
-    limit !=100 молча возвращает 10 (замерено)
-    reverse=true игнорируется
-    TRADINGSESSION 0 утро 1 основная 2 вечер vs flow session morning/main
-
+    params: iss.meta=off, iss.only=trades, limit=100, start=NUMTRADES-100, fast_mode=false (true→Content not available)
+    limit !=100 молча 10, reverse=true игнорируется, TRADINGSESSION 0 утро 1 основная 2 вечер
+    лаг 15-19 мин (21.08 последний принт 14:55:53 при времени 15:19), ISS кэш ~10 мин, MOODEX ~5 мин
+    плотность: MGNT 100=11 мин → запрос каждые 10 мин непрерывная дельта; SBER 70875 <1 мин точечная
   marketdata: https://iss.moex.com/iss/engines/stock/markets/shares/securities/{TICKER}.json
-    iss.only=marketdata, columns: BIDDEPTHT, OFFERDEPTHT, WAPRICE, NUMTRADES, LAST, etc
-    valid: ASTR 1.29 vs 1.19 (пример)
-
+    iss.only=marketdata, fast_mode=false иначе Unable to load, кэш ~10 мин
   candles index: https://iss.moex.com/iss/engines/stock/markets/index/securities/{INDEX}/candles.json?interval=10
-    INDEX = IMOEX, IMOEX2 — 07:00-23:50, в основную совпадает до копейки
+    INDEX IMOEX, IMOEX2 07:00-23:50 в основную совпадает до копейки
+    выгрузка одного дня: ?from=ДАТА&till=ДАТА&interval=10&iss.only=candles&iss.meta=off — один день целиком без обрезки
+    fast_mode=false иначе Unable to load / Content not available, кэш ~10 мин не дёргать чаще раза в 10 мин
+  /api/flow res=5m обрывается 12:45–12:50 isTruncated true totalLineCount 1 — последний час дельты недоступен, свежую только ISS trades.json или /api/live
+  Живой кейс поглощения SIBN 21.08 13:42: orderbook_index 85.7 покупатели доминируют 31 снимок, bid5_sum 24641 vs ask5_sum 4528 5.4:1, cumulative_delta -199443 VWAP 476.01 vs 470.4 buy 11 sell 337 — книга и лента расходятся → поглощение не разворот
 
-Этот модуль — единственный источник дельты для торговли.
-Tinkoff flow deprecated, использовать только для отладки с пометкой UNRELIABLE.
+Этот модуль — единственный источник дельты для торговли. Tinkoff flow deprecated UNRELIABLE.
 """
 
 import os
@@ -374,20 +378,42 @@ def fetch_index_candles(index: str = "IMOEX2", interval: int = 10,
                         from_date: Optional[str] = None,
                         till_date: Optional[str] = None) -> List[dict]:
     """
-    Свечи индекса IMOEX / IMOEX2 интервал 10м.
+    Свечи индекса IMOEX / IMOEX2 интервал 10м — обновление 21.08 на 14 днях.
     IMOEX2 07:00-23:50, в основную совпадает с IMOEX до копейки (проверено).
+    Выгрузка одного дня: ?from=ДАТА&till=ДАТА&interval=10&iss.only=candles&iss.meta=off — один день целиком без обрезки.
+    fast_mode:false обязателен — при true Unable to load / Content not available (воспроизведено на candles.json и marketdata).
+    ISS кэширует ~10 мин: повтор через 3 мин байт-в-байт тот же срез — чаще раза в 10 мин не дёргать.
+    /api/flow res=5m обрывается 12:45–12:50 isTruncated true — последний час дельты недоступен, только ISS trades.json или /api/live.
     """
     index = index.upper()
     url = ISS_INDEX_CANDLES_URL.format(sec=index)
     if from_date is None:
-        from_date = (datetime.now(timezone.utc) + timedelta(hours=3) - timedelta(days=7)).strftime("%Y-%m-%d")
+        from_date = (datetime.now(timezone.utc) + timedelta(hours=3) - timedelta(days=14)).strftime("%Y-%m-%d")
     if till_date is None:
         till_date = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d")
     params = {
         "iss.meta": "off",
+        "iss.only": "candles",
         "interval": interval,
         "from": from_date,
         "till": till_date,
+        "fast_mode": "false",
+    }
+    payload = fetch_json(url, params)
+    return parse_candles_payload(payload)
+
+
+def fetch_index_candles_one_day(index: str, date: str, interval: int = 10) -> List[dict]:
+    """Выгрузка одного дня индекса целиком без обрезки — 21.08 находка"""
+    index = index.upper()
+    url = ISS_INDEX_CANDLES_URL.format(sec=index)
+    params = {
+        "iss.meta": "off",
+        "iss.only": "candles",
+        "interval": interval,
+        "from": date,
+        "till": date,
+        "fast_mode": "false",
     }
     payload = fetch_json(url, params)
     return parse_candles_payload(payload)
