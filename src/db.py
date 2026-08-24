@@ -2875,14 +2875,23 @@ async def flow_candle_check(ticker: str, day: str,
             continue
         ours = (f["buy_volume"] or 0) + (f["sell_volume"] or 0)
         theirs = c["volume"] or 0
-        # Подозрительно ПРЕВЫШЕНИЕ: это подпись задвоения. Недосчёт возможен
-        # законно — контейнер мог подняться посреди минуты.
-        suspect = bool(source == "exchange" and theirs and ours > theirs * 1.05)
+        # ИСПРАВЛЕНО 19.08: прежнее условие ours > theirs*1.05 ловило только
+        # ЗАДВОЕНИЕ (избыток), но слепо к ПОТЕРЕ сделок. Пример: diff -21425 =
+        # 60.6% потеряно, suspect false. Теперь смотрим абсолютное расхождение
+        # в обе стороны: |diff|/candle > 5% → suspect.
+        # Недосчёт может быть законным при старте контейнера посреди минуты,
+        # но он тоже помечается — смотреть diff и причину.
+        diff = ours - theirs
+        if source == "exchange" and theirs:
+            suspect = bool(abs(diff) / theirs > 0.05)
+        else:
+            suspect = False
         if suspect:
             bad += 1
         out.append({
             "ts": f["ts"], "ours": ours, "candle": theirs,
-            "diff": ours - theirs,
+            "diff": diff,
+            "diff_pct": round(diff / theirs * 100, 2) if theirs else None,
             "ours_buy": f["buy_volume"], "candle_buy": c["volume_buy"],
             "ours_sell": f["sell_volume"], "candle_sell": c["volume_sell"],
             "suspect": suspect,

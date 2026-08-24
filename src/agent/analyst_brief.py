@@ -159,15 +159,21 @@ async def build(ticker: str) -> dict:
             "buy_pct_avg3": (round(sum(buys) / len(buys), 1) if buys else None),
             "delta_avg3": (round(sum(dels) / len(dels)) if dels else None),
             "age_min": _age(trs[0]), "snapshots": len(trs),
-            "_note": ("встречный поток при движущейся цене — чаще ПОГЛОЩЕНИЕ, чем "
-                      "разворот. 30.07 я дважды прочитал это как разворот и оба "
-                      "раза ошибся"),
+            "_deprecated": True,
+            "_reliability": "UNRELIABLE — инверсия знака подтверждена 19.08",
+            "_ground_truth": "ISS trades.json BUYSELL B=buyer hits ask / S=bid, use src/collector/iss_trades.py",
+            "_examples": "CBOM -7.76% bid/ask 0.43 but buy 93.8%, ASTR brief +6238 vs ISS -7586, NVTK/SBER аналогично",
+            "_note": ("DEPRECATED 19.08: flow.buy_pct/delta из Tinkoff инвертированы. "
+                      "Встречный поток при движущейся цене — чаще ПОГЛОЩЕНИЕ, чем "
+                      "разворот. Для торговли использовать ТОЛЬКО ISS trades.json. "
+                      "См. src/agent/trader_protocol.py"),
         }
         if (_age(trs[0]) or 0) > 10:
             out["gaps"].append(f"снимок потока устарел на {_age(trs[0])} мин")
+        out["gaps"].append("flow из Tinkoff deprecated — использовать ISS trades.json (см. _ground_truth)")
     else:
         out["flow"] = None
-        out["gaps"].append("нет данных по потоку сделок")
+        out["gaps"].append("нет данных по потоку сделок (ISS trades.json — ground truth)")
 
     out["ready"] = not out["gaps"]
     return out

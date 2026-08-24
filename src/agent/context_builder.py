@@ -542,14 +542,22 @@ def _format_orderbook_read(ticker: str, obs: list[dict], trs: list[dict]) -> str
         lines.append("  Динамика потока (buy% по снимкам): "
                      + " → ".join(str(x) for x in seq_f))
 
-    # Абсорбция — расхождение стакан↔поток (сильный интрадей-сигнал)
-    if ratio is not None and buy_pct is not None:
+    # Абсорбция — расхождение стакан↔поток — DEPRECATED 19.08
+    # Старая логика ratio<0.7+buy≥60 использовала Tinkoff buy_pct, который инвертирован
+    # (CBOM -7.76% + bid/ask 0.43 но buy 93.8%, ASTR +6238 vs ISS -7586).
+    # Правильный источник дельты: ISS trades.json BUYSELL.
+    # См. src/agent/trader_protocol.py — поглощение определяется по ISS дельте
+    # и движению цены, а не по Tinkoff buy_pct.
+    if False and ratio is not None and buy_pct is not None:
         if ratio < 0.7 and buy_pct >= 60:
             lines.append("  🔀 Абсорбция: агрессивные покупки бьют в стену продавца — "
                          "пробьют → импульс вверх, не пробьют → разворот вниз.")
         elif ratio > 1.4 and buy_pct <= 40:
             lines.append("  🔀 Абсорбция: агрессивные продажи в стену покупателя — "
                          "продавят → импульс вниз, удержат → отскок.")
+    # Вместо старой абсорбции помечаем источник как недостоверный
+    if buy_pct is not None:
+        lines.append("  ⚠️ Flow из Tinkoff DEPRECATED 19.08 — инверсия знака, см. ISS trades.json")
 
     # Ликвидность — предупреждение о тонком стакане (риск проскальзывания)
     if spread is not None and spread >= 0.2:

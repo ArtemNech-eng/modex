@@ -593,6 +593,13 @@ class TinkoffClient:
 
 def _classify_flow(trades: list[dict]) -> dict:
     """
+    DEPRECATED 19.08 — инверсия знака подтверждена vs ISS BUYSELL ground truth.
+    Примеры: CBOM -7.76% bid/ask 0.43 но buy 93.8%, ASTR +6238 vs ISS -7586.
+    Причина: поле direction Tinkoff TRADE_DIRECTION_BUY/SELL интерпретировано как aggressor,
+    но фактически противоположно ISS B/S (buyer hits ask = B). См. iss_trades.py.
+    Использовать только iss_trades.compute_delta() для торговли.
+    Для совместимости оставлен, но помечен _deprecated и flow_confidence=low по умолчанию.
+
     Чистая классификация потока сделок (без сети — легко тестировать) ДВУМЯ методами:
       1) по полю `direction` Tinkoff (сторона агрессора);
       2) tick-rule (знак изменения цены) — резерв на случай, если поле direction
@@ -714,6 +721,8 @@ def _classify_flow(trades: list[dict]) -> dict:
         "delta":        buy_vol - sell_vol,   # агрессивный buy−sell (снимок): + покупатели, − продавцы
         "order_flow":   flow,
         "avg_price":    avg_price,
+        "_deprecated": True,
+        "_reliability": "UNRELIABLE 19.08 — инверсия vs ISS BUYSELL, см. iss_trades.py",
         # ── диагностика/прозрачность (видно в /api/feed) ──
         "flow_method":       method,        # какой метод дал итог: direction | tick
         "flow_confidence":   confidence,    # high | low
@@ -722,6 +731,52 @@ def _classify_flow(trades: list[dict]) -> dict:
         "direction_counts":  dir_counts,    # сырое распределение поля direction
         "footprint":         footprint,     # топ цен по впитанному объёму + buy%
     }
+
+
+def _classify_flow_fixed(trades: list[dict]) -> dict:
+    """
+    ИСПРАВЛЕННАЯ версия 19.08 — инверсия направления Tinkoff vs ISS.
+
+    Гипотеза: TRADE_DIRECTION_BUY в Tinkoff = продажа агрессора (инвертировано),
+    т.к. CBOM -7.76% bid/ask 0.43 но buy 93.8% (противоречие), ASTR +6238 vs ISS -7586.
+
+    В этой версии direction инвертируется, tick-rule остаётся как есть (независим).
+    Для торговли использовать ТОЛЬКО ISS, это лишь для сверки и отладки.
+    """
+    base = _classify_flow(trades)
+    # инвертируем direction оценку
+    try:
+        buy_dir = base.get("buy_pct_direction")
+        # если было 93.8% buy, после инверсии 6.2% buy
+        if buy_dir is not None:
+            inv_dir = round(100 - buy_dir, 1)
+        else:
+            inv_dir = None
+        # пересчёт объёмов инверсией
+        # buy_dir и sell_dir из dir_counts, но у нас только pct — делаем приближение
+        # Лучше пересчитать напрямую:
+        def _q(t):
+            try:
+                return int(t.get("quantity", 0) or 0)
+            except Exception:
+                return 0
+        buy_dir_vol = sum(_q(t) for t in trades if t.get("direction") == "TRADE_DIRECTION_BUY")
+        sell_dir_vol = sum(_q(t) for t in trades if t.get("direction") == "TRADE_DIRECTION_SELL")
+        # инверсия
+        buy_fixed = sell_dir_vol
+        sell_fixed = buy_dir_vol
+        tot = buy_fixed + sell_fixed
+        buy_pct_fixed = round(buy_fixed / tot * 100, 1) if tot else 50.0
+
+        base["buy_pct_fixed"] = buy_pct_fixed
+        base["buy_volume_fixed"] = buy_fixed
+        base["sell_volume_fixed"] = sell_fixed
+        base["delta_fixed"] = buy_fixed - sell_fixed
+        base["buy_pct_direction_fixed"] = inv_dir
+        base["_fixed_note"] = "direction инвертирован для сверки с ISS B/S"
+    except Exception as e:
+        base["_fixed_error"] = str(e)[:200]
+    return base
 
 
 def _footprint_increment(trades: list[dict], since_ts: Optional[str]) -> dict:
